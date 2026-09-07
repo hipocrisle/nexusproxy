@@ -1,0 +1,6 @@
+{
+  "upstream": { "address": "127.0.0.1", "port": 9050 },
+  "listen": { "http": 18080, "socks": 18081 },
+  "through_proxy": ["domain:localhost", "ip:127.0.0.2/32"],
+  "direct": ["full:direct.localhost"]
+}

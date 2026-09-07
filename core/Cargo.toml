@@ -1,0 +1,33 @@
+[package]
+name = "nexusproxy-core"
+version = "0.1.0"
+edition = "2021"
+description = "Локальный прокси с правилами: выбранные ресурсы — через вышестоящий SOCKS5, остальное напрямую"
+
+[lib]
+name = "nexusproxy_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexusproxy-core"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Registry",
+  "Win32_Networking_WinInet",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_SystemInformation",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

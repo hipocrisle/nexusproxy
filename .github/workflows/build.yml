@@ -1,0 +1,124 @@
+name: Build NexusProxy
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Долгая сборка Windows не должна отменяться следующим коммитом —
+# на этом уже теряли готовые артефакты.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  core:
+    name: Тесты движка
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - run: cargo test --release --manifest-path core/Cargo.toml
+
+  windows:
+    name: Сборка под Windows
+    runs-on: windows-latest
+    needs: core
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # Первая сборка компилирует ~500 пакетов с нуля и занимает ~20 минут.
+      # Кеш сохраняется по Cargo.lock, поэтому обновляется только когда
+      # зависимости реально изменились.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core
+            app/src-tauri
+          key: win-msvc
+
+      # Тег и версия в настройках должны совпадать, иначе на выходе
+      # получится файл не той версии, что в релизе.
+      - name: Сверить версию с тегом
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CONF=$(node -p "require('./app/src-tauri/tauri.conf.json').version")
+          echo "тег=$TAG конфиг=$CONF"
+          if [ "$CONF" != "$TAG" ]; then
+            echo "::error::Тег $GITHUB_REF_NAME не совпадает с версией $CONF"
+            exit 1
+          fi
+
+      - name: Консольный движок
+        run: cargo build --release --manifest-path core/Cargo.toml
+
+      - name: Зависимости интерфейса
+        working-directory: app
+        run: npm ci
+
+      - name: Окно программы
+        working-directory: app
+        run: npx tauri build --target x86_64-pc-windows-msvc
+
+      - name: Собрать всё в одну папку
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out
+          REL=app/src-tauri/target/x86_64-pc-windows-msvc/release
+
+          # Имя файла задаёт Tauri, и оно не всегда совпадает с названием
+          # программы — ищем, а не угадываем.
+          echo "── что лежит в $REL ──"
+          ls -la "$REL" | head -30
+
+          APP=$(find "$REL" -maxdepth 1 -name '*.exe' ! -name '*build-script*' | head -1)
+          if [ -z "$APP" ]; then
+            echo "::error::Окно программы не собралось — .exe не найден в $REL"
+            exit 1
+          fi
+          cp "$APP" out/NexusProxy.exe
+          echo "окно программы: $APP"
+
+          cp core/target/release/nexusproxy-core.exe out/nexusproxy-console.exe
+
+          # Установщик, если собрался
+          find "$REL/bundle" -name '*.exe' -exec cp {} out/ \; 2>/dev/null || true
+
+          cp windows/config.json windows/README.txt out/
+          echo "── итог ──"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexusproxy-windows
+          path: out/*
+
+      - name: Релиз по тегу
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+
+# сборка: тесты движка на Linux, затем Windows
