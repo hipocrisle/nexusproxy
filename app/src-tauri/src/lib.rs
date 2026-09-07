@@ -10,6 +10,9 @@ use tauri::{Manager, State, WindowEvent};
 pub struct App {
     engine: Mutex<Option<Arc<core::Engine>>>,
     path: Mutex<String>,
+    /// Почему движок не поднялся — чтобы окно показало причину,
+    /// а не пустые списки.
+    start_error: Mutex<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -222,6 +225,12 @@ fn conns_reset() {
     core::conns::reset_totals()
 }
 
+/// Доступность каждого прокси.
+#[tauri::command]
+fn proxies_health() -> Vec<core::health::ProxyHealth> {
+    core::health::proxies()
+}
+
 /// Список прокси и группы правил.
 #[tauri::command]
 fn upstreams_list(app: State<App>) -> Result<serde_json::Value, String> {
@@ -233,18 +242,53 @@ fn upstreams_list(app: State<App>) -> Result<serde_json::Value, String> {
     }))
 }
 
-/// Добавить или заменить прокси. Пустое имя — основной.
+/// Добавить, изменить или переименовать прокси.
+/// `old_name` — как он назывался до правки; пусто, если это новый.
+///
+/// Переименование обязано тянуть за собой группы правил: иначе они
+/// останутся ссылаться на исчезнувшее имя, и трафик молча пойдёт мимо.
 #[tauri::command]
-fn upstream_save(app: State<App>, up: core::upstream::Upstream) -> Result<(), String> {
+fn upstream_save(
+    app: State<App>,
+    up: core::upstream::Upstream,
+    old_name: Option<String>,
+) -> Result<(), String> {
+    if up.address.trim().is_empty() {
+        return Err("не указан адрес".into());
+    }
     let e = engine(&app)?;
     {
         let mut c = e.cfg.lock().unwrap();
-        if up.name.is_empty() || up.name == c.upstream.name {
-            c.upstream = up;
-        } else if let Some(x) = c.upstreams.iter_mut().find(|x| x.name == up.name) {
-            *x = up;
+        let old = old_name.unwrap_or_default();
+        let editing_main = old == c.upstream.name && !c.upstream.name.is_empty()
+            || (old.is_empty() && up.name.is_empty());
+
+        // имя не должно совпадать с чужим
+        if !up.name.is_empty() && up.name != old {
+            let taken = c.upstream.name == up.name
+                || c.upstreams.iter().any(|x| x.name == up.name);
+            if taken {
+                return Err(format!("прокси с именем «{}» уже есть", up.name));
+            }
+        }
+
+        if editing_main {
+            c.upstream = up.clone();
+        } else if !old.is_empty() {
+            match c.upstreams.iter_mut().find(|x| x.name == old) {
+                Some(x) => *x = up.clone(),
+                None => c.upstreams.push(up.clone()),
+            }
+            // группы должны переехать на новое имя
+            if old != up.name {
+                for g in c.groups.iter_mut() {
+                    if g.via == old {
+                        g.via = up.name.clone();
+                    }
+                }
+            }
         } else {
-            c.upstreams.push(up);
+            c.upstreams.push(up.clone());
         }
     }
     e.apply_and_save()
@@ -295,6 +339,48 @@ fn group_remove(app: State<App>, via: String) -> Result<(), String> {
 #[tauri::command]
 fn journal_since(after: u64) -> Vec<core::journal::Entry> {
     core::journal::since(after)
+}
+
+/// Откуда запущена программа и какая это версия.
+///
+/// Нужно, потому что обновление у Tauri всегда идёт через установщик:
+/// он ставит программу в профиль пользователя, а запущенный портативный
+/// файл остаётся старым. Без пояснения человек ищет «куда делась новая
+/// версия» и снова запускает старый файл.
+#[derive(Serialize)]
+pub struct Install {
+    version: String,
+    portable: bool,
+    exe_dir: String,
+    installed_dir: String,
+}
+
+#[tauri::command]
+fn install_info(app: tauri::AppHandle) -> Install {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe_dir = exe.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+    let installed_dir = std::env::var("LOCALAPPDATA")
+        .map(|d| format!("{d}\\NexusProxy"))
+        .unwrap_or_default();
+    let portable = !installed_dir.is_empty()
+        && !exe_dir.eq_ignore_ascii_case(&installed_dir);
+    Install {
+        version: app.package_info().version.to_string(),
+        portable,
+        exe_dir,
+        installed_dir,
+    }
+}
+
+/// Открыть папку, куда установщик кладёт программу.
+#[tauri::command]
+fn open_installed(_app: tauri::AppHandle) -> Result<(), String> {
+    let dir = std::env::var("LOCALAPPDATA")
+        .map(|d| format!("{d}\\NexusProxy"))
+        .map_err(|_| "не удалось определить папку профиля")?;
+    #[cfg(windows)]
+    { std::process::Command::new("explorer").arg(&dir).spawn().map_err(|e| e.to_string())?; }
+    Ok(())
 }
 
 /// Открыть папку с настройками и журналом в проводнике.
@@ -433,6 +519,15 @@ fn started_hidden() -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Вторая копия не должна занимать порты и показывать пустое окно —
+        // вместо запуска показываем уже работающую.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -441,7 +536,11 @@ pub fn run() {
             // при автозапуске окно не показываем — программа уходит в трей
             Some(vec!["--hidden"]),
         ))
-        .manage(App { engine: Mutex::new(None), path: Mutex::new(String::new()) })
+        .manage(App {
+            engine: Mutex::new(None),
+            path: Mutex::new(String::new()),
+            start_error: Mutex::new(None),
+        })
         .setup(|app| {
             // ── значок в области уведомлений ──
             let show = MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
@@ -505,7 +604,10 @@ pub fn run() {
             let rt = tokio::runtime::Runtime::new()?;
             match rt.block_on(core::Engine::start(cfg, &path_s)) {
                 Ok(e) => *state.engine.lock().unwrap() = Some(e),
-                Err(err) => eprintln!("движок не запустился: {err}"),
+                Err(err) => {
+                    eprintln!("движок не запустился: {err}");
+                    *state.start_error.lock().unwrap() = Some(err);
+                }
             }
 
             // среда выполнения должна жить, пока живёт программа
@@ -515,9 +617,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             status, rules_list, rule_add, rule_edit, rule_remove, rule_set_via,
             rule_add_from_file, rules_export, presets, check,
-            journal_since, journal_clear, open_folder,
+            journal_since, journal_clear, open_folder, install_info, open_installed,
             conns_active, conns_totals, conns_reset,
             upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
+            proxies_health,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit
         ])

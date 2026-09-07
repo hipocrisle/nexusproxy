@@ -200,3 +200,8 @@ select.field { appearance: auto; }
 .sortable:hover { color: var(--ink); }
 
 .col-n { width: 92px; flex: 0 0 auto; text-align: right; font-variant-numeric: tabular-nums; }
+
+.state { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+.state.up { background: var(--ok); }
+.state.down { background: var(--danger); }
+.state.unknown { background: var(--line); }

@@ -37,6 +37,23 @@ export function human(b: number): string {
   return i === 0 ? `${b} Б` : `${v.toFixed(1)} ${u[i]}`;
 }
 
+/// Состояние, переживающее переключение вкладок.
+/// Вкладки размонтируются, и обычный useState сбрасывал бы отборы —
+/// галка «только через прокси» слетала при каждом переходе.
+function useSticky<T>(key: string, initial: T): [T, (v: T) => void] {
+  const [v, setV] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem("ui." + key);
+      return raw === null ? initial : (JSON.parse(raw) as T);
+    } catch { return initial; }
+  });
+  const set = (next: T) => {
+    setV(next);
+    try { localStorage.setItem("ui." + key, JSON.stringify(next)); } catch { /* режим без хранилища */ }
+  };
+  return [v, set];
+}
+
 function duration(sec: number): string {
   const m = Math.floor(sec / 60), s = sec % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
@@ -48,7 +65,7 @@ const routeLabel: Record<string, string> = { proxy: "через прокси", d
 type Theme = "system" | "light" | "dark";
 
 export default function App() {
-  const [tab, setTab] = useState<"rules" | "discover" | "conns" | "log" | "settings">("rules");
+  const [tab, setTab] = useSticky<"rules" | "discover" | "conns" | "log" | "settings">("tab", "rules");
   const [st, setSt] = useState<Status | null>(null);
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem("theme") as Theme) || "system"
@@ -96,8 +113,13 @@ export default function App() {
           </span>
         )}
         <span className="grow" />
+        {st && !st.running && st.error && (
+          <span className="pill down" title={st.error}>
+            <span className="dot" />{st.error}
+          </span>
+        )}
         <span className="meta">
-          {st?.running ? `${st.upstream} · правил ${st.rules_count}` : "служба не запущена"}
+          {st?.running ? `${st.upstream} · правил ${st.rules_count}` : ""}
         </span>
         <div className="theme">
           {(["system", "light", "dark"] as const).map((t) => (
@@ -145,7 +167,7 @@ function Rules({ onChange }: { onChange: () => void }) {
   const [probe, setProbe] = useState("");
   const [verdicts, setVerdicts] = useState<{ host: string; route: string }[]>([]);
   const [presets, setPresets] = useState<Preset[]>([]);
-  const [filter, setFilter] = useState("");
+  const [filter, setFilter] = useSticky("rules.filter", "");
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
 
@@ -422,10 +444,10 @@ type SortKey = "host" | "app" | "seconds" | "sent" | "received";
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
   const [totals, setTotals] = useState<DomainStat[]>([]);
-  const [filter, setFilter] = useState("");
-  const [onlyProxy, setOnlyProxy] = useState(false);
-  const [sort, setSort] = useState<SortKey>("received");
-  const [asc, setAsc] = useState(false);
+  const [filter, setFilter] = useSticky("conn.filter", "");
+  const [onlyProxy, setOnlyProxy] = useSticky("conn.onlyProxy", false);
+  const [sort, setSort] = useSticky<SortKey>("conn.sort", "received");
+  const [asc, setAsc] = useSticky("conn.asc", false);
 
   const flip = (k: SortKey) => { if (sort === k) setAsc(!asc); else { setSort(k); setAsc(false); } };
   const arrow = (k: SortKey) => (sort === k ? (asc ? " ↑" : " ↓") : "");
@@ -532,8 +554,8 @@ function Connections() {
 
 function Log() {
   const [lines, setLines] = useState<Entry[]>([]);
-  const [filter, setFilter] = useState("");
-  const [onlyProxy, setOnlyProxy] = useState(false);
+  const [filter, setFilter] = useSticky("log.filter", "");
+  const [onlyProxy, setOnlyProxy] = useSticky("log.onlyProxy", false);
   const last = useRef(0);
 
   useEffect(() => {
@@ -709,13 +731,17 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
 /* ─────────────── Несколько прокси ─────────────── */
 
+type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number };
+
 function Upstreams() {
   const [ups, setUps] = useState<Upstream[]>([]);
+  const [health, setHealth] = useState<ProxyHealth[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
   const [adding, setAdding] = useState(false);
-  const [draft, setDraft] = useState<Upstream>({
-    name: "", kind: "socks5", address: "", port: 1080, user: "", password: "",
-  });
+  /// имя, под которым прокси был до правки; null — добавляем новый
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const empty: Upstream = { name: "", kind: "socks5", address: "", port: 1080, user: "", password: "" };
+  const [draft, setDraft] = useState<Upstream>(empty);
   const [err, setErr] = useState("");
 
   const load = useCallback(async () => {
@@ -725,17 +751,31 @@ function Upstreams() {
     } catch { /* движок ещё не поднялся */ }
   }, []);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const tick = () => invoke<ProxyHealth[]>("proxies_health").then(setHealth).catch(() => {});
+    tick();
+    const t = setInterval(tick, 5000);
+    return () => clearInterval(t);
+  }, []);
 
   const save = async () => {
-    if (!draft.name.trim() || !draft.address.trim()) {
-      setErr("нужно имя и адрес"); return;
-    }
+    if (!draft.address.trim()) { setErr("не указан адрес"); return; }
+    if (editingName === null && !draft.name.trim()) { setErr("не указано имя"); return; }
     try {
-      await invoke("upstream_save", { up: { ...draft, port: Number(draft.port) } });
-      setAdding(false); setErr("");
-      setDraft({ name: "", kind: "socks5", address: "", port: 1080, user: "", password: "" });
+      await invoke("upstream_save", {
+        up: { ...draft, port: Number(draft.port) },
+        oldName: editingName,
+      });
+      setAdding(false); setEditingName(null); setErr(""); setDraft(empty);
       load();
     } catch (e) { setErr(String(e)); }
+  };
+
+  const startEdit = (u: Upstream) => {
+    setDraft({ ...u, user: u.user ?? "", password: u.password ?? "" });
+    setEditingName(u.name);
+    setAdding(true);
+    setErr("");
   };
 
   const remove = async (name: string) => {
@@ -756,15 +796,22 @@ function Upstreams() {
         с логином и паролем.
       </p>
       <div className="list">
-        {ups.map((u, i) => (
-          <div className="item" key={u.name || "основной-" + i}>
-            <span className="grow">
-              {u.name || "основной"}
-              <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
-            </span>
-            {i > 0 && <button className="btn small" onClick={() => remove(u.name)}>Убрать</button>}
-          </div>
-        ))}
+        {ups.map((u, i) => {
+          const h = health.find((x) => x.name === (u.name || `${u.address}:${u.port}`));
+          return (
+            <div className="item" key={u.name || "основной-" + i}>
+              <span className={"state " + (h ? (h.up ? "up" : "down") : "unknown")}
+                title={h ? (h.up ? `отвечает, ${h.ms} мс` : "не отвечает") : "ещё не проверялся"} />
+              <span className="grow">
+                {u.name || "основной"}
+                <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
+              </span>
+              <span className="sub">{h ? (h.up ? `${h.ms} мс` : "не отвечает") : "—"}</span>
+              <button className="btn small" onClick={() => startEdit(u)}>Править</button>
+              {i > 0 && <button className="btn small" onClick={() => remove(u.name)}>Убрать</button>}
+            </div>
+          );
+        })}
       </div>
 
       {groups.length > 0 && (
@@ -793,7 +840,8 @@ function Upstreams() {
         <div style={{ marginTop: 10 }}>
           <div className="grid2">
             <label className="lbl">Имя<input className="field" value={draft.name}
-              placeholder="например, vpn" onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label>
+              placeholder={editingName === "" ? "основной" : "vpn"}
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label>
             <label className="lbl">Протокол
               <select className="field" value={draft.kind}
                 onChange={(e) => setDraft({ ...draft, kind: e.target.value as "socks5" | "http" })}>
@@ -812,11 +860,17 @@ function Upstreams() {
           </div>
           <div className="row" style={{ marginTop: 8 }}>
             <button className="btn primary" onClick={save}>Сохранить</button>
-            <button className="btn" onClick={() => { setAdding(false); setErr(""); }}>Отмена</button>
+            <button className="btn" onClick={() => {
+              setAdding(false); setEditingName(null); setDraft(empty); setErr("");
+            }}>Отмена</button>
+            {editingName !== null && editingName !== draft.name && (
+              <span className="meta">группы правил переедут на новое имя</span>
+            )}
           </div>
         </div>
       ) : (
-        <button className="btn" style={{ marginTop: 10 }} onClick={() => setAdding(true)}>
+        <button className="btn" style={{ marginTop: 10 }}
+          onClick={() => { setDraft(empty); setEditingName(null); setAdding(true); }}>
           Добавить прокси
         </button>
       )}
@@ -835,7 +889,11 @@ const UPDATE_HOSTS = [
   "github-releases.githubusercontent.com",
 ];
 
+type Install = { version: string; portable: boolean; exe_dir: string; installed_dir: string };
+
 function Updates() {
+  const [inst, setInst] = useState<Install | null>(null);
+  useEffect(() => { invoke<Install>("install_info").then(setInst).catch(() => {}); }, []);
   const [state, setState] = useState<"idle" | "checking" | "none" | "found" | "installing" | "error">("idle");
   const [version, setVersion] = useState("");
   const [err, setErr] = useState("");
@@ -869,14 +927,34 @@ function Updates() {
 
   return (
     <div className="card">
-      <h3>Обновления</h3>
+      <div className="row" style={{ marginBottom: 8 }}>
+        <h3 style={{ margin: 0 }}>Обновления</h3>
+        <span className="grow" />
+        {inst && <span className="meta">версия {inst.version}</span>}
+      </div>
+      {inst?.portable && (
+        <div className="note" style={{ marginBottom: 10 }}>
+          <b>Запущена портативная копия.</b>
+          <span>
+            Обновление выполняется установщиком: он размещает программу
+            в <code>{inst.installed_dir}</code> и добавляет ярлык в меню «Пуск».
+            Текущий файл в <code>{inst.exe_dir}</code> остаётся прежней версии —
+            после обновления запускайте установленную копию.
+          </span>
+          <div className="row">
+            <button className="btn small" onClick={() => invoke("open_installed")}>
+              Открыть папку установки
+            </button>
+          </div>
+        </div>
+      )}
       <div className="row">
         <button className="btn" onClick={look} disabled={state === "checking" || state === "installing"}>
           {state === "checking" ? "Проверка…" : "Проверить обновления"}
         </button>
         {state === "found" && (
           <button className="btn primary" onClick={install} disabled={state !== "found"}>
-            Обновить до {version}
+            {inst?.portable ? `Установить ${version}` : `Обновить до ${version}`}
           </button>
         )}
         {state === "none" && <span className="meta">установлена актуальная версия</span>}

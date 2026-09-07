@@ -109,34 +109,50 @@ impl Engine {
             }
         });
 
-        // Сторож: раз в 15 секунд проверяет, жив ли вышестоящий прокси,
-        // и сам отмечает восстановление. Ничего не «чинит» силой —
-        // соединения и так пробуются повторно.
-        let watch_up = up.clone();
+        // Сторож проверяет КАЖДЫЙ прокси из настроек, а не только основной:
+        // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
+        let watch_pool = pool.clone();
+        let main_name = up.title();
         let t3 = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let list: Vec<upstream::Upstream> = {
+                    let p = watch_pool.read().unwrap();
+                    // пустое имя дублирует основной — его пропускаем
+                    p.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone())
+                        .chain(p.get("").cloned())
+                        .collect()
+                };
+                let mut main_ok = true;
+                for u in list {
+                    let started = std::time::Instant::now();
+                    let ok = tokio::time::timeout(
+                        std::time::Duration::from_secs(6),
+                        tokio::net::TcpStream::connect((u.address.as_str(), u.port)),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                    let ms = started.elapsed().as_millis() as u64;
+                    health::set_proxy(&u.title(), ok, ms);
+                    if u.title() == main_name {
+                        main_ok = ok;
+                    }
+                    if !ok {
+                        logfile::line(&logfile::now_stamp(),
+                                      &format!("прокси «{}» не отвечает", u.title()));
+                    }
+                }
                 if !upstream::AUTO_RECONNECT.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
-                let addr = (watch_up.address.as_str(), watch_up.port);
-                let ok = tokio::time::timeout(
-                    std::time::Duration::from_secs(6),
-                    tokio::net::TcpStream::connect(addr),
-                )
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
                 let was = health::get().up;
-                if ok {
+                if main_ok {
                     if !was {
-                        logfile::line(&logfile::now_stamp(), "вышестоящий прокси снова доступен");
+                        logfile::line(&logfile::now_stamp(), "основной прокси снова доступен");
                     }
                     health::mark_up();
                 } else {
-                    if was {
-                        logfile::line(&logfile::now_stamp(), "вышестоящий прокси недоступен");
-                    }
                     health::mark_down("не отвечает на проверке связи");
                 }
             }
