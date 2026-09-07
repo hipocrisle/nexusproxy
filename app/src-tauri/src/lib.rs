@@ -155,14 +155,96 @@ fn check(app: State<App>, hosts: Vec<String>) -> Result<Vec<Verdict>, String> {
         .iter()
         .map(|h| Verdict {
             host: h.clone(),
-            route: match r.decide(h) {
-                core::rules::Route::Proxy => "proxy",
-                core::rules::Route::Direct => "direct",
-                core::rules::Route::Block => "block",
-            }
-            .into(),
+            route: r.decide(h).tag().into(),
         })
         .collect())
+}
+
+/// Что открыто прямо сейчас — колонки как в Proxifier.
+#[tauri::command]
+fn conns_active() -> Vec<core::conns::Conn> {
+    core::conns::active()
+}
+
+/// Сколько куда ушло, по доменам.
+#[tauri::command]
+fn conns_totals() -> Vec<core::conns::DomainStat> {
+    core::conns::totals()
+}
+
+#[tauri::command]
+fn conns_reset() {
+    core::conns::reset_totals()
+}
+
+/// Список прокси и группы правил.
+#[tauri::command]
+fn upstreams_list(app: State<App>) -> Result<serde_json::Value, String> {
+    let e = engine(&app)?;
+    let c = e.cfg.lock().unwrap();
+    Ok(serde_json::json!({
+        "upstreams": c.all_upstreams(),
+        "groups": c.groups,
+    }))
+}
+
+/// Добавить или заменить прокси. Пустое имя — основной.
+#[tauri::command]
+fn upstream_save(app: State<App>, up: core::upstream::Upstream) -> Result<(), String> {
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        if up.name.is_empty() || up.name == c.upstream.name {
+            c.upstream = up;
+        } else if let Some(x) = c.upstreams.iter_mut().find(|x| x.name == up.name) {
+            *x = up;
+        } else {
+            c.upstreams.push(up);
+        }
+    }
+    e.apply_and_save()
+}
+
+/// Убрать прокси. Основной убрать нельзя, и нельзя убрать тот,
+/// на который ещё ссылается группа правил.
+#[tauri::command]
+fn upstream_remove(app: State<App>, name: String) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("основной прокси убрать нельзя".into());
+    }
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        if let Some(g) = c.groups.iter().find(|g| g.via == name) {
+            return Err(format!(
+                "на него ссылается группа с {} правилами — сначала переключи её",
+                g.patterns.len()
+            ));
+        }
+        c.upstreams.retain(|u| u.name != name);
+    }
+    e.apply_and_save()
+}
+
+/// Создать или обновить группу правил, идущих через отдельный прокси.
+#[tauri::command]
+fn group_save(app: State<App>, group: core::config::RouteGroup) -> Result<(), String> {
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        match c.groups.iter_mut().find(|g| g.via == group.via) {
+            Some(g) => *g = group,
+            None => c.groups.push(group),
+        }
+    }
+    e.apply_and_save()
+}
+
+#[tauri::command]
+fn group_remove(app: State<App>, via: String) -> Result<(), String> {
+    let e = engine(&app)?;
+    { e.cfg.lock().unwrap().groups.retain(|g| g.via != via); }
+    e.apply_and_save()
 }
 
 #[tauri::command]
@@ -282,8 +364,12 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
 fn default_config() -> core::config::Config {
     core::config::Config {
         upstream: core::upstream::Upstream {
+            name: String::new(),
+            kind: core::upstream::Kind::Socks5,
             address: "127.0.0.1".into(), port: 1080, user: None, password: None,
         },
+        upstreams: vec![],
+        groups: vec![],
         listen: core::config::Listen { http: 18080, socks: 18081 },
         through_proxy: vec![],
         direct: vec![],
@@ -303,6 +389,8 @@ fn started_hidden() -> bool {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             // при автозапуске окно не показываем — программа уходит в трей
@@ -374,6 +462,7 @@ pub fn run() {
                 Ok(e) => *state.engine.lock().unwrap() = Some(e),
                 Err(err) => eprintln!("движок не запустился: {err}"),
             }
+
             // среда выполнения должна жить, пока живёт программа
             std::mem::forget(rt);
             Ok(())
@@ -382,6 +471,8 @@ pub fn run() {
             status, rules_list, rule_add, rule_edit, rule_remove,
             rule_add_from_file, rules_export, presets, check,
             journal_since, journal_clear, open_folder,
+            conns_active, conns_totals, conns_reset,
+            upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit
         ])

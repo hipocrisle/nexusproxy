@@ -8,9 +8,31 @@ use std::net::IpAddr;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
-    Proxy,
+    /// Через прокси с этим именем. Пустое имя — основной прокси.
+    Proxy(String),
     Direct,
     Block,
+}
+
+impl Route {
+    pub fn proxy() -> Self { Route::Proxy(String::new()) }
+    pub fn is_proxy(&self) -> bool { matches!(self, Route::Proxy(_)) }
+    /// Как показывать в журнале и таблице соединений.
+    pub fn label(&self) -> &str {
+        match self {
+            Route::Proxy(n) if n.is_empty() => "через прокси",
+            Route::Proxy(_) => "через прокси",
+            Route::Direct => "напрямую",
+            Route::Block => "запрещено",
+        }
+    }
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Route::Proxy(_) => "proxy",
+            Route::Direct => "direct",
+            Route::Block => "block",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,19 +152,19 @@ mod tests {
 
     fn rules() -> Rules {
         let mut r = Rules::new(Route::Direct);
-        r.add("domain:anthropic.com", Route::Proxy).unwrap();
-        r.add("full:exact.example", Route::Proxy).unwrap();
-        r.add("keyword:openai", Route::Proxy).unwrap();
-        r.add("ip:10.0.0.0/8", Route::Proxy).unwrap();
+        r.add("domain:anthropic.com", Route::proxy()).unwrap();
+        r.add("full:exact.example", Route::proxy()).unwrap();
+        r.add("keyword:openai", Route::proxy()).unwrap();
+        r.add("ip:10.0.0.0/8", Route::proxy()).unwrap();
         r
     }
 
     #[test]
     fn domain_and_subdomains() {
         let r = rules();
-        assert_eq!(r.decide("anthropic.com"), Route::Proxy);
-        assert_eq!(r.decide("api.anthropic.com"), Route::Proxy);
-        assert_eq!(r.decide("API.Anthropic.COM."), Route::Proxy);
+        assert_eq!(r.decide("anthropic.com"), Route::proxy());
+        assert_eq!(r.decide("api.anthropic.com"), Route::proxy());
+        assert_eq!(r.decide("API.Anthropic.COM."), Route::proxy());
         // ключевая проверка: чужой домен, лишь оканчивающийся похоже
         assert_eq!(r.decide("notanthropic.com"), Route::Direct);
         assert_eq!(r.decide("example.com"), Route::Direct);
@@ -151,32 +173,32 @@ mod tests {
     #[test]
     fn exact_only() {
         let r = rules();
-        assert_eq!(r.decide("exact.example"), Route::Proxy);
+        assert_eq!(r.decide("exact.example"), Route::proxy());
         assert_eq!(r.decide("sub.exact.example"), Route::Direct);
     }
 
     #[test]
     fn keyword_anywhere() {
         let r = rules();
-        assert_eq!(r.decide("api.openai.com"), Route::Proxy);
-        assert_eq!(r.decide("myopenaiproxy.net"), Route::Proxy);
+        assert_eq!(r.decide("api.openai.com"), Route::proxy());
+        assert_eq!(r.decide("myopenaiproxy.net"), Route::proxy());
     }
 
     #[test]
     fn cidr() {
         let r = rules();
-        assert_eq!(r.decide("10.1.2.3"), Route::Proxy);
+        assert_eq!(r.decide("10.1.2.3"), Route::proxy());
         assert_eq!(r.decide("11.1.2.3"), Route::Direct);
     }
 
     #[test]
     fn comments_and_headers_ignored() {
         let mut r = Rules::new(Route::Direct);
-        r.add("_ChatGPT и Codex", Route::Proxy).unwrap();
-        r.add("# просто заметка", Route::Proxy).unwrap();
-        r.add("", Route::Proxy).unwrap();
-        r.add("domain:openai.com", Route::Proxy).unwrap();
-        assert_eq!(r.decide("api.openai.com"), Route::Proxy);
+        r.add("_ChatGPT и Codex", Route::proxy()).unwrap();
+        r.add("# просто заметка", Route::proxy()).unwrap();
+        r.add("", Route::proxy()).unwrap();
+        r.add("domain:openai.com", Route::proxy()).unwrap();
+        assert_eq!(r.decide("api.openai.com"), Route::proxy());
         assert_eq!(r.decide("_ChatGPT и Codex"), Route::Direct);
     }
 
@@ -189,8 +211,8 @@ mod tests {
     #[test]
     fn partial_byte_prefix() {
         let mut r = Rules::new(Route::Direct);
-        r.add("ip:192.168.4.0/22", Route::Proxy).unwrap();
-        assert_eq!(r.decide("192.168.5.9"), Route::Proxy);
+        r.add("ip:192.168.4.0/22", Route::proxy()).unwrap();
+        assert_eq!(r.decide("192.168.5.9"), Route::proxy());
         assert_eq!(r.decide("192.168.8.1"), Route::Direct);
     }
 }

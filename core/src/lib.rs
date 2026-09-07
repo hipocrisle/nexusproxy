@@ -2,12 +2,14 @@
 //! Отдельно от интерфейса, чтобы им пользовались и окно программы, и консоль.
 
 pub mod config;
+pub mod conns;
 pub mod domain;
 pub mod http_in;
 pub mod health;
 pub mod journal;
 pub mod logfile;
 pub mod presets;
+pub mod proc;
 pub mod report;
 pub mod rules;
 pub mod socks_in;
@@ -21,6 +23,8 @@ use tokio::net::TcpListener;
 pub struct Engine {
     pub cfg: Arc<Mutex<config::Config>>,
     pub rules: Arc<RwLock<rules::Rules>>,
+    /// Доступные прокси: имя → описание. Меняется вместе с настройками.
+    pub pool: Arc<RwLock<upstream::Pool>>,
     pub path: String,
     saved: Mutex<Option<winproxy::Saved>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -28,14 +32,31 @@ pub struct Engine {
 
 pub const NO_PROXY: &str = "localhost,127.0.0.1,::1";
 
+/// Собрать набор прокси из настроек: основной под пустым именем плюс
+/// каждый под своим.
+fn build_pool(cfg: &config::Config) -> upstream::Pool {
+    let mut m = upstream::Pool::new();
+    m.insert(String::new(), cfg.upstream.clone());
+    if !cfg.upstream.name.is_empty() {
+        m.insert(cfg.upstream.name.clone(), cfg.upstream.clone());
+    }
+    for u in &cfg.upstreams {
+        m.insert(u.name.clone(), u.clone());
+    }
+    m
+}
+
 impl Engine {
     /// Поднимает оба входа. Системный прокси НЕ трогает — это отдельным шагом.
     pub async fn start(cfg: config::Config, path: &str) -> Result<Arc<Self>, String> {
         journal::enable();
         report::enable();
         health::enable();
+        conns::enable();
         upstream::AUTO_RECONNECT.store(cfg.auto_reconnect, std::sync::atomic::Ordering::Relaxed);
+        cfg.check_links()?;
         let rules = Arc::new(RwLock::new(cfg.rules()?));
+        let pool = Arc::new(RwLock::new(build_pool(&cfg)));
         let up = Arc::new(cfg.upstream.clone());
         let (hp, sp) = (cfg.listen.http, cfg.listen.socks);
 
@@ -47,6 +68,7 @@ impl Engine {
         let e = Arc::new(Engine {
             cfg: Arc::new(Mutex::new(cfg)),
             rules: rules.clone(),
+            pool: pool.clone(),
             path: path.to_string(),
             saved: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
@@ -55,7 +77,7 @@ impl Engine {
         // ⛔ Раньше здесь было `while let Ok(...) = accept()`, и любая
         // случайная ошибка приёма навсегда убивала вход — молча, без следа.
         // Теперь ошибка только записывается, а цикл продолжается.
-        let (u1, r1) = (up.clone(), rules.clone());
+        let (u1, r1) = (pool.clone(), rules.clone());
         let t1 = tokio::spawn(async move {
             loop {
                 match http.accept().await {
@@ -70,7 +92,7 @@ impl Engine {
                 }
             }
         });
-        let (u2, r2) = (up.clone(), rules.clone());
+        let (u2, r2) = (pool.clone(), rules.clone());
         let t2 = tokio::spawn(async move {
             loop {
                 match socks.accept().await {
@@ -123,10 +145,12 @@ impl Engine {
         Ok(e)
     }
 
-    /// Перечитать правила из настроек и сохранить файл.
+    /// Перечитать правила и список прокси из настроек, затем сохранить файл.
     pub fn apply_and_save(&self) -> Result<(), String> {
         let c = self.cfg.lock().unwrap();
+        c.check_links()?;
         *self.rules.write().unwrap() = c.rules()?;
+        *self.pool.write().unwrap() = build_pool(&c);
         c.save(&self.path)
     }
 

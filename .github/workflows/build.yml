@@ -78,6 +78,9 @@ jobs:
 
       - name: Окно программы
         working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --target x86_64-pc-windows-msvc
 
       - name: Собрать всё в одну папку
@@ -102,8 +105,9 @@ jobs:
 
           cp core/target/release/nexusproxy-core.exe out/nexusproxy-console.exe
 
-          # Установщик, если собрался
+          # Установщик и подписи для обновления
           find "$REL/bundle" -name '*.exe' -exec cp {} out/ \; 2>/dev/null || true
+          find "$REL/bundle" -name '*.sig' -exec cp {} out/ \; 2>/dev/null || true
 
           cp windows/config.json windows/README.txt out/
           echo "── итог ──"
@@ -113,6 +117,36 @@ jobs:
         with:
           name: nexusproxy-windows
           path: out/*
+
+      # Список обновлений: приложение ходит именно за ним.
+      # Версия берётся из тега, ссылка — на файл этого же релиза.
+      - name: Собрать список обновлений
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -e
+          VER="${GITHUB_REF_NAME#v}"
+          SETUP=$(find out -name '*-setup.exe' | head -1)
+          SIG=$(find out -name '*-setup.exe.sig' | head -1)
+          if [ -z "$SETUP" ] || [ -z "$SIG" ]; then
+            echo "::error::Не найден установщик или его подпись — обновление работать не будет"
+            ls -la out; exit 1
+          fi
+          NAME=$(basename "$SETUP")
+          cat > out/latest.json <<EOF
+          {
+            "version": "$VER",
+            "notes": "Свежая версия NexusProxy",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "$(cat "$SIG")",
+                "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${NAME}"
+              }
+            }
+          }
+          EOF
+          cat out/latest.json
 
       - name: Релиз по тегу
         if: startsWith(github.ref, 'refs/tags/v')

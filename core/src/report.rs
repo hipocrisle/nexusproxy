@@ -93,7 +93,7 @@ pub fn note(host: &str, route: &Route) {
         Some((h, t)) if now.duration_since(*t) <= RELATED_WINDOW => Some(h.clone()),
         _ => None,
     };
-    if *route == Route::Proxy {
+    if *route == Route::proxy() {
         l.last_proxy = Some((host.to_string(), now));
     }
     l.ever.insert(host.to_string());
@@ -110,7 +110,7 @@ pub fn live_candidates() -> Vec<Candidate> {
     let g = STATE.lock().unwrap();
     let Some(l) = g.as_ref() else { return Vec::new() };
     let Some(s) = l.session.as_ref() else { return Vec::new() };
-    group(s.seen.iter().filter(|(h, (_, r, _))| *r != Route::Proxy && !s.baseline.contains(*h)))
+    group(s.seen.iter().filter(|(h, (_, r, _))| *r != Route::proxy() && !s.baseline.contains(*h)))
 }
 
 /// Свести имена узлов к доменам.
@@ -157,8 +157,8 @@ pub fn finish_session() -> Option<SessionResult> {
         .into_iter()
         .filter(|(h, _)| !s.baseline.contains(h))
         .collect();
-    let candidates = group(fresh.iter().filter(|(_, (_, r, _))| *r != Route::Proxy));
-    let already = group(fresh.iter().filter(|(_, (_, r, _))| *r == Route::Proxy));
+    let candidates = group(fresh.iter().filter(|(_, (_, r, _))| *r != Route::proxy()));
+    let already = group(fresh.iter().filter(|(_, (_, r, _))| *r == Route::proxy()));
     Some(SessionResult {
         seconds: s.started.elapsed().as_secs(),
         candidates,
@@ -186,7 +186,7 @@ mod tests {
 
         start_session();
         note("monitoring.corp.example", &Route::Direct); // снова фон
-        note("chatgpt.com", &Route::Proxy);
+        note("chatgpt.com", &Route::proxy());
         note("oaistatic.com", &Route::Direct);           // новое, рядом с прокси
 
         let r = finish_session().unwrap();
@@ -201,7 +201,7 @@ mod tests {
         let _guard = reset();
         note("bg.example", &Route::Direct);
         start_session();
-        note("chatgpt.com", &Route::Proxy);
+        note("chatgpt.com", &Route::proxy());
         note("oaistatic.com", &Route::Direct);
         note("bg.example", &Route::Direct);
         let live = live_candidates();
@@ -216,7 +216,7 @@ mod tests {
         // ровно случай ютуба: имена разные, домен один
         let _guard = reset();
         start_session();
-        note("youtube.com", &Route::Proxy);
+        note("youtube.com", &Route::proxy());
         note("rr3---sn-4g5edndz.googlevideo.com", &Route::Direct);
         note("rr1---sn-4g5ednsy.googlevideo.com", &Route::Direct);
         note("rr5---sn-4g5e6nzz.googlevideo.com", &Route::Direct);
@@ -249,7 +249,7 @@ mod tests {
     fn trigger_expires_after_window() {
         let _guard = reset();
         start_session();
-        note("chatgpt.com", &Route::Proxy);
+        note("chatgpt.com", &Route::proxy());
         // подделываем давность: сдвигаем отметку назад
         if let Some(l) = STATE.lock().unwrap().as_mut() {
             if let Some((h, _)) = l.last_proxy.take() {

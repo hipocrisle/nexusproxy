@@ -57,9 +57,6 @@ pub fn all() -> Vec<Preset> {
           "Куда чаще всего ходят за ответами",
           &["stackoverflow.com", "stackexchange.com", "readthedocs.io",
             "mozilla.org", "w3.org", "rust-lang.org", "docs.rs"]),
-        p("Обновления NexusProxy и NexuSSH",
-          "Чтобы программы могли проверять обновления из-за периметра",
-          &["hipogas.org"]),
     ]
 }
 

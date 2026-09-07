@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFile, save as saveFile } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { enable as autoOn, disable as autoOff, isEnabled as autoIs } from "@tauri-apps/plugin-autostart";
 
 type Status = {
@@ -17,6 +19,28 @@ type Candidate = {
   examples: string[]; triggered_by: string | null;
 };
 type Preset = { name: string; note: string; domains: string[] };
+type Conn = {
+  id: number; host: string; port: number; route: string; via: string;
+  app: string; seconds: number; sent: number; received: number;
+};
+type DomainStat = { domain: string; route: string; conns: number; sent: number; received: number };
+type Upstream = {
+  name: string; kind: "socks5" | "http"; address: string; port: number;
+  user: string | null; password: string | null;
+};
+type Group = { via: string; enabled: boolean; patterns: string[] };
+
+export function human(b: number): string {
+  const u = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let v = b, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${b} Б` : `${v.toFixed(1)} ${u[i]}`;
+}
+
+function duration(sec: number): string {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
 type Bulk = { added: string[]; skipped: string[]; invalid: string[] };
 
 const routeLabel: Record<string, string> = { proxy: "через прокси", direct: "напрямую", block: "запрещено" };
@@ -24,7 +48,7 @@ const routeLabel: Record<string, string> = { proxy: "через прокси", d
 type Theme = "system" | "light" | "dark";
 
 export default function App() {
-  const [tab, setTab] = useState<"rules" | "discover" | "log" | "settings">("rules");
+  const [tab, setTab] = useState<"rules" | "discover" | "conns" | "log" | "settings">("rules");
   const [st, setSt] = useState<Status | null>(null);
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem("theme") as Theme) || "system"
@@ -89,7 +113,8 @@ export default function App() {
       </div>
 
       <div className="tabs">
-        {([["rules", "Правила"], ["discover", "Подбор доменов"], ["log", "Журнал"], ["settings", "Настройки"]] as const)
+        {([["rules", "Правила"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
+           ["log", "Журнал"], ["settings", "Настройки"]] as const)
           .map(([k, label]) => (
             <button key={k} className={"tab" + (tab === k ? " sel" : "")} onClick={() => setTab(k)}>
               {label}{k === "discover" && st?.discovering ? " ●" : ""}
@@ -100,6 +125,7 @@ export default function App() {
       <div className="body">
         {tab === "rules" && <Rules onChange={refresh} />}
         {tab === "discover" && <Discover active={!!st?.discovering} onChange={refresh} />}
+        {tab === "conns" && <Connections />}
         {tab === "log" && <Log />}
         {tab === "settings" && <Settings st={st} onSaved={refresh} />}
       </div>
@@ -369,6 +395,83 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
   );
 }
 
+/* ─────────────── Соединения и трафик ─────────────── */
+
+function Connections() {
+  const [live, setLive] = useState<Conn[]>([]);
+  const [totals, setTotals] = useState<DomainStat[]>([]);
+
+  useEffect(() => {
+    const tick = async () => {
+      setLive(await invoke<Conn[]>("conns_active").catch(() => []));
+      setTotals(await invoke<DomainStat[]>("conns_totals").catch(() => []));
+    };
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const sum = totals.reduce((a, t) => ({ s: a.s + t.sent, r: a.r + t.received }), { s: 0, r: 0 });
+  const viaProxy = totals.filter((t) => t.route === "proxy")
+    .reduce((a, t) => a + t.sent + t.received, 0);
+
+  return (
+    <div className="panel">
+      <div className="card">
+        <div className="row">
+          <h3 style={{ margin: 0 }}>Открыто сейчас — {live.length}</h3>
+          <span className="grow" />
+          <span className="meta">
+            всего отдано {human(sum.s)} · получено {human(sum.r)} · через прокси {human(viaProxy)}
+          </span>
+          <button className="btn small" onClick={() => invoke("conns_reset")}>Сбросить счётчики</button>
+        </div>
+        <div className="list" style={{ marginTop: 8 }}>
+          <div className="item head">
+            <span className="grow">Куда</span>
+            <span className="col-app">Приложение</span>
+            <span className="col-t">Время</span>
+            <span className="col-v">Через что</span>
+            <span className="col-b">Отдано</span>
+            <span className="col-b">Получено</span>
+          </div>
+          {live.length === 0 && <div className="empty">Ничего не открыто.</div>}
+          {live.map((c) => (
+            <div className="item" key={c.id}>
+              <span className="grow">{c.host}:{c.port}</span>
+              <span className="col-app sub">{c.app || "—"}</span>
+              <span className="col-t sub">{duration(c.seconds)}</span>
+              <span className={"col-v tag " + c.route}>{c.via || routeLabel[c.route]}</span>
+              <span className="col-b sub">{human(c.sent)}</span>
+              <span className="col-b sub">{human(c.received)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h3>Трафик по доменам</h3>
+        <p className="hint">
+          Имена узлов сведены к домену: у ютуба каждое соединение приходит
+          с нового имени, иначе таблица была бы бесконечной.
+        </p>
+        <div className="list">
+          {totals.length === 0 && <div className="empty">Пока пусто.</div>}
+          {totals.map((t) => (
+            <div className="item" key={t.domain}>
+              <span className="grow">{t.domain}</span>
+              <span className={"tag " + t.route}>{routeLabel[t.route]}</span>
+              <span className="col-t sub">{t.conns} св.</span>
+              <span className="col-b sub">{human(t.sent)}</span>
+              <span className="col-b sub">{human(t.received)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ─────────────── Журнал ─────────────── */
 
 function Log() {
@@ -491,6 +594,8 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         </div>
       </div>
 
+      <Upstreams />
+
       <div className="card">
         <h3>Наши порты</h3>
         <p className="hint">На них слушает сама программа. Менять стоит, только если порт уже занят.</p>
@@ -535,9 +640,217 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         <button className="btn primary" onClick={save}>Сохранить</button>
         {saved && <span className="meta">{saved}</span>}
       </div>
+      <Updates />
+
       <div className="note">
         Приложения читают настройки прокси при запуске — после включения их нужно перезапустить.
       </div>
+    </div>
+  );
+}
+
+
+/* ─────────────── Несколько прокси ─────────────── */
+
+function Upstreams() {
+  const [ups, setUps] = useState<Upstream[]>([]);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState<Upstream>({
+    name: "", kind: "socks5", address: "", port: 1080, user: "", password: "",
+  });
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const r = await invoke<{ upstreams: Upstream[]; groups: Group[] }>("upstreams_list");
+      setUps(r.upstreams); setGroups(r.groups);
+    } catch { /* движок ещё не поднялся */ }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async () => {
+    if (!draft.name.trim() || !draft.address.trim()) {
+      setErr("нужно имя и адрес"); return;
+    }
+    try {
+      await invoke("upstream_save", { up: { ...draft, port: Number(draft.port) } });
+      setAdding(false); setErr("");
+      setDraft({ name: "", kind: "socks5", address: "", port: 1080, user: "", password: "" });
+      load();
+    } catch (e) { setErr(String(e)); }
+  };
+
+  const remove = async (name: string) => {
+    try { await invoke("upstream_remove", { name }); setErr(""); load(); }
+    catch (e) { setErr(String(e)); }
+  };
+
+  const toggleGroup = async (g: Group) => {
+    await invoke("group_save", { group: { ...g, enabled: !g.enabled } });
+    load();
+  };
+
+  return (
+    <div className="card">
+      <h3>Дополнительные прокси</h3>
+      <p className="hint">
+        Разным ресурсам можно назначить разные прокси. Например, рабочие — через
+        офисный, зарубежные — через локальный, который поднимает Happ или NexuSSH.
+        Тогда всё управляется из одного окна.
+      </p>
+      <div className="list">
+        {ups.map((u, i) => (
+          <div className="item" key={u.name || "основной-" + i}>
+            <span className="grow">
+              {u.name || "основной"}
+              <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
+            </span>
+            {i > 0 && <button className="btn small" onClick={() => remove(u.name)}>Убрать</button>}
+          </div>
+        ))}
+      </div>
+
+      {groups.length > 0 && (
+        <>
+          <h3 style={{ marginTop: 12 }}>Группы правил</h3>
+          <div className="list">
+            {groups.map((g) => (
+              <div className="item" key={g.via}>
+                <label className="check grow">
+                  <input type="checkbox" checked={g.enabled} onChange={() => toggleGroup(g)} />
+                  через «{g.via}» — {g.patterns.length} правил
+                </label>
+                <button className="btn small" onClick={async () => {
+                  await invoke("group_remove", { via: g.via }); load();
+                }}>Убрать</button>
+              </div>
+            ))}
+          </div>
+          <p className="hint" style={{ marginTop: 6, marginBottom: 0 }}>
+            Галку можно снять, не удаляя правил — тогда они пойдут по общему списку.
+          </p>
+        </>
+      )}
+
+      {adding ? (
+        <div style={{ marginTop: 10 }}>
+          <div className="grid2">
+            <label className="lbl">Имя<input className="field" value={draft.name}
+              placeholder="например, vpn" onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label>
+            <label className="lbl">Протокол
+              <select className="field" value={draft.kind}
+                onChange={(e) => setDraft({ ...draft, kind: e.target.value as "socks5" | "http" })}>
+                <option value="socks5">SOCKS5</option>
+                <option value="http">HTTP</option>
+              </select>
+            </label>
+            <label className="lbl">Адрес<input className="field" value={draft.address}
+              placeholder="127.0.0.1" onChange={(e) => setDraft({ ...draft, address: e.target.value })} /></label>
+            <label className="lbl">Порт<input className="field" value={draft.port}
+              onChange={(e) => setDraft({ ...draft, port: Number(e.target.value) || 0 })} /></label>
+            <label className="lbl">Логин<input className="field" value={draft.user ?? ""}
+              onChange={(e) => setDraft({ ...draft, user: e.target.value })} /></label>
+            <label className="lbl">Пароль<input className="field" type="password" value={draft.password ?? ""}
+              onChange={(e) => setDraft({ ...draft, password: e.target.value })} /></label>
+          </div>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button className="btn primary" onClick={save}>Сохранить</button>
+            <button className="btn" onClick={() => { setAdding(false); setErr(""); }}>Отмена</button>
+          </div>
+        </div>
+      ) : (
+        <button className="btn" style={{ marginTop: 10 }} onClick={() => setAdding(true)}>
+          Добавить прокси
+        </button>
+      )}
+      {err && <div className="note" style={{ marginTop: 8 }}>{err}</div>}
+    </div>
+  );
+}
+
+/* ─────────────── Обновления ─────────────── */
+
+/// Куда ходит проверка обновлений: сам список и скачивание файла
+/// идут с разных доменов GitHub, поэтому их три.
+const UPDATE_HOSTS = [
+  "github.com",
+  "objects.githubusercontent.com",
+  "github-releases.githubusercontent.com",
+];
+
+function Updates() {
+  const [state, setState] = useState<"idle" | "checking" | "none" | "found" | "installing" | "error">("idle");
+  const [version, setVersion] = useState("");
+  const [err, setErr] = useState("");
+  const [added, setAdded] = useState(false);
+
+  // Тихая проверка при запуске: за корпоративным периметром канал обновлений
+  // может быть недоступен, и это НЕ повод показывать ошибку.
+  useEffect(() => {
+    checkUpdate()
+      .then((u) => { if (u) { setVersion(u.version); setState("found"); } })
+      .catch(() => {});
+  }, []);
+
+  const look = async () => {
+    setState("checking"); setErr("");
+    try {
+      const u = await checkUpdate();
+      if (u) { setVersion(u.version); setState("found"); } else setState("none");
+    } catch (e) { setErr(String(e)); setState("error"); }
+  };
+
+  const install = async () => {
+    setState("installing");
+    try {
+      const u = await checkUpdate();
+      if (!u) { setState("none"); return; }
+      await u.downloadAndInstall();
+      await relaunch();
+    } catch (e) { setErr(String(e)); setState("error"); }
+  };
+
+  return (
+    <div className="card">
+      <h3>Обновления</h3>
+      <div className="row">
+        <button className="btn" onClick={look} disabled={state === "checking" || state === "installing"}>
+          {state === "checking" ? "Проверяю…" : "Проверить обновления"}
+        </button>
+        {state === "found" && (
+          <button className="btn primary" onClick={install} disabled={state !== "found"}>
+            Обновить до {version}
+          </button>
+        )}
+        {state === "none" && <span className="meta">установлена свежая версия</span>}
+        {state === "installing" && <span className="meta">качаю и ставлю…</span>}
+      </div>
+      {state === "error" && (
+        <div className="note" style={{ marginTop: 10 }}>
+          <b>Не удалось проверить обновления.</b>
+          <span>{err}</span>
+          <span>
+            Скорее всего, эти адреса закрыты и их нужно пустить через прокси:
+          </span>
+          <div style={{ fontFamily: "ui-monospace, Consolas, monospace", fontSize: "12px", margin: "4px 0" }}>
+            {UPDATE_HOSTS.map((h) => <div key={h}>{h}</div>)}
+          </div>
+          <div className="row">
+            {added ? (
+              <span className="meta">добавлено — попробуй проверить ещё раз</span>
+            ) : (
+              <button className="btn small" onClick={async () => {
+                await invoke("rule_add", { text: UPDATE_HOSTS.join("\n") });
+                setAdded(true);
+              }}>Добавить их в правила</button>
+            )}
+            <button className="btn small" onClick={() => navigator.clipboard.writeText(UPDATE_HOSTS.join("\n"))}>
+              Копировать
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

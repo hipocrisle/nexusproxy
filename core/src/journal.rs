@@ -35,22 +35,13 @@ pub fn push(host: &str, port: u16, route: &Route) {
         id,
         host: host.to_string(),
         port,
-        route: match route {
-            Route::Proxy => "proxy",
-            Route::Direct => "direct",
-            Route::Block => "block",
-        }
-        .to_string(),
+        route: route.tag().to_string(),
     });
     while j.items.len() > CAP {
         j.items.pop_front();
     }
     drop(g);
-    let mark = match route {
-        Route::Proxy => "через прокси",
-        Route::Direct => "напрямую",
-        Route::Block => "запрещено",
-    };
+    let mark = route.label();
     crate::logfile::line(&crate::logfile::now_stamp(), &format!("{mark:12} {host}:{port}"));
 }
 
@@ -79,7 +70,7 @@ mod tests {
     fn journal_behaviour() {
         let _guard = crate::logfile::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         enable();
-        push("a.example", 443, &Route::Proxy);
+        push("a.example", 443, &Route::proxy());
         push("b.example", 80, &Route::Direct);
         let all = since(0);
         assert_eq!(all.len(), 2);

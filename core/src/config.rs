@@ -57,9 +57,28 @@ pub struct BulkResult {
     pub invalid: Vec<String>,
 }
 
+/// Группа правил, идущих через один и тот же прокси.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteGroup {
+    /// Имя прокси из списка upstreams.
+    pub via: String,
+    /// Можно выключить группу целиком, не удаляя правил.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Основной прокси. Оставлен ради совместимости со старыми настройками.
     pub upstream: Upstream,
+    /// Дополнительные прокси, на которые ссылаются группы правил.
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
+    /// Правила, идущие через отдельные прокси.
+    #[serde(default)]
+    pub groups: Vec<RouteGroup>,
     #[serde(default)]
     pub listen: Listen,
     /// Ресурсы, которые идут ЧЕРЕЗ вышестоящий прокси. Всё остальное — напрямую.
@@ -133,7 +152,7 @@ impl Config {
             let normalized = normalize(item);
             // проверяем, что запись вообще осмысленная
             let mut probe = crate::rules::Rules::new(crate::rules::Route::Direct);
-            if let Err(e) = probe.add(&normalized, crate::rules::Route::Proxy) {
+            if let Err(e) = probe.add(&normalized, crate::rules::Route::proxy()) {
                 r.invalid.push(format!("{item} — {e}"));
                 continue;
             }
@@ -160,10 +179,48 @@ impl Config {
         for p in &self.direct {
             r.add(p, Route::Direct)?;
         }
+        // затем группы: они адреснее общего списка
+        for g in &self.groups {
+            if !g.enabled {
+                continue;
+            }
+            for p in &g.patterns {
+                r.add(p, Route::Proxy(g.via.clone()))?;
+            }
+        }
         for p in &self.through_proxy {
-            r.add(p, Route::Proxy)?;
+            r.add(p, Route::proxy())?;
         }
         Ok(r)
+    }
+
+    /// Найти прокси по имени. Пустое имя — основной.
+    pub fn upstream_by_name(&self, name: &str) -> Option<&Upstream> {
+        if name.is_empty() {
+            return Some(&self.upstream);
+        }
+        self.upstreams
+            .iter()
+            .find(|u| u.name == name)
+            .or(if self.upstream.name == name { Some(&self.upstream) } else { None })
+    }
+
+    /// Все прокси одним списком — для показа и для проверки ссылок.
+    pub fn all_upstreams(&self) -> Vec<Upstream> {
+        let mut v = vec![self.upstream.clone()];
+        v.extend(self.upstreams.iter().cloned());
+        v
+    }
+
+    /// Группы не должны ссылаться на несуществующий прокси —
+    /// иначе трафик молча никуда не пойдёт.
+    pub fn check_links(&self) -> Result<(), String> {
+        for g in &self.groups {
+            if self.upstream_by_name(&g.via).is_none() {
+                return Err(format!("группа ссылается на неизвестный прокси «{}»", g.via));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -174,9 +231,12 @@ mod tests {
     fn cfg(through: &[&str], direct: &[&str]) -> Config {
         Config {
             upstream: Upstream {
+                name: String::new(), kind: Default::default(),
                 address: "127.0.0.1".into(), port: 1080, user: None, password: None,
             },
             listen: Listen::default(),
+            upstreams: vec![],
+            groups: vec![],
             through_proxy: through.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
             auto_reconnect: true,
@@ -189,7 +249,7 @@ mod tests {
     fn exception_beats_proxy_rule() {
         // весь домен через прокси, но один поддомен — напрямую
         let r = cfg(&["domain:corp.example"], &["domain:cdn.corp.example"]).rules().unwrap();
-        assert_eq!(r.decide("api.corp.example"), Route::Proxy);
+        assert_eq!(r.decide("api.corp.example"), Route::proxy());
         assert_eq!(r.decide("cdn.corp.example"), Route::Direct);
         assert_eq!(r.decide("a.cdn.corp.example"), Route::Direct);
     }
@@ -222,6 +282,49 @@ mod tests {
         assert_eq!(c.through_proxy.len(), 2);
         assert!(c.remove_proxy("2IP.IO"));
         assert!(!c.remove_proxy("2ip.io"));
+    }
+
+    fn up(name: &str, port: u16) -> Upstream {
+        Upstream {
+            name: name.into(), kind: Default::default(),
+            address: "127.0.0.1".into(), port, user: None, password: None,
+        }
+    }
+
+    #[test]
+    fn group_routes_to_its_own_proxy() {
+        let mut c = cfg(&["domain:openai.com"], &[]);
+        c.upstreams = vec![up("vpn", 10808)];
+        c.groups = vec![RouteGroup {
+            via: "vpn".into(), enabled: true,
+            patterns: vec!["domain:youtube.com".into()],
+        }];
+        let r = c.rules().unwrap();
+        assert_eq!(r.decide("api.openai.com"), Route::proxy(), "общий список — основной прокси");
+        assert_eq!(r.decide("www.youtube.com"), Route::Proxy("vpn".into()), "группа — свой прокси");
+        assert!(c.check_links().is_ok());
+    }
+
+    #[test]
+    fn disabled_group_falls_back() {
+        let mut c = cfg(&[], &[]);
+        c.upstreams = vec![up("vpn", 10808)];
+        c.groups = vec![RouteGroup {
+            via: "vpn".into(), enabled: false,
+            patterns: vec!["domain:youtube.com".into()],
+        }];
+        // выключенная группа не должна ничего заворачивать
+        assert_eq!(c.rules().unwrap().decide("youtube.com"), Route::Direct);
+    }
+
+    #[test]
+    fn broken_link_is_reported() {
+        let mut c = cfg(&[], &[]);
+        c.groups = vec![RouteGroup {
+            via: "нет-такого".into(), enabled: true, patterns: vec!["a.example".into()],
+        }];
+        // иначе трафик молча никуда не пойдёт
+        assert!(c.check_links().is_err());
     }
 
     #[test]

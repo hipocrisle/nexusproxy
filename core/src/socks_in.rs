@@ -1,16 +1,17 @@
 //! Входящий SOCKS5 — для приложений, которые умеют работать через SOCKS.
 
 use crate::rules::Rules;
-use crate::upstream::{dial, Upstream};
+use crate::upstream::{dial, Pool};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::RwLock<Rules>>)
-    -> io::Result<()>
+pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
+                    rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
+    let app = c.peer_addr().map(|a| crate::proc::app_by_port(a.port())).unwrap_or_default();
 
     // приветствие клиента
     let mut head = [0u8; 2];
@@ -65,10 +66,16 @@ pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::R
     c.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
 
-    match dial(&up, &rules, &host, port).await {
-        Ok(mut server) => {
+    match dial(&pool, &rules, &host, port).await {
+        Ok((mut server, d)) => {
             reply(&mut c, 0x00).await?;
-            let _ = copy_bidirectional(&mut c, &mut server).await;
+            let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+            let (up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
+            crate::conns::close(id, up_b, down_b);
+            crate::logfile::line(
+                &crate::logfile::now_stamp(),
+                &format!("закрыто  {host}:{port} · {} · отдано {up_b} получено {down_b}", d.route.label()),
+            );
             Ok(())
         }
         Err(e) => {

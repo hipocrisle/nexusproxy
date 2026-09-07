@@ -3,7 +3,7 @@
 //! SOCKS он не поддерживает.
 
 use crate::rules::Rules;
-use crate::upstream::{dial, Upstream};
+use crate::upstream::{dial, Pool};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
@@ -11,10 +11,12 @@ use tokio::net::TcpStream;
 
 const MAX_HEAD: usize = 64 * 1024;
 
-pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::RwLock<Rules>>)
-    -> io::Result<()>
+pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
+                    rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
+    // порт клиента нужен, чтобы понять, какое приложение пришло
+    let app = c.peer_addr().map(|a| crate::proc::app_by_port(a.port())).unwrap_or_default();
 
     // читаем заголовок до пустой строки
     let mut buf = Vec::with_capacity(2048);
@@ -44,15 +46,24 @@ pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::R
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target, 443)?;
-        return match dial(&up, &rules, &host, port).await {
-            Ok(mut server) => {
+        return match dial(&pool, &rules, &host, port).await {
+            Ok((mut server, d)) => {
                 c.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
                 // всё, что клиент успел прислать после заголовка, — уже полезные данные
                 let rest = &buf[head_end..];
+                // эти байты уходят до начала перекачки — иначе не попали бы в счёт
+                let pre = rest.len() as u64;
                 if !rest.is_empty() {
                     server.write_all(rest).await?;
                 }
-                let _ = copy_bidirectional(&mut c, &mut server).await;
+                let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+                let (mut up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
+                up_b += pre;
+                crate::conns::close(id, up_b, down_b);
+                crate::logfile::line(
+                    &crate::logfile::now_stamp(),
+                    &format!("закрыто  {host}:{port} · {} · отдано {up_b} получено {down_b}", d.route.label()),
+                );
                 Ok(())
             }
             Err(e) => {
@@ -64,8 +75,8 @@ pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::R
 
     // обычный запрос в абсолютной форме: GET http://host/path
     let (host, port, path) = split_absolute(&target)?;
-    let mut server = match dial(&up, &rules, &host, port).await {
-        Ok(s) => s,
+    let (mut server, d) = match dial(&pool, &rules, &host, port).await {
+        Ok(v) => v,
         Err(e) => {
             respond(&mut c, 502, "Bad Gateway").await.ok();
             return Err(e);
@@ -88,13 +99,18 @@ pub async fn handle(mut c: TcpStream, up: Arc<Upstream>, rules: Arc<std::sync::R
         out.push_str("\r\n");
     }
     out.push_str("\r\n");
+    let mut pre = out.len() as u64;
     server.write_all(out.as_bytes()).await?;
 
     let rest = &buf[head_end..];
+    pre += rest.len() as u64;
     if !rest.is_empty() {
         server.write_all(rest).await?;
     }
-    let _ = copy_bidirectional(&mut c, &mut server).await;
+    let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+    let (mut up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
+    up_b += pre;
+    crate::conns::close(id, up_b, down_b);
     Ok(())
 }
 
