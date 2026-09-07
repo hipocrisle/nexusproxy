@@ -10,6 +10,7 @@ pub mod journal;
 pub mod logfile;
 pub mod presets;
 pub mod proc;
+pub mod pump;
 pub mod report;
 pub mod rules;
 pub mod socks_in;

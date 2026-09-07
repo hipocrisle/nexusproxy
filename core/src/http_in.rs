@@ -6,7 +6,7 @@ use crate::rules::Rules;
 use crate::upstream::{dial, Pool};
 use std::io;
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const MAX_HEAD: usize = 64 * 1024;
@@ -56,9 +56,9 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
                 if !rest.is_empty() {
                     server.write_all(rest).await?;
                 }
-                let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
-                let (mut up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
-                up_b += pre;
+                let (id, counters) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+                counters.sent.fetch_add(pre, std::sync::atomic::Ordering::Relaxed);
+                let (up_b, down_b) = crate::pump::both_ways(c, server, counters).await;
                 crate::conns::close(id, up_b, down_b);
                 crate::logfile::line(
                     &crate::logfile::now_stamp(),
@@ -107,9 +107,9 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
     if !rest.is_empty() {
         server.write_all(rest).await?;
     }
-    let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
-    let (mut up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
-    up_b += pre;
+    let (id, counters) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+    counters.sent.fetch_add(pre, std::sync::atomic::Ordering::Relaxed);
+    let (up_b, down_b) = crate::pump::both_ways(c, server, counters).await;
     crate::conns::close(id, up_b, down_b);
     Ok(())
 }

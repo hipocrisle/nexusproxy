@@ -9,10 +9,14 @@ const CAP: usize = 3000;
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Entry {
     pub id: u64,
+    /// Время по местным часам — то же, что и в файле журнала.
+    pub at: String,
     pub host: String,
     pub port: u16,
     /// «proxy» | «direct» | «block»
     pub route: String,
+    /// Через какой прокси, если через прокси.
+    pub via: String,
 }
 
 struct Journal {
@@ -27,22 +31,30 @@ pub fn enable() {
 }
 
 pub fn push(host: &str, port: u16, route: &Route) {
+    let stamp = crate::logfile::now_stamp();
+    // в окне удобнее только время, дата и так видна в файле
+    let short = stamp.rsplit(' ').next().unwrap_or(&stamp).to_string();
+    let via = match route {
+        Route::Proxy(n) => n.clone(),
+        _ => String::new(),
+    };
     let mut g = J.lock().unwrap();
     let Some(j) = g.as_mut() else { return };
     let id = j.next_id;
     j.next_id += 1;
     j.items.push_back(Entry {
         id,
+        at: short,
         host: host.to_string(),
         port,
         route: route.tag().to_string(),
+        via,
     });
     while j.items.len() > CAP {
         j.items.pop_front();
     }
     drop(g);
-    let mark = route.label();
-    crate::logfile::line(&crate::logfile::now_stamp(), &format!("{mark:12} {host}:{port}"));
+    crate::logfile::line(&stamp, &format!("{:12} {host}:{port}", route.label()));
 }
 
 /// Всё, что появилось после указанного номера.

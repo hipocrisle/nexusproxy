@@ -165,12 +165,21 @@ impl Config {
         r
     }
 
-    /// Убрать ресурс из списка. Возвращает false, если его там не было.
+    /// Убрать ресурс отовсюду: и из общего списка, и из групп.
+    /// ⛔ Раньше чистился только общий список, и правило, переведённое
+    /// на другой прокси, удалить было нельзя — оно молча оставалось.
     pub fn remove_proxy(&mut self, pattern: &str) -> bool {
         let p = normalize(pattern);
-        let before = self.through_proxy.len();
+        let before = self.through_proxy.len()
+            + self.groups.iter().map(|g| g.patterns.len()).sum::<usize>();
         self.through_proxy.retain(|x| normalize(x) != p);
-        self.through_proxy.len() != before
+        for g in self.groups.iter_mut() {
+            g.patterns.retain(|x| normalize(x) != p);
+        }
+        self.groups.retain(|g| !g.patterns.is_empty());
+        let after = self.through_proxy.len()
+            + self.groups.iter().map(|g| g.patterns.len()).sum::<usize>();
+        after != before
     }
 
     pub fn rules(&self) -> Result<Rules, String> {
@@ -303,6 +312,21 @@ mod tests {
         assert_eq!(r.decide("api.openai.com"), Route::proxy(), "общий список — основной прокси");
         assert_eq!(r.decide("www.youtube.com"), Route::Proxy("vpn".into()), "группа — свой прокси");
         assert!(c.check_links().is_ok());
+    }
+
+    #[test]
+    fn removing_cleans_groups_too() {
+        let mut c = cfg(&[], &[]);
+        c.upstreams = vec![up("vpn", 10808)];
+        c.groups = vec![RouteGroup {
+            via: "vpn".into(), enabled: true,
+            patterns: vec!["domain:youtube.com".into(), "domain:ytimg.com".into()],
+        }];
+        assert!(c.remove_proxy("youtube.com"), "правило из группы должно удаляться");
+        assert_eq!(c.groups[0].patterns, vec!["domain:ytimg.com"]);
+        assert!(c.remove_proxy("ytimg.com"));
+        assert!(c.groups.is_empty(), "опустевшая группа убирается");
+        assert!(!c.remove_proxy("ytimg.com"), "повторное удаление — уже нечего");
     }
 
     #[test]

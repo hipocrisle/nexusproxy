@@ -164,7 +164,9 @@ label.lbl { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; 
 }
 .preset:hover { border-color: var(--accent); }
 .preset b { display: block; font-size: 13px; }
-.preset span { color: var(--muted); font-size: 11.5px; }
+.preset span { display: block; color: var(--muted); font-size: 11.5px; }
+.preset .doms { margin-top: 4px; font-family: ui-monospace, Consolas, monospace;
+  font-size: 10.5px; line-height: 1.45; opacity: .75; }
 .preset.done { border-color: var(--ok); color: var(--ok); }
 
 .item input.edit {
@@ -190,3 +192,11 @@ label.lbl { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; 
 .col-b { width: 82px; flex: 0 0 auto; text-align: right; font-variant-numeric: tabular-nums; }
 
 select.field { appearance: auto; }
+
+.small-sel { width: 132px; flex: 0 0 auto; padding: 3px 6px; font-size: 12px; }
+
+.log .at { color: var(--muted); width: 62px; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.sortable { cursor: pointer; user-select: none; }
+.sortable:hover { color: var(--ink); }
+
+.col-n { width: 92px; flex: 0 0 auto; text-align: right; font-variant-numeric: tabular-nums; }

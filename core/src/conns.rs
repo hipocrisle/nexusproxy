@@ -42,8 +42,9 @@ struct Live {
     via: String,
     app: String,
     started: Instant,
-    sent: u64,
-    received: u64,
+    /// Счётчики обновляются по ходу перекачки, поэтому в таблице
+    /// видно объём ещё до закрытия соединения.
+    counters: std::sync::Arc<crate::pump::Counters>,
 }
 
 #[derive(Default)]
@@ -59,17 +60,21 @@ pub fn enable() {
     *S.lock().unwrap() = Some(State::default());
 }
 
-/// Соединение открылось. Возвращает номер, по которому его потом закрывать.
-pub fn open(host: &str, port: u16, route: &str, via: &str, app: &str) -> u64 {
+/// Соединение открылось. Возвращает номер и счётчики, которые
+/// заполняются по ходу передачи.
+pub fn open(host: &str, port: u16, route: &str, via: &str, app: &str)
+    -> (u64, std::sync::Arc<crate::pump::Counters>)
+{
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let counters = std::sync::Arc::new(crate::pump::Counters::default());
     if let Some(s) = S.lock().unwrap().as_mut() {
         s.live.insert(id, Live {
             host: host.to_string(), port, route: route.to_string(),
             via: via.to_string(), app: app.to_string(),
-            started: Instant::now(), sent: 0, received: 0,
+            started: Instant::now(), counters: counters.clone(),
         });
     }
-    id
+    (id, counters)
 }
 
 /// Соединение закрылось: переносим объём в итоги по домену.
@@ -89,10 +94,13 @@ pub fn close(id: u64, sent: u64, received: u64) {
 pub fn active() -> Vec<Conn> {
     let g = S.lock().unwrap();
     let Some(s) = g.as_ref() else { return Vec::new() };
-    let mut v: Vec<Conn> = s.live.iter().map(|(id, c)| Conn {
-        id: *id, host: c.host.clone(), port: c.port, route: c.route.clone(),
-        via: c.via.clone(), app: c.app.clone(),
-        seconds: c.started.elapsed().as_secs(), sent: c.sent, received: c.received,
+    let mut v: Vec<Conn> = s.live.iter().map(|(id, c)| {
+        let (sent, received) = c.counters.get();
+        Conn {
+            id: *id, host: c.host.clone(), port: c.port, route: c.route.clone(),
+            via: c.via.clone(), app: c.app.clone(),
+            seconds: c.started.elapsed().as_secs(), sent, received,
+        }
     }).collect();
     v.sort_by(|a, b| b.id.cmp(&a.id));
     v
@@ -126,8 +134,10 @@ mod tests {
     #[test]
     fn open_shows_up_and_close_moves_to_totals() {
         let _g = fresh();
-        let id = open("api.openai.com", 443, "proxy", "офис", "codex.exe");
+        let (id, counters) = open("api.openai.com", 443, "proxy", "офис", "codex.exe");
+        counters.sent.fetch_add(700, std::sync::atomic::Ordering::Relaxed);
         let live = active();
+        assert_eq!(live[0].sent, 700, "объём должен быть виден до закрытия");
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].host, "api.openai.com");
         assert_eq!(live[0].via, "офис");
@@ -147,7 +157,7 @@ mod tests {
         // у ютуба каждое соединение с новым именем — в итогах должна быть одна строка
         let _g = fresh();
         for i in 0..3 {
-            let id = open(&format!("rr{i}---sn-x.googlevideo.com"), 443, "proxy", "", "");
+            let (id, _) = open(&format!("rr{i}---sn-x.googlevideo.com"), 443, "proxy", "", "");
             close(id, 100, 1_000_000);
         }
         let t = totals();
@@ -160,8 +170,8 @@ mod tests {
     #[test]
     fn totals_sorted_by_volume() {
         let _g = fresh();
-        let a = open("small.example", 443, "direct", "", ""); close(a, 1, 1);
-        let b = open("big.example", 443, "direct", "", ""); close(b, 1, 999_999);
+        let (a, _) = open("small.example", 443, "direct", "", ""); close(a, 1, 1);
+        let (b, _) = open("big.example", 443, "direct", "", ""); close(b, 1, 999_999);
         assert_eq!(totals()[0].domain, "big.example");
     }
 }

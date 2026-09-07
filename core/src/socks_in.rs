@@ -4,7 +4,7 @@ use crate::rules::Rules;
 use crate::upstream::{dial, Pool};
 use std::io;
 use std::sync::Arc;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
@@ -69,8 +69,8 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
     match dial(&pool, &rules, &host, port).await {
         Ok((mut server, d)) => {
             reply(&mut c, 0x00).await?;
-            let id = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
-            let (up_b, down_b) = copy_bidirectional(&mut c, &mut server).await.unwrap_or((0, 0));
+            let (id, counters) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+            let (up_b, down_b) = crate::pump::both_ways(c, server, counters).await;
             crate::conns::close(id, up_b, down_b);
             crate::logfile::line(
                 &crate::logfile::now_stamp(),

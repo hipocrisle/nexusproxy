@@ -69,9 +69,17 @@ fn status(app: State<App>) -> Status {
     }
 }
 
+/// Одно правило вместе с тем, через какой прокси оно идёт.
+#[derive(Serialize)]
+pub struct RuleItem {
+    pattern: String,
+    /// пустое — основной прокси
+    via: String,
+}
+
 #[derive(Serialize)]
 pub struct RuleLists {
-    through_proxy: Vec<String>,
+    items: Vec<RuleItem>,
     direct: Vec<String>,
 }
 
@@ -79,7 +87,44 @@ pub struct RuleLists {
 fn rules_list(app: State<App>) -> Result<RuleLists, String> {
     let e = engine(&app)?;
     let c = e.cfg.lock().unwrap();
-    Ok(RuleLists { through_proxy: c.through_proxy.clone(), direct: c.direct.clone() })
+    let mut items: Vec<RuleItem> = c
+        .through_proxy
+        .iter()
+        .map(|p| RuleItem { pattern: p.clone(), via: String::new() })
+        .collect();
+    for g in &c.groups {
+        for p in &g.patterns {
+            items.push(RuleItem { pattern: p.clone(), via: g.via.clone() });
+        }
+    }
+    Ok(RuleLists { items, direct: c.direct.clone() })
+}
+
+/// Перевести правило на другой прокси. Пустое имя — вернуть на основной.
+#[tauri::command]
+fn rule_set_via(app: State<App>, pattern: String, via: String) -> Result<(), String> {
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        // сначала убираем отовсюду
+        c.through_proxy.retain(|p| p != &pattern);
+        for g in c.groups.iter_mut() {
+            g.patterns.retain(|p| p != &pattern);
+        }
+        c.groups.retain(|g| !g.patterns.is_empty());
+        // затем кладём куда надо
+        if via.is_empty() {
+            c.through_proxy.push(pattern);
+        } else {
+            match c.groups.iter_mut().find(|g| g.via == via) {
+                Some(g) => g.patterns.push(pattern),
+                None => c.groups.push(core::config::RouteGroup {
+                    via, enabled: true, patterns: vec![pattern],
+                }),
+            }
+        }
+    }
+    e.apply_and_save()
 }
 
 #[tauri::command]
@@ -468,7 +513,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            status, rules_list, rule_add, rule_edit, rule_remove,
+            status, rules_list, rule_add, rule_edit, rule_remove, rule_set_via,
             rule_add_from_file, rules_export, presets, check,
             journal_since, journal_clear, open_folder,
             conns_active, conns_totals, conns_reset,

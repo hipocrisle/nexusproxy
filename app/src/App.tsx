@@ -13,7 +13,7 @@ type Status = {
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
-type Entry = { id: number; host: string; port: number; route: string };
+type Entry = { id: number; at: string; host: string; port: number; route: string; via: string };
 type Candidate = {
   domain: string; count: number; hosts_count: number;
   examples: string[]; triggered_by: string | null;
@@ -88,16 +88,16 @@ export default function App() {
         <span className="brand">NexusProxy</span>
         <span className={"pill" + (st?.system_on ? " on" : "")}>
           <span className="dot" />
-          {st?.system_on ? "трафик идёт через нас" : "выключен"}
+          {st?.system_on ? "перехват включён" : "выключен"}
         </span>
         {st?.running && !st.upstream_up && (
           <span className="pill down" title={st.upstream_error ?? ""}>
-            <span className="dot" />вышестоящий прокси не отвечает
+            <span className="dot" />прокси не отвечает
           </span>
         )}
         <span className="grow" />
         <span className="meta">
-          {st?.running ? `${st.upstream} · правил ${st.rules_count}` : "движок не запущен"}
+          {st?.running ? `${st.upstream} · правил ${st.rules_count}` : "служба не запущена"}
         </span>
         <div className="theme">
           {(["system", "light", "dark"] as const).map((t) => (
@@ -135,8 +135,11 @@ export default function App() {
 
 /* ─────────────── Правила ─────────────── */
 
+type RuleItem = { pattern: string; via: string };
+
 function Rules({ onChange }: { onChange: () => void }) {
-  const [items, setItems] = useState<string[]>([]);
+  const [items, setItems] = useState<RuleItem[]>([]);
+  const [ups, setUps] = useState<Upstream[]>([]);
   const [text, setText] = useState("");
   const [result, setResult] = useState<Bulk | null>(null);
   const [probe, setProbe] = useState("");
@@ -148,8 +151,10 @@ function Rules({ onChange }: { onChange: () => void }) {
 
   const load = useCallback(async () => {
     try {
-      const r = await invoke<{ through_proxy: string[] }>("rules_list");
-      setItems(r.through_proxy);
+      const r = await invoke<{ items: RuleItem[] }>("rules_list");
+      setItems(r.items);
+      const u = await invoke<{ upstreams: Upstream[] }>("upstreams_list");
+      setUps(u.upstreams);
     } catch { /* движок ещё не поднялся */ }
   }, []);
   useEffect(() => { load(); invoke<Preset[]>("presets").then(setPresets).catch(() => {}); }, [load]);
@@ -185,27 +190,35 @@ function Rules({ onChange }: { onChange: () => void }) {
     setVerdicts(await invoke("check", { hosts }));
   };
 
-  const plain = items.filter((i) => !i.startsWith("_"));
-  const shown = plain.filter((i) => !filter || i.toLowerCase().includes(filter.toLowerCase()));
-  const copyAll = () => navigator.clipboard.writeText(shown.join("\n"));
-  const hasAll = (p: Preset) => p.domains.every((d) => plain.some((i) => i === "domain:" + d));
+  const plain = items.filter((i) => !i.pattern.startsWith("_"));
+  const shown = plain.filter((i) => !filter || i.pattern.toLowerCase().includes(filter.toLowerCase()));
+  const copyAll = () => navigator.clipboard.writeText(shown.map((i) => i.pattern).join("\n"));
+  const hasAll = (p: Preset) => p.domains.every((d) => plain.some((i) => i.pattern === "domain:" + d));
+  const upName = (u: Upstream) => u.name || "основной";
+  const togglePreset = async (p: Preset) => {
+    if (hasAll(p)) {
+      for (const d of p.domains) await invoke("rule_remove", { pattern: "domain:" + d });
+    } else {
+      await invoke<Bulk>("rule_add", { text: p.domains.join("\n") });
+    }
+    load(); onChange();
+  };
 
   return (
     <div className="panel split">
       <div className="card wide">
         <h3>Готовые наборы</h3>
         <p className="hint">
-          Добавляют сразу все домены сервиса. Подбирать их по одному долго, а для
-          ходовых список известен заранее — например, ютубу нужен ещё
-          <code>googlevideo.com</code>, откуда раздаётся само видео.
+Щелчок добавляет домены набора, повторный убирает. Галочка — набор добавлен.
         </p>
         <div className="presets">
           {presets.map((p) => (
             <button key={p.name} className={"preset" + (hasAll(p) ? " done" : "")}
-              onClick={() => addText(p.domains.join("\n"))}
-              title={p.domains.join(", ")}>
+              onClick={() => togglePreset(p)}
+              title={hasAll(p) ? "щёлкни, чтобы убрать эти домены" : "щёлкни, чтобы добавить"}>
               <b>{hasAll(p) ? "✓ " : "+ "}{p.name}</b>
               <span>{p.note}</span>
+              <span className="doms">{p.domains.join(", ")}</span>
             </button>
           ))}
         </div>
@@ -214,8 +227,8 @@ function Rules({ onChange }: { onChange: () => void }) {
       <div className="card">
         <h3>Добавить своё</h3>
         <p className="hint">
-          Списком: домены, адреса и диапазоны вперемешку, по строке или через запятую.
-          Ссылки можно вставлять целиком — останется имя узла.
+Домены, адреса и подсети. Разделители: перевод строки, запятая, пробел.
+          Из ссылки берётся только имя узла.
         </p>
         <textarea className="field" value={text} placeholder={"openai.com\n10.0.0.0/8\n192.168.1.10"}
           onChange={(e) => setText(e.target.value)} />
@@ -239,7 +252,7 @@ function Rules({ onChange }: { onChange: () => void }) {
 
       <div className="card">
         <h3>Проверить, каким путём пойдёт</h3>
-        <p className="hint">Отвечает по текущим правилам, ничего не открывая.</p>
+        <p className="hint">Результат по текущим правилам, без обращения к ресурсу.</p>
         <div className="row">
           <input className="field" value={probe} placeholder="api.openai.com"
             onChange={(e) => setProbe(e.target.value)} onKeyDown={(e) => e.key === "Enter" && doCheck()} />
@@ -260,6 +273,7 @@ function Rules({ onChange }: { onChange: () => void }) {
       <div className="card wide">
         <div className="row" style={{ marginBottom: 8 }}>
           <h3 style={{ margin: 0 }}>В списке — {plain.length}</h3>
+          {ups.length > 1 && <span className="meta">колонка справа — назначенный прокси</span>}
           <span className="grow" />
           <input className="field" style={{ maxWidth: 220 }} placeholder="поиск"
             value={filter} onChange={(e) => setFilter(e.target.value)} />
@@ -275,25 +289,37 @@ function Rules({ onChange }: { onChange: () => void }) {
           }}>Выгрузить в файл</button>
         </div>
         <div className="list">
-          {plain.length === 0 && <div className="empty">Пока пусто. Весь трафик идёт напрямую.</div>}
-          {shown.map((p) => (
-            <div className="item" key={p}>
-              {editing === p ? (
+          {plain.length === 0 && <div className="empty">Правил нет — весь трафик идёт напрямую.</div>}
+          {shown.map((it) => (
+            <div className="item" key={it.pattern}>
+              {editing === it.pattern ? (
                 <>
                   <input className="edit" value={draft} autoFocus
                     onChange={(e) => setDraft(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") saveEdit(p);
+                      if (e.key === "Enter") saveEdit(it.pattern);
                       if (e.key === "Escape") setEditing(null);
                     }} />
-                  <button className="btn small" onClick={() => saveEdit(p)}>Сохранить</button>
+                  <button className="btn small" onClick={() => saveEdit(it.pattern)}>Сохранить</button>
                   <button className="btn small" onClick={() => setEditing(null)}>Отмена</button>
                 </>
               ) : (
                 <>
-                  <span className="grow">{p}</span>
-                  <button className="btn small" onClick={() => { setEditing(p); setDraft(p); }}>Править</button>
-                  <button className="btn small" onClick={() => remove(p)}>Убрать</button>
+                  <span className="grow">{it.pattern}</span>
+                  {ups.length > 1 && (
+                    <select className="field small-sel" value={it.via}
+                      title="через какой прокси пускать"
+                      onChange={async (e) => {
+                        await invoke("rule_set_via", { pattern: it.pattern, via: e.target.value });
+                        load(); onChange();
+                      }}>
+                      {ups.map((u, i) => (
+                        <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                      ))}
+                    </select>
+                  )}
+                  <button className="btn small" onClick={() => { setEditing(it.pattern); setDraft(it.pattern); }}>Править</button>
+                  <button className="btn small" onClick={() => remove(it.pattern)}>Убрать</button>
                 </>
               )}
             </div>
@@ -338,24 +364,18 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
       <div className="card">
         <h3>Подбор сопутствующих доменов</h3>
         <p className="hint">
-          Нажми «Начать», открой нужный сервис и попользуйся им. Ниже появятся домены,
-          которые пошли мимо прокси сразу после обращений через него.
+          Записывает адреса, ушедшие напрямую в течение 15 секунд после обращения
+          через прокси. Адреса, встречавшиеся до начала записи, исключаются.
         </p>
         <p className="hint">
-          Предлагается <b>домен целиком</b>, а не отдельные имена узлов: у видео на
-          ютубе имена вида <code>rr3---sn-4g5edndz.googlevideo.com</code> меняются
-          каждый сеанс, и добавлять их поштучно бесполезно. Рядом с каждым доменом
-          показано, сколько разных имён за ним стояло.
-        </p>
-        <p className="hint">
-          Всё, что программа видела до начала подбора, в список не попадает — так
-          отсеиваются мониторинг, реклама и прочий постоянный фон.
+          Результат сводится к домену второго уровня: имена узлов у части сервисов
+          генерируются на каждый сеанс. В скобках — сколько имён относится к домену.
         </p>
         <div className="row">
           {!active
             ? <button className="btn primary" onClick={start}>Начать подбор</button>
             : <button className="btn" onClick={stop}>Закончить</button>}
-          {active && <span className="meta">идёт запись — открой нужный сервис</span>}
+          {active && <span className="meta">идёт запись</span>}
           <span className="grow" />
           {active && live.length > 0 && (
             <>
@@ -372,7 +392,7 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
         <div className="card">
           <h3>Найдено доменов — {live.length}</h3>
           <div className="list">
-            {live.length === 0 && <div className="empty">Пока ничего нового. Открой сервис и попользуйся им.</div>}
+            {live.length === 0 && <div className="empty">Новых адресов не зафиксировано.</div>}
             {live.map((c) => (
               <div className="item" key={c.domain}>
                 <span className="grow">
@@ -397,9 +417,18 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
 
 /* ─────────────── Соединения и трафик ─────────────── */
 
+type SortKey = "host" | "app" | "seconds" | "sent" | "received";
+
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
   const [totals, setTotals] = useState<DomainStat[]>([]);
+  const [filter, setFilter] = useState("");
+  const [onlyProxy, setOnlyProxy] = useState(false);
+  const [sort, setSort] = useState<SortKey>("received");
+  const [asc, setAsc] = useState(false);
+
+  const flip = (k: SortKey) => { if (sort === k) setAsc(!asc); else { setSort(k); setAsc(false); } };
+  const arrow = (k: SortKey) => (sort === k ? (asc ? " ↑" : " ↓") : "");
 
   useEffect(() => {
     const tick = async () => {
@@ -415,6 +444,21 @@ function Connections() {
   const viaProxy = totals.filter((t) => t.route === "proxy")
     .reduce((a, t) => a + t.sent + t.received, 0);
 
+  const match = (host: string, app: string) =>
+    !filter || (host + " " + app).toLowerCase().includes(filter.toLowerCase());
+
+  const shownLive = live
+    .filter((c) => (!onlyProxy || c.route === "proxy") && match(c.host, c.app))
+    .sort((a, b) => {
+      const d = sort === "host" ? a.host.localeCompare(b.host)
+        : sort === "app" ? (a.app || "").localeCompare(b.app || "")
+        : (a[sort] as number) - (b[sort] as number);
+      return asc ? d : -d;
+    });
+
+  const shownTotals = totals
+    .filter((t) => (!onlyProxy || t.route === "proxy") && match(t.domain, ""));
+
   return (
     <div className="panel">
       <div className="card">
@@ -426,17 +470,25 @@ function Connections() {
           </span>
           <button className="btn small" onClick={() => invoke("conns_reset")}>Сбросить счётчики</button>
         </div>
+        <div className="row" style={{ marginTop: 8 }}>
+          <input className="field" placeholder="поиск по адресу или приложению"
+            value={filter} onChange={(e) => setFilter(e.target.value)} />
+          <label className="check">
+            <input type="checkbox" checked={onlyProxy} onChange={(e) => setOnlyProxy(e.target.checked)} />
+            только через прокси
+          </label>
+        </div>
         <div className="list" style={{ marginTop: 8 }}>
           <div className="item head">
-            <span className="grow">Куда</span>
-            <span className="col-app">Приложение</span>
-            <span className="col-t">Время</span>
+            <span className="grow sortable" onClick={() => flip("host")}>Куда{arrow("host")}</span>
+            <span className="col-app sortable" onClick={() => flip("app")}>Приложение{arrow("app")}</span>
+            <span className="col-t sortable" onClick={() => flip("seconds")}>Время{arrow("seconds")}</span>
             <span className="col-v">Через что</span>
-            <span className="col-b">Отдано</span>
-            <span className="col-b">Получено</span>
+            <span className="col-b sortable" onClick={() => flip("sent")}>Отдано{arrow("sent")}</span>
+            <span className="col-b sortable" onClick={() => flip("received")}>Получено{arrow("received")}</span>
           </div>
-          {live.length === 0 && <div className="empty">Ничего не открыто.</div>}
-          {live.map((c) => (
+          {shownLive.length === 0 && <div className="empty">Ничего не открыто.</div>}
+          {shownLive.map((c) => (
             <div className="item" key={c.id}>
               <span className="grow">{c.host}:{c.port}</span>
               <span className="col-app sub">{c.app || "—"}</span>
@@ -451,17 +503,21 @@ function Connections() {
 
       <div className="card">
         <h3>Трафик по доменам</h3>
-        <p className="hint">
-          Имена узлов сведены к домену: у ютуба каждое соединение приходит
-          с нового имени, иначе таблица была бы бесконечной.
-        </p>
+        <p className="hint">Учёт по домену второго уровня, за всё время работы программы.</p>
         <div className="list">
-          {totals.length === 0 && <div className="empty">Пока пусто.</div>}
-          {totals.map((t) => (
+          <div className="item head">
+            <span className="grow">Домен</span>
+            <span className="col-v">Каким путём</span>
+            <span className="col-n">Соединений</span>
+            <span className="col-b">Отдано</span>
+            <span className="col-b">Получено</span>
+          </div>
+          {shownTotals.length === 0 && <div className="empty">Пока пусто.</div>}
+          {shownTotals.map((t) => (
             <div className="item" key={t.domain}>
               <span className="grow">{t.domain}</span>
-              <span className={"tag " + t.route}>{routeLabel[t.route]}</span>
-              <span className="col-t sub">{t.conns} св.</span>
+              <span className={"col-v tag " + t.route}>{routeLabel[t.route]}</span>
+              <span className="col-n sub">{t.conns}</span>
               <span className="col-b sub">{human(t.sent)}</span>
               <span className="col-b sub">{human(t.received)}</span>
             </div>
@@ -515,10 +571,11 @@ function Log() {
       </div>
       <div className="card">
         <div className="log">
-          {shown.length === 0 && <div className="empty">Пока пусто. Открой что-нибудь в браузере.</div>}
+          {shown.length === 0 && <div className="empty">Записей нет.</div>}
           {shown.map((l) => (
             <div className="line" key={l.id}>
-              <span className={"tag " + l.route}>{routeLabel[l.route]}</span>
+              <span className="at">{l.at}</span>
+              <span className={"tag " + l.route}>{l.via || routeLabel[l.route]}</span>
               <span className="who">{l.host}:{l.port}</span>
               {l.route === "direct" && (
                 <button className="btn small" title="добавить домен в список «через прокси»"
@@ -585,7 +642,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
     <div className="panel">
       <div className="card">
         <h3>Вышестоящий прокси</h3>
-        <p className="hint">Тот SOCKS5, через который должны идти выбранные ресурсы.</p>
+        <p className="hint">Прокси по умолчанию для правил без явного назначения.</p>
         <div className="grid2">
           <label className="lbl">Адрес<input className="field" value={address} onChange={(e) => setAddress(e.target.value)} /></label>
           <label className="lbl">Порт<input className="field" value={port} onChange={(e) => setPort(e.target.value)} /></label>
@@ -598,7 +655,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
       <div className="card">
         <h3>Наши порты</h3>
-        <p className="hint">На них слушает сама программа. Менять стоит, только если порт уже занят.</p>
+        <p className="hint">Локальные порты программы. Менять при конфликте портов.</p>
         <div className="grid2">
           <label className="lbl">HTTP-прокси<input className="field" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} /></label>
           <label className="lbl">SOCKS5-прокси<input className="field" value={socksPort} onChange={(e) => setSocksPort(e.target.value)} /></label>
@@ -618,8 +675,8 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           Сворачивать в трей вместо закрытия
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
-          Полностью закрыть — «Выход» в меню значка. Только так возвращаются
-          системные настройки: иначе останется прокси, указывающий в никуда.
+Выход — через меню значка. При выходе системные настройки прокси
+          возвращаются к прежним.
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
@@ -627,11 +684,11 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           Переподключаться, если прокси оборвался
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
-          Повторяет попытку и следит за доступностью раз в 15 секунд.
+Повтор при обрыве, проверка доступности каждые 15 секунд.
         </p>
         <p className="hint" style={{ marginTop: 8 }}>
-          Настройки и журнал лежат в одной папке. Журнал пишется сам,
-          старый файл сохраняется как <code>nexusproxy.log.1</code>.
+Настройки и журнал в одной папке. Журнал ротируется при 4 МБ,
+          предыдущий файл — <code>nexusproxy.log.1</code>.
         </p>
         <button className="btn" onClick={() => invoke("open_folder")}>Открыть папку с журналом</button>
       </div>
@@ -643,7 +700,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
       <Updates />
 
       <div className="note">
-        Приложения читают настройки прокси при запуске — после включения их нужно перезапустить.
+Настройки прокси читаются приложениями при запуске. После включения перезапустите их.
       </div>
     </div>
   );
@@ -695,9 +752,8 @@ function Upstreams() {
     <div className="card">
       <h3>Дополнительные прокси</h3>
       <p className="hint">
-        Разным ресурсам можно назначить разные прокси. Например, рабочие — через
-        офисный, зарубежные — через локальный, который поднимает Happ или NexuSSH.
-        Тогда всё управляется из одного окна.
+Правилу назначается прокси в списке правил. Поддерживаются SOCKS5 и HTTP,
+        с логином и паролем.
       </p>
       <div className="list">
         {ups.map((u, i) => (
@@ -728,7 +784,7 @@ function Upstreams() {
             ))}
           </div>
           <p className="hint" style={{ marginTop: 6, marginBottom: 0 }}>
-            Галку можно снять, не удаляя правил — тогда они пойдут по общему списку.
+Снятая галка отключает правила группы, не удаляя их.
           </p>
         </>
       )}
@@ -816,29 +872,29 @@ function Updates() {
       <h3>Обновления</h3>
       <div className="row">
         <button className="btn" onClick={look} disabled={state === "checking" || state === "installing"}>
-          {state === "checking" ? "Проверяю…" : "Проверить обновления"}
+          {state === "checking" ? "Проверка…" : "Проверить обновления"}
         </button>
         {state === "found" && (
           <button className="btn primary" onClick={install} disabled={state !== "found"}>
             Обновить до {version}
           </button>
         )}
-        {state === "none" && <span className="meta">установлена свежая версия</span>}
-        {state === "installing" && <span className="meta">качаю и ставлю…</span>}
+        {state === "none" && <span className="meta">установлена актуальная версия</span>}
+        {state === "installing" && <span className="meta">загрузка и установка…</span>}
       </div>
       {state === "error" && (
         <div className="note" style={{ marginTop: 10 }}>
           <b>Не удалось проверить обновления.</b>
           <span>{err}</span>
           <span>
-            Скорее всего, эти адреса закрыты и их нужно пустить через прокси:
+Требуемые адреса:
           </span>
           <div style={{ fontFamily: "ui-monospace, Consolas, monospace", fontSize: "12px", margin: "4px 0" }}>
             {UPDATE_HOSTS.map((h) => <div key={h}>{h}</div>)}
           </div>
           <div className="row">
             {added ? (
-              <span className="meta">добавлено — попробуй проверить ещё раз</span>
+              <span className="meta">добавлено, повторите проверку</span>
             ) : (
               <button className="btn small" onClick={async () => {
                 await invoke("rule_add", { text: UPDATE_HOSTS.join("\n") });
