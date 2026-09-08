@@ -37,6 +37,9 @@ pub struct Engine {
     pub path: String,
     saved: Mutex<Option<sysproxy::Saved>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Последний записанный в журнал состав прокси — чтобы не повторять
+    /// одну и ту же строку на каждое сохранение настроек.
+    pool_sign: Mutex<Option<String>>,
 }
 
 pub const NO_PROXY: &str = "localhost,127.0.0.1,::1";
@@ -80,7 +83,6 @@ impl Engine {
             overrides: Default::default(),
         }));
         let recheck = Arc::new(tokio::sync::Notify::new());
-        let default_name = cfg.default_proxy().map(|u| u.name.clone()).unwrap_or_default();
         let (hp, sp) = (cfg.listen.http, cfg.listen.socks);
 
         let http = TcpListener::bind(("127.0.0.1", hp)).await
@@ -96,6 +98,7 @@ impl Engine {
             path: path.to_string(),
             saved: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            pool_sign: Mutex::new(None),
         });
 
         // ⛔ Раньше здесь было `while let Ok(...) = accept()`, и любая
@@ -136,7 +139,6 @@ impl Engine {
         // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
         let watch_routing = routing.clone();
         let watch_recheck = recheck.clone();
-        let main_name = default_name.clone();
         let t3 = tokio::spawn(async move {
             // первая проверка сразу: иначе список прокси до четверти минуты
             // стоит серым и выглядит сломанным
@@ -154,7 +156,17 @@ impl Engine {
                     // пустое имя — дубль основного, его пропускаем
                     r.pool.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
                 };
-                let mut main_ok = true;
+                // ⛔ Имя основного прокси берём заново на каждом круге.
+                // Раньше оно запоминалось при запуске: стоило сменить основной
+                // или удалить его, как сторож сравнивал с исчезнувшим именем,
+                // ни с чем не совпадал и оставлял общий признак «работает» —
+                // индикатор горел зелёным, когда всё лежало.
+                let main_name = {
+                    let r = watch_routing.read().unwrap();
+                    r.pool.get("").map(|u| u.title()).unwrap_or_default()
+                };
+                let mut main_ok = false;
+                let mut main_seen = false;
                 for u in list {
                     // 1. отвечает ли сам прокси
                     let started = std::time::Instant::now();
@@ -196,6 +208,7 @@ impl Engine {
                     }
                     if u.title() == main_name {
                         main_ok = ok;
+                        main_seen = true;
                     }
                     if !ok {
                         logfile::line(&logfile::now_stamp(),
@@ -210,6 +223,11 @@ impl Engine {
                     }
                 }
                 if !upstream::AUTO_RECONNECT.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                // основного нет вовсе — сообщать не о чем, прежнее состояние
+                // оставляем как есть, иначе индикатор запрыгает
+                if !main_seen {
                     continue;
                 }
                 let was = health::get().up;
@@ -317,9 +335,17 @@ impl Engine {
             .filter(|(k, _)| !k.is_empty())
             .map(|(k, v)| format!("{k} → {}:{}", v.address, v.port))
             .collect();
-        logfile::line(&logfile::now_stamp(),
-                      &format!("список прокси обновлён: по умолчанию «{}», всего {} — {}",
-                               c.default_upstream, c.upstreams.len(), names.join(", ")));
+        // пишем только при настоящем изменении: сохранение настроек идёт
+        // пачками, и одинаковых строк набегало по десятку в секунду
+        let sign = format!("{}|{}", c.default_upstream, names.join(", "));
+        if self.pool_sign.lock().unwrap().replace(sign.clone()) != Some(sign) {
+            logfile::line(&logfile::now_stamp(),
+                          &format!("список прокси обновлён: по умолчанию «{}», всего {} — {}",
+                                   c.default_upstream, c.upstreams.len(), names.join(", ")));
+        }
+        // прокси, которого больше нет, не должен висеть в наблюдении
+        health::retain(&pool.iter().filter(|(k, _)| !k.is_empty())
+                            .map(|(_, v)| v.title()).collect::<Vec<_>>());
         self.routing.write().unwrap().pool = pool;
         // сторож должен сразу проверить изменившийся список прокси
         self.recheck.notify_waiters();

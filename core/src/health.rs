@@ -43,6 +43,14 @@ pub fn set_proxy(name: &str, up: bool, ms: u64, probe_ok: bool) {
     m.insert(name.to_string(), One { up, ms, probe_ok, checked: Instant::now() });
 }
 
+/// Забыть прокси, которых больше нет в настройках. Без этого удалённый
+/// прокси навсегда оставался бы в списке с последним известным состоянием.
+pub fn retain(names: &[String]) {
+    if let Some(m) = EACH.lock().unwrap().as_mut() {
+        m.retain(|k, _| names.iter().any(|n| n == k));
+    }
+}
+
 /// Состояние всех прокси — по одному на каждый из настроек.
 pub fn proxies() -> Vec<ProxyHealth> {
     let g = EACH.lock().unwrap();
@@ -132,5 +140,18 @@ mod tests {
         let h = get();
         assert!(h.up);
         assert!(h.last_error.is_none(), "после восстановления ошибка не висит");
+    }
+}
+
+#[cfg(test)]
+mod retain_tests {
+    #[test]
+    fn убранный_прокси_исчезает_из_наблюдения() {
+        super::set_proxy("основной", true, 5, true);
+        super::set_proxy("WL", true, 7, true);
+        super::retain(&["WL".to_string()]);
+        let names: Vec<String> = super::proxies().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["WL".to_string()],
+                   "удалённый прокси не должен оставаться в списке");
     }
 }

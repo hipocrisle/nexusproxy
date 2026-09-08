@@ -7,6 +7,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { enable as autoOn, disable as autoOff, isEnabled as autoIs } from "@tauri-apps/plugin-autostart";
 
 type Status = {
+  os?: string;
   running: boolean; upstream: string; http_port: number; socks_port: number;
   system_on: boolean; discovering: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
@@ -1002,7 +1003,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           возвращаются к прежним.
         </p>
         <label className="check" style={{ marginTop: 12 }}>
-          <input type="checkbox" checked={st?.enable_on_start ?? false}
+          <input type="checkbox" checked={st?.enable_on_start ?? true}
             onChange={(e) => invoke("set_flag", { name: "enable_on_start", value: e.target.checked }).then(onSaved)} />
           Сразу включать при запуске
         </label>

@@ -33,6 +33,7 @@ pub struct Status {
     config_path: String,
     log_path: String,
     error: Option<String>,
+    os: String,
 }
 
 fn engine(app: &State<App>) -> Result<Arc<core::Engine>, String> {
@@ -58,6 +59,7 @@ fn status(app: State<App>) -> Status {
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,
                 enable_on_start: c.enable_on_start,
+                os: std::env::consts::OS.to_string(),
                 default_upstream: c.default_upstream.clone(),
                 rules_count: c.through_proxy.iter().filter(|s| !s.starts_with('_')).count(),
                 upstream_up: h.up,
@@ -70,7 +72,8 @@ fn status(app: State<App>) -> Status {
         None => Status {
             running: false, upstream: String::new(), http_port: 0, socks_port: 0,
             system_on: false, discovering: false,
-            auto_reconnect: true, minimize_to_tray: true, enable_on_start: false,
+            auto_reconnect: true, minimize_to_tray: true, enable_on_start: true,
+            os: std::env::consts::OS.to_string(),
             default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
             config_path: path, log_path: String::new(),
@@ -499,6 +502,11 @@ fn upstream_save(
     if up.name.trim().is_empty() {
         return Err("не указано имя".into());
     }
+    let mut up = up;
+    // пустые поля входа не должны попадать в настройки как пустые строки:
+    // прокси тогда предлагается вход по логину, а отправлять нечего
+    if up.user.as_deref().is_some_and(|v| v.trim().is_empty()) { up.user = None; }
+    if up.password.as_deref().is_some_and(|v| v.trim().is_empty()) { up.password = None; }
     let e = engine(&app)?;
     {
         let mut c = e.cfg.lock().unwrap();
@@ -536,26 +544,15 @@ fn upstream_save(
     e.apply_and_save()
 }
 
-/// Убрать прокси. Основной убрать нельзя, и нельзя убрать тот,
-/// на который ещё ссылается группа правил.
+/// Убрать прокси. Нельзя убрать последний и тот, на который ещё
+/// ссылается группа правил. Основной убрать можно — роль перейдёт
+/// к оставшемуся.
 #[tauri::command]
 fn upstream_remove(app: State<App>, name: String) -> Result<(), String> {
     let e = engine(&app)?;
     {
         let mut c = e.cfg.lock().unwrap();
-        if c.default_upstream == name {
-            return Err("сначала выберите основным другой прокси".into());
-        }
-        if c.upstreams.len() <= 1 {
-            return Err("это последний прокси, убрать его нельзя".into());
-        }
-        if let Some(g) = c.groups.iter().find(|g| g.via == name) {
-            return Err(format!(
-                "на него ссылаются {} правил — сначала переключите их на другой прокси",
-                g.patterns.len()
-            ));
-        }
-        c.upstreams.retain(|u| u.name != name);
+        c.remove_upstream(&name)?;
     }
     e.apply_and_save()
 }
@@ -748,7 +745,8 @@ fn default_config() -> core::config::Config {
         direct: vec![],
         auto_reconnect: true,
         minimize_to_tray: true,
-        enable_on_start: false,
+        enable_on_start: true,
+        defaults_applied: false,
         subscription: None,
         extra: Default::default(),
     }
@@ -834,8 +832,26 @@ pub fn run() {
             if !path.exists() {
                 default_config().save(&path_s).ok();
             }
-            let cfg = core::config::Config::load(&path_s)
+            let mut cfg = core::config::Config::load(&path_s)
                 .unwrap_or_else(|_| default_config());
+
+            // ── Базовые галки поведения: все четыре включены ──
+            // Ставим один раз и запоминаем это в настройках: иначе снятая
+            // вручную галка возвращалась бы при каждом запуске.
+            if !cfg.defaults_applied {
+                cfg.defaults_applied = true;
+                cfg.enable_on_start = true;
+                cfg.minimize_to_tray = true;
+                cfg.auto_reconnect = true;
+                cfg.save(&path_s).ok();
+                use tauri_plugin_autostart::ManagerExt;
+                match app.autolaunch().enable() {
+                    Ok(_) => core::logfile::line(&core::logfile::now_stamp(),
+                        "запуск вместе с системой включён по умолчанию"),
+                    Err(err) => core::logfile::line(&core::logfile::now_stamp(),
+                        &format!("автозапуск не включился: {err}")),
+                }
+            }
 
             if started_hidden() {
                 if let Some(w) = app.get_webview_window("main") {

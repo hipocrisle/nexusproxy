@@ -114,8 +114,13 @@ pub struct Config {
     #[serde(default = "yes")]
     pub minimize_to_tray: bool,
     /// Включать перехват сразу при запуске программы.
-    #[serde(default)]
+    #[serde(default = "yes")]
     pub enable_on_start: bool,
+    /// Отметка, что базовые галки поведения уже расставлены один раз.
+    /// Нужна, чтобы разовая простановка не повторялась после того,
+    /// как галки сняли вручную.
+    #[serde(default)]
+    pub defaults_applied: bool,
     /// Подписка со странами. Хранится, чтобы поднимать их при запуске.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
@@ -149,6 +154,12 @@ impl Config {
                 self.default_upstream = u.name;
             }
         }
+        // пустая строка в логине или пароле — это «их нет». Иначе прокси
+        // предлагается вход по логину, а отправлять нечего.
+        for u in self.upstreams.iter_mut() {
+            if u.user.as_deref().is_some_and(|v| v.is_empty()) { u.user = None; }
+            if u.password.as_deref().is_some_and(|v| v.is_empty()) { u.password = None; }
+        }
         // имена обязательны: безымянный прокси не показать и не выбрать
         let mut n = 1;
         for u in self.upstreams.iter_mut() {
@@ -161,6 +172,28 @@ impl Config {
             self.default_upstream =
                 self.upstreams.first().map(|u| u.name.clone()).unwrap_or_default();
         }
+    }
+
+    /// Убрать прокси из настроек. Если убирают основной, основным
+    /// становится первый из оставшихся: раньше приходилось сначала
+    /// вручную назначить другой основным и только потом удалять,
+    /// и это на ровном месте выглядело поломкой.
+    pub fn remove_upstream(&mut self, name: &str) -> Result<(), String> {
+        if self.upstreams.len() <= 1 {
+            return Err("это последний прокси, убрать его нельзя".into());
+        }
+        if let Some(g) = self.groups.iter().find(|g| g.via == name) {
+            return Err(format!(
+                "на него ссылаются {} правил — сначала переключите их на другой прокси",
+                g.patterns.len()
+            ));
+        }
+        self.upstreams.retain(|u| u.name != name);
+        if self.default_upstream == name {
+            self.default_upstream =
+                self.upstreams.first().map(|u| u.name.clone()).unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// Прокси, через который идут правила без явного назначения.
@@ -304,7 +337,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    fn cfg(through: &[&str], direct: &[&str]) -> Config {
+    pub fn cfg(through: &[&str], direct: &[&str]) -> Config {
         Config {
             upstream: None,
             listen: Listen::default(),
@@ -319,7 +352,8 @@ mod tests {
             direct: direct.iter().map(|s| s.to_string()).collect(),
             auto_reconnect: true,
             minimize_to_tray: true,
-            enable_on_start: false,
+            enable_on_start: true,
+            defaults_applied: false,
             subscription: None,
             extra: Default::default(),
         }
@@ -435,11 +469,13 @@ mod tests {
         let mut c = cfg(&["domain:a.example"], &[]);
         c.enable_on_start = true;
         c.minimize_to_tray = false;
+        c.defaults_applied = true;
         c.save(&p).unwrap();
 
         let back = Config::load(&p).unwrap();
         assert!(back.enable_on_start, "флаг должен пережить запись и чтение");
         assert!(!back.minimize_to_tray);
+        assert!(back.defaults_applied, "отметка о разовой простановке галок должна сохраняться");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -500,5 +536,45 @@ mod tests {
     #[test]
     fn bad_pattern_is_reported() {
         assert!(cfg(&["ip:999.1.1.1/8"], &[]).rules().is_err());
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    fn up(name: &str) -> crate::upstream::Upstream {
+        crate::upstream::Upstream {
+            name: name.into(), kind: Default::default(), address: "127.0.0.1".into(),
+            port: 1080, user: None, password: None, from_subscription: false,
+        }
+    }
+
+    #[test]
+    fn убранный_основной_передаёт_роль_оставшемуся() {
+        let mut c = super::tests::cfg(&[], &[]);
+        c.upstreams = vec![up("основной"), up("WL")];
+        c.default_upstream = "основной".into();
+        c.remove_upstream("основной").unwrap();
+        assert_eq!(c.upstreams.len(), 1);
+        assert_eq!(c.default_upstream, "WL", "основным должен стать оставшийся");
+    }
+
+    #[test]
+    fn последний_прокси_убрать_нельзя() {
+        let mut c = super::tests::cfg(&[], &[]);
+        c.upstreams = vec![up("основной")];
+        assert!(c.remove_upstream("основной").is_err());
+    }
+
+    #[test]
+    fn прокси_под_ссылкой_группы_не_убрать() {
+        let mut c = super::tests::cfg(&[], &[]);
+        c.upstreams = vec![up("основной"), up("WL")];
+        c.groups = vec![RouteGroup {
+            via: "WL".into(), enabled: true,
+            patterns: vec!["domain:example.com".into()],
+        }];
+        assert!(c.remove_upstream("WL").is_err());
     }
 }

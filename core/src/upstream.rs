@@ -164,6 +164,12 @@ pub async fn connect_through(up: &Upstream, host: &str, port: u16) -> io::Result
 
 /// HTTP-прокси: тот же метод CONNECT, который мы сами принимаем на входе.
 async fn via_http(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStream> {
+    tokio::time::timeout(handshake_limit(), via_http_inner(up, host, port))
+        .await
+        .map_err(|_| bad("вышестоящий прокси не ответил на рукопожатие"))?
+}
+
+async fn via_http_inner(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStream> {
     let mut s = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         TcpStream::connect((up.address.as_str(), up.port)),
@@ -175,7 +181,7 @@ async fn via_http(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStream>
     let mut req = format!(
         "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nProxy-Connection: Keep-Alive\r\n"
     );
-    if let Some(user) = &up.user {
+    if let Some(user) = up.user.as_deref().filter(|u| !u.is_empty()) {
         let pass = up.password.clone().unwrap_or_default();
         req.push_str(&format!(
             "Proxy-Authorization: Basic {}\r\n",
@@ -226,7 +232,25 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Сколько ждём ответа вышестоящего прокси на рукопожатие.
+/// Отдельной величиной, чтобы тест не ждал полминуты.
+pub static HANDSHAKE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(15_000);
+
+fn handshake_limit() -> std::time::Duration {
+    std::time::Duration::from_millis(HANDSHAKE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// ⛔ Рукопожатие обязано укладываться в срок. Без этого прокси, который
+/// принимает соединение и молчит, подвешивал запрос навсегда: в журнале
+/// строка «через прокси» есть, в таблице соединений пусто, в «Не открылось»
+/// тоже — снаружи это выглядит как «ничего не работает» без единой причины.
 async fn via_socks5(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStream> {
+    tokio::time::timeout(handshake_limit(), via_socks5_inner(up, host, port))
+        .await
+        .map_err(|_| bad("вышестоящий прокси не ответил на рукопожатие"))?
+}
+
+async fn via_socks5_inner(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStream> {
     let mut s = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         TcpStream::connect((up.address.as_str(), up.port)),
@@ -235,7 +259,9 @@ async fn via_socks5(up: &Upstream, host: &str, port: u16) -> io::Result<TcpStrea
     .map_err(|_| bad("вышестоящий прокси не отвечает"))??;
     s.set_nodelay(true).ok();
 
-    let with_auth = up.user.is_some();
+    // пустая строка в настройках — это «логина нет». Иначе мы предлагаем
+    // прокси вход по логину, он его выбирает, а отправить нечего.
+    let with_auth = up.user.as_deref().is_some_and(|u| !u.is_empty());
     // приветствие: предлагаем «без аутентификации» и, если задан логин, «логин/пароль»
     if with_auth {
         s.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
@@ -378,5 +404,47 @@ mod tests {
         r.overrides.insert("офис".into(), "нет-такого".into());
         // молча вернуть исходный нельзя: человек думает, что переключил
         assert!(r.resolve("офис").is_none());
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn молчащий_прокси_не_подвешивает_соединение() {
+        // прокси, который принимает связь и не отвечает ни слова
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = l.accept().await {
+                held.push(c); // держим открытым, ничего не отвечаем
+            }
+        });
+
+        HANDSHAKE_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+        let up = Upstream {
+            name: "тихий".into(), kind: Kind::Socks5, address: "127.0.0.1".into(),
+            port, user: None, password: None, from_subscription: false,
+        };
+        let started = std::time::Instant::now();
+        let r = via_socks5(&up, "example.com", 443).await;
+        HANDSHAKE_MS.store(15_000, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(r.is_err(), "молчание прокси обязана кончиться отказом, а не ожиданием");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3),
+                "отказ должен прийти по сроку, а не когда-нибудь");
+    }
+
+    #[test]
+    fn пустой_логин_не_считается_логином() {
+        let up = Upstream {
+            name: "офис".into(), kind: Kind::Socks5, address: "127.0.0.1".into(),
+            port: 1080, user: Some(String::new()), password: Some(String::new()),
+            from_subscription: false,
+        };
+        assert!(!up.user.as_deref().is_some_and(|u| !u.is_empty()),
+                "пустая строка в логине означает, что входа по логину нет");
     }
 }
