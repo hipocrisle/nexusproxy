@@ -644,19 +644,6 @@ pub fn run() {
             let cfg = core::config::Config::load(&path_s)
                 .unwrap_or_else(|_| default_config());
 
-            {
-                let st = app.state::<App>();
-                let e = st.engine.lock().unwrap().clone();
-                if let Some(e) = e {
-                    let want = e.cfg.lock().unwrap().enable_on_start;
-                    if want {
-                        if let Err(err) = e.system_proxy_on() {
-                            eprintln!("не удалось включить перехват при запуске: {err}");
-                        }
-                    }
-                }
-            }
-
             if started_hidden() {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.hide();
@@ -671,6 +658,24 @@ pub fn run() {
                 Err(err) => {
                     eprintln!("движок не запустился: {err}");
                     *state.start_error.lock().unwrap() = Some(err);
+                }
+            }
+
+            // ⛔ Только ПОСЛЕ запуска движка: раньше этот блок стоял выше,
+            // движка ещё не было, и галка «включать при запуске» молча
+            // ничего не делала.
+            {
+                let e = app.state::<App>().engine.lock().unwrap().clone();
+                if let Some(e) = e {
+                    let want = e.cfg.lock().unwrap().enable_on_start;
+                    if want {
+                        match e.system_proxy_on() {
+                            Ok(_) => core::logfile::line(&core::logfile::now_stamp(),
+                                                        "перехват включён при запуске"),
+                            Err(err) => core::logfile::line(&core::logfile::now_stamp(),
+                                &format!("не удалось включить перехват при запуске: {err}")),
+                        }
+                    }
                 }
             }
 

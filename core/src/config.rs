@@ -405,6 +405,26 @@ mod tests {
     }
 
     #[test]
+    fn flags_survive_save_and_load() {
+        // галка «включать при запуске» не срабатывала — проверяем,
+        // что она вообще доезжает до файла и обратно
+        let dir = std::env::temp_dir().join(format!("np-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let p = path.to_string_lossy().to_string();
+
+        let mut c = cfg(&["domain:a.example"], &[]);
+        c.enable_on_start = true;
+        c.minimize_to_tray = false;
+        c.save(&p).unwrap();
+
+        let back = Config::load(&p).unwrap();
+        assert!(back.enable_on_start, "флаг должен пережить запись и чтение");
+        assert!(!back.minimize_to_tray);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn old_config_is_migrated() {
         // старый файл: единственный прокси отдельным полем, без имени
         let old = r#"{"upstream":{"address":"10.0.0.1","port":1080},

@@ -33,6 +33,8 @@ pub struct Conn {
 pub struct DomainStat {
     pub domain: String,
     pub route: String,
+    /// через какой прокси шло — иначе в таблице стоит безликое «через прокси»
+    pub via: String,
     pub conns: u64,
     pub sent: u64,
     pub received: u64,
@@ -115,8 +117,10 @@ pub fn close(id: u64, sent: u64, received: u64) {
     let Some(c) = s.live.remove(&id) else { return };
     let domain = crate::domain::registrable(&c.host);
     let e = s.totals.entry(domain.clone()).or_insert_with(|| DomainStat {
-        domain, route: c.route.clone(), ..Default::default()
+        domain, route: c.route.clone(), via: c.via.clone(), ..Default::default()
     });
+    e.route = c.route.clone();
+    e.via = c.via.clone();
     e.conns += 1;
     e.sent += sent;
     e.received += received;
@@ -185,6 +189,7 @@ mod tests {
         let t = totals();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].domain, "openai.com", "итоги считаются по домену");
+        assert_eq!(t[0].via, "офис", "в итогах должно стоять имя прокси");
         assert_eq!(t[0].sent, 1024);
         assert_eq!(t[0].received, 4096);
     }

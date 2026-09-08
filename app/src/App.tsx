@@ -25,7 +25,10 @@ type Conn = {
   app: string; app_path: string; pid: number;
   seconds: number; sent: number; received: number;
 };
-type DomainStat = { domain: string; route: string; conns: number; sent: number; received: number };
+type DomainStat = {
+  domain: string; route: string; via: string;
+  conns: number; sent: number; received: number;
+};
 type Upstream = {
   name: string; kind: "socks5" | "http"; address: string; port: number;
   user: string | null; password: string | null;
@@ -106,7 +109,7 @@ export default function App() {
         <span className="brand">NexusProxy</span>
         <span className={"pill" + (st?.system_on ? " on" : "")}>
           <span className="dot" />
-          {st?.system_on ? "перехват включён" : "выключен"}
+          {st?.system_on ? "включён" : "выключен"}
         </span>
         {st?.running && !st.upstream_up && (
           <span className="pill down" title={st.upstream_error ?? ""}>
@@ -221,7 +224,16 @@ function Rules({ onChange }: { onChange: () => void }) {
   const upName = (u: Upstream) => u.name || "по умолчанию";
   const togglePreset = async (p: Preset) => {
     if (hasAll(p)) {
-      for (const d of p.domains) await invoke("rule_remove", { pattern: "domain:" + d });
+      // Наборы делят домены: у Gemini и YouTube общие google-адреса.
+      // Убирать общее нельзя — иначе снятие одного набора рушит другой.
+      const нужны_другим = new Set(
+        presets.filter((o) => o.name !== p.name && hasAll(o)).flatMap((o) => o.domains)
+      );
+      for (const d of p.domains) {
+        if (!нужны_другим.has(d)) {
+          await invoke("rule_remove", { pattern: "domain:" + d });
+        }
+      }
     } else {
       await invoke<Bulk>("rule_add", { text: p.domains.join("\n"), via: addVia });
     }
@@ -610,7 +622,7 @@ function Connections() {
           {shownTotals.map((t) => (
             <div className="item" key={t.domain}>
               <span className="grow">{t.domain}</span>
-              <span className={"col-v tag " + t.route}>{routeLabel[t.route]}</span>
+              <span className={"col-v tag " + t.route}>{t.via || routeLabel[t.route]}</span>
               <span className="col-n sub">{t.conns}</span>
               <span className="col-b sub">{human(t.sent)}</span>
               <span className="col-b sub">{human(t.received)}</span>
@@ -739,6 +751,10 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           <label className="lbl">HTTP-прокси<input className="field" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} /></label>
           <label className="lbl">SOCKS5-прокси<input className="field" value={socksPort} onChange={(e) => setSocksPort(e.target.value)} /></label>
         </div>
+        <div className="row" style={{ marginTop: 10 }}>
+          <button className="btn" onClick={save}>Применить и перезапустить</button>
+          {saved && <span className="meta">{saved}</span>}
+        </div>
       </div>
 
       <div className="card">
@@ -760,8 +776,13 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.enable_on_start ?? false}
             onChange={(e) => invoke("set_flag", { name: "enable_on_start", value: e.target.checked }).then(onSaved)} />
-          Включать перехват при запуске программы
+          Сразу включать при запуске
         </label>
+        <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
+          То же, что нажать «Включить» в шапке: программа прописывается
+          в системные настройки прокси, и приложения начинают ходить через неё.
+          Без галки после запуска нужно включать вручную.
+        </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
             onChange={(e) => invoke("set_flag", { name: "auto_reconnect", value: e.target.checked }).then(onSaved)} />
@@ -777,10 +798,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         <button className="btn" onClick={() => invoke("open_folder")}>Открыть папку с журналом</button>
       </div>
 
-      <div className="row">
-        <button className="btn primary" onClick={save}>Сохранить порты</button>
-        {saved && <span className="meta">{saved}</span>}
-      </div>
+
       <Updates />
 
       <div className="note">
