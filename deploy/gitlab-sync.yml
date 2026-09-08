@@ -1,0 +1,83 @@
+# Синхронизация NexusProxy из GitHub во внутренний GitLab.
+#
+# Забирает и код, и готовые файлы установщика, чтобы коллеги скачивали
+# дистрибутив с вашего ресурса и не ходили на GitHub.
+#
+# GitLab сам обращается наружу — снаружи к нему никто не подключается.
+#
+# ── Как поставить ───────────────────────────────────────────────
+# 1. Создать в GitLab ДВА проекта:
+#      nexusproxy       — сюда приедет зеркало кода (пустой, без README)
+#      nexusproxy-sync  — сюда положить ЭТОТ файл как .gitlab-ci.yml
+# 2. В проекте nexusproxy-sync завести переменные (Settings → CI/CD → Variables):
+#      MIRROR_URL   — адрес проекта-зеркала с токеном, вида
+#                     https://oauth2:ТОКЕН@gitlab.внутренний/группа/nexusproxy.git
+#                     токен: Project Access Token проекта nexusproxy,
+#                     роль Maintainer, права write_repository
+#      GL_TOKEN     — тот же токен (для выкладывания файлов), права api
+#      GL_PROJECT   — числовой идентификатор проекта nexusproxy
+#    Обе переменные пометить «Masked».
+# 3. Settings → CI/CD → Schedules: расписание, например каждый час.
+# 4. Исполнителю нужен доступ наружу к github.com.
+#
+# Ничего секретного в GitHub при этом не уходит: обращение одностороннее.
+
+variables:
+  ИСТОЧНИК: https://github.com/hipocrisle/nexusproxy.git
+  РЕЛИЗЫ: https://api.github.com/repos/hipocrisle/nexusproxy/releases/latest
+  GIT_STRATEGY: none
+
+stages: [код, дистрибутив]
+
+зеркало-кода:
+  stage: код
+  image: alpine/git:latest
+  script:
+    - echo "Забираю код из GitHub…"
+    - git clone --mirror "$ИСТОЧНИК" repo.git
+    - cd repo.git
+    # --mirror переносит все ветки и теги как есть
+    - git push --mirror "$MIRROR_URL"
+    - echo "Код обновлён."
+
+дистрибутив:
+  stage: дистрибутив
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      ВЕРСИЯ=$(curl -sSf "$РЕЛИЗЫ" | jq -r .tag_name)
+      echo "Последний выпуск на GitHub: $ВЕРСИЯ"
+
+      # уже выкладывали эту версию — второй раз не нужно
+      УЖЕ=$(curl -sS --header "PRIVATE-TOKEN: $GL_TOKEN" \
+            "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$ВЕРСИЯ" | jq -r '.tag_name // empty')
+      if [ "$УЖЕ" = "$ВЕРСИЯ" ]; then
+        echo "Версия $ВЕРСИЯ уже выложена, пропускаю."
+        exit 0
+      fi
+
+      # берём установщик и портативный файл
+      curl -sSf "$РЕЛИЗЫ" | jq -r '.assets[] | select(.name|test("\\.exe$")) | .browser_download_url' > список
+      test -s список || { echo "В выпуске нет файлов .exe"; exit 1; }
+
+      ССЫЛКИ=""
+      while read -r АДРЕС; do
+        ИМЯ=$(basename "$АДРЕС")
+        echo "Скачиваю $ИМЯ…"
+        curl -sSfL -o "$ИМЯ" "$АДРЕС"
+        echo "Выкладываю $ИМЯ в GitLab…"
+        curl -sSf --header "PRIVATE-TOKEN: $GL_TOKEN" --upload-file "$ИМЯ" \
+          "$CI_API_V4_URL/projects/$GL_PROJECT/packages/generic/nexusproxy/${ВЕРСИЯ#v}/$ИМЯ"
+        АДРЕС_В_GITLAB="$CI_API_V4_URL/projects/$GL_PROJECT/packages/generic/nexusproxy/${ВЕРСИЯ#v}/$ИМЯ"
+        ССЫЛКИ="$ССЫЛКИ{\"name\":\"$ИМЯ\",\"url\":\"$АДРЕС_В_GITLAB\"},"
+      done < список
+
+      # оформляем выпуск, чтобы коллеги скачивали со страницы, а не по ссылке
+      curl -sSf --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "{\"name\":\"NexusProxy $ВЕРСИЯ\",\"tag_name\":\"$ВЕРСИЯ\",
+                 \"description\":\"Собрано из GitHub. Ставить файл с -setup в имени — права администратора не нужны.\",
+                 \"assets\":{\"links\":[${ССЫЛКИ%,}]}}" \
+        "$CI_API_V4_URL/projects/$GL_PROJECT/releases"
+      echo "Выпуск $ВЕРСИЯ выложен."
