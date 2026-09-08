@@ -217,7 +217,7 @@ function Rules({ onChange }: { onChange: () => void }) {
   const shown = plain.filter((i) => !filter || i.pattern.toLowerCase().includes(filter.toLowerCase()));
   const copyAll = () => navigator.clipboard.writeText(shown.map((i) => i.pattern).join("\n"));
   const hasAll = (p: Preset) => p.domains.every((d) => plain.some((i) => i.pattern === "domain:" + d));
-  const upName = (u: Upstream) => u.name || "основной";
+  const upName = (u: Upstream) => u.name || "по умолчанию";
   const togglePreset = async (p: Preset) => {
     if (hasAll(p)) {
       for (const d of p.domains) await invoke("rule_remove", { pattern: "domain:" + d });
@@ -641,10 +641,6 @@ function Log() {
 /* ─────────────── Настройки ─────────────── */
 
 function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
-  const [address, setAddress] = useState("");
-  const [port, setPort] = useState("1080");
-  const [user, setUser] = useState("");
-  const [password, setPassword] = useState("");
   const [httpPort, setHttpPort] = useState("18080");
   const [socksPort, setSocksPort] = useState("18081");
   const [auto, setAuto] = useState(false);
@@ -652,10 +648,8 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
   useEffect(() => {
     if (!st?.running) return;
-    const [a, p] = st.upstream.split(":");
-    setAddress(a || ""); setPort(p || "1080");
     setHttpPort(String(st.http_port)); setSocksPort(String(st.socks_port));
-  }, [st?.upstream, st?.http_port, st?.socks_port, st?.running]);
+  }, [st?.http_port, st?.socks_port, st?.running]);
 
   const [autoErr, setAutoErr] = useState("");
   useEffect(() => {
@@ -665,10 +659,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
   const save = async () => {
     try {
       await invoke("settings_save", {
-        s: {
-          address, port: Number(port), user, password,
-          http_port: Number(httpPort), socks_port: Number(socksPort),
-        },
+        s: { http_port: Number(httpPort), socks_port: Number(socksPort) },
       });
       setSaved("Сохранено, движок перезапущен");
       onSaved();
@@ -689,17 +680,6 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
   return (
     <div className="panel">
-      <div className="card">
-        <h3>Вышестоящий прокси</h3>
-        <p className="hint">Прокси по умолчанию для правил без явного назначения.</p>
-        <div className="grid2">
-          <label className="lbl">Адрес<input className="field" value={address} onChange={(e) => setAddress(e.target.value)} /></label>
-          <label className="lbl">Порт<input className="field" value={port} onChange={(e) => setPort(e.target.value)} /></label>
-          <label className="lbl">Логин, если нужен<input className="field" value={user} onChange={(e) => setUser(e.target.value)} /></label>
-          <label className="lbl">Пароль<input className="field" type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-        </div>
-      </div>
-
       <Upstreams />
 
       <div className="card">
@@ -743,7 +723,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
       </div>
 
       <div className="row">
-        <button className="btn primary" onClick={save}>Сохранить</button>
+        <button className="btn primary" onClick={save}>Сохранить порты</button>
         {saved && <span className="meta">{saved}</span>}
       </div>
       <Updates />
@@ -811,7 +791,7 @@ function Upstreams() {
 
   return (
     <div className="card">
-      <h3>Дополнительные прокси</h3>
+      <h3>Прокси</h3>
       <p className="hint">
 Правилу назначается прокси в списке правил. Поддерживаются SOCKS5 и HTTP,
         с логином и паролем.
@@ -824,7 +804,8 @@ function Upstreams() {
               <span className={"state " + (h ? (h.up ? "up" : "down") : "unknown")}
                 title={h ? (h.up ? `отвечает, ${h.ms} мс` : "не отвечает") : "ещё не проверялся"} />
               <span className="grow">
-                {u.name || "основной"}
+                {u.name || "без имени"}
+                {i === 0 && <span className="tag" style={{ marginLeft: 6 }}>по умолчанию</span>}
                 <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
               </span>
               <span className="sub">{h ? (h.up ? `${h.ms} мс` : "не отвечает") : "—"}</span>

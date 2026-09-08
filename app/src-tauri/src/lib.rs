@@ -476,14 +476,12 @@ fn quit(app: tauri::AppHandle) {
 
 #[derive(serde::Deserialize)]
 pub struct Settings {
-    address: String,
-    port: u16,
-    user: Option<String>,
-    password: Option<String>,
     http_port: u16,
     socks_port: u16,
 }
 
+/// Сохранить наши порты. Порты читаются при запуске, поэтому движок
+/// перезапускается; прокси и правила при этом сохраняются.
 #[tauri::command]
 async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String> {
     let state = app.state::<App>();
@@ -493,10 +491,6 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
         Some(e) => e.cfg.lock().unwrap().clone(),
         None => core::config::Config::load(&path)?,
     };
-    cfg.upstream.address = s.address;
-    cfg.upstream.port = s.port;
-    cfg.upstream.user = s.user.filter(|v| !v.is_empty());
-    cfg.upstream.password = s.password.filter(|v| !v.is_empty());
     cfg.listen.http = s.http_port;
     cfg.listen.socks = s.socks_port;
     cfg.save(&path)?;
