@@ -83,7 +83,10 @@ export default function App() {
     // Титульная полоса с кнопками — это системная рамка окна, темой
     // страницы она не управляется. Переключаем её отдельно, иначе в
     // тёмной теме сверху остаётся светлая полоса.
-    getCurrentWindow().setTheme(theme === "system" ? null : theme).catch(() => {});
+    // ⛔ В try: сбой здесь не должен ронять всё окно ради одной рамки.
+    try {
+      getCurrentWindow().setTheme(theme === "system" ? null : theme).catch(() => {});
+    } catch { /* окно недоступно — тема страницы всё равно применилась */ }
   }, [theme]);
 
   const refresh = useCallback(async () => {
@@ -338,6 +341,26 @@ function Rules({ onChange }: { onChange: () => void }) {
   const shown = plain.filter((i) => !filter || i.pattern.toLowerCase().includes(filter.toLowerCase()));
   const copyAll = () => navigator.clipboard.writeText(shown.map((i) => i.pattern).join("\n"));
   const hasAll = (p: Preset) => p.domains.every((d) => plain.some((i) => i.pattern === "domain:" + d));
+
+  /// Через что идут домены набора. Если по-разному — «смешано»:
+  /// один домен может входить в несколько наборов, а идти обязан
+  /// одним путём. Показываем как есть, а не делаем вид, что всё ровно.
+  const presetVia = (p: Preset): string | null => {
+    const mine = p.domains
+      .map((d) => plain.find((i) => i.pattern === "domain:" + d))
+      .filter(Boolean) as RuleItem[];
+    if (mine.length === 0) return null;
+    const first = mine[0].via;
+    return mine.every((i) => i.via === first) ? first : "\u0000mixed";
+  };
+
+  const movePreset = async (p: Preset, via: string) => {
+    await invoke("rules_set_via", {
+      patterns: p.domains.map((d) => "domain:" + d),
+      via,
+    });
+    load(); onChange();
+  };
   const upName = (u: Upstream) => u.name || "по умолчанию";
   const togglePreset = async (p: Preset) => {
     if (hasAll(p)) {
@@ -366,13 +389,27 @@ function Rules({ onChange }: { onChange: () => void }) {
         </p>
         <div className="presets">
           {presets.map((p) => (
-            <button key={p.name} className={"preset" + (hasAll(p) ? " done" : "")}
-              onClick={() => togglePreset(p)}
-              title={hasAll(p) ? "щёлкни, чтобы убрать эти домены" : "щёлкни, чтобы добавить"}>
-              <b>{hasAll(p) ? "✓ " : "+ "}{p.name}</b>
-              <span>{p.note}</span>
-              <span className="doms">{p.domains.join(", ")}</span>
-            </button>
+            <div key={p.name} className={"preset" + (hasAll(p) ? " done" : "")}>
+              <button className="preset-head" onClick={() => togglePreset(p)}
+                title={hasAll(p) ? "убрать домены набора" : "добавить домены набора"}>
+                <b>{hasAll(p) ? "✓ " : "+ "}{p.name}</b>
+                <span>{p.note}</span>
+                <span className="doms">{p.domains.join(", ")}</span>
+              </button>
+              {hasAll(p) && ups.length > 1 && (
+                <div className="preset-via">
+                  <span>через</span>
+                  <select className="field small-sel"
+                    value={presetVia(p) === "\u0000mixed" ? "" : (presetVia(p) ?? "")}
+                    onChange={(e) => movePreset(p, e.target.value)}>
+                    {presetVia(p) === "\u0000mixed" && <option value="">смешано</option>}
+                    {ups.map((u, i) => (
+                      <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
           ))}
         </div>
       </div>
@@ -854,6 +891,8 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
   return (
     <div className="panel">
+      <Subscription onChange={onSaved} />
+
       <Upstreams defaultName={st?.default_upstream ?? ""} onSaved={onSaved} />
 
       <div className="card">
@@ -873,9 +912,9 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           {saved && <span className="meta">{saved}</span>}
         </div>
 
-        <div className="note" style={{ marginTop: 12 }}>
-          <b>Если приложение умеет работать через прокси само</b>
-          <span>
+        <details className="fold" style={{ marginTop: 12 }}>
+          <summary>Если приложение умеет работать через прокси само</summary>
+          <span className="hint">
             Программы со своими настройками связи — Telegram, Docker, часть
             почтовых клиентов и редакторов — системный прокси не слушают.
             Впишите в их настройках один из этих адресов, и они пойдут через
@@ -897,11 +936,11 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
               </button>
             </div>
           </div>
-          <span>
+          <span className="hint">
             Логин и пароль не нужны. Если в приложении есть выбор — берите SOCKS5,
             он подходит для любого трафика, а не только для веб-запросов.
           </span>
-        </div>
+        </details>
       </div>
 
       <div className="card">
@@ -1191,5 +1230,112 @@ function Updates() {
         </div>
       )}
     </div>
+  );
+}
+
+
+/* ─────────────── Подписка со странами ─────────────── */
+
+type SubState = {
+  installed: boolean; running: boolean; url: string;
+  has_text: boolean; enabled: boolean; countries: string[]; dir: string;
+};
+
+function Subscription({ onChange }: { onChange: () => void }) {
+  const [st, setSt] = useState<SubState | null>(null);
+  const [source, setSource] = useState("");
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const load = useCallback(async () => {
+    try { setSt(await invoke<SubState>("sub_state")); } catch { /* движок ещё не поднялся */ }
+  }, []);
+  useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, [load]);
+
+  const run = async (what: string, fn: () => Promise<unknown>) => {
+    setBusy(what); setErr("");
+    try { await fn(); } catch (e) { setErr(String(e)); }
+    setBusy(""); load(); onChange();
+  };
+
+  const countries = st?.countries ?? [];
+
+  return (
+    <details className="fold" open={open} onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+      <summary>
+        Подписка со странами
+        {countries.length > 0 && ` — ${countries.length} шт.`}
+        {st?.running && " · работает"}
+      </summary>
+
+      <span className="hint">
+        Вставьте ссылку на подписку или её содержимое. Каждая страна станет
+        отдельным прокси в списке, и любому правилу можно будет назначить любую.
+      </span>
+
+      {!st?.installed && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <b>Нужен xray</b>
+          <span>
+            Для подписок требуется отдельная программа — xray. В состав она не
+            входит: на рабочих машинах её присутствие ни к чему. Скачивается
+            один раз, из официальных выпусков, в папку с настройками.
+          </span>
+          <div className="row">
+            <button className="btn small primary" disabled={busy !== ""}
+              onClick={() => run("install", () => invoke("sub_install"))}>
+              {busy === "install" ? "Скачиваю…" : "Скачать xray"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="row" style={{ marginTop: 8 }}>
+        <input className="field" placeholder="https://… или содержимое подписки"
+          value={source} onChange={(e) => setSource(e.target.value)} />
+        <button className="btn" disabled={!source.trim() || busy !== ""}
+          onClick={() => run("load", async () => {
+            await invoke("sub_load", { source });
+            setSource("");
+            if (st?.installed) await invoke("sub_apply");
+          })}>
+          {busy === "load" ? "Читаю…" : "Загрузить"}
+        </button>
+      </div>
+
+      {st?.url && (
+        <p className="hint" style={{ marginTop: 6 }}>
+          Источник: <code>{st.url}</code>
+        </p>
+      )}
+
+      {st?.has_text && (
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="btn small" disabled={!st.installed || busy !== ""}
+            onClick={() => run("apply", () => invoke("sub_apply"))}>
+            {busy === "apply" ? "Поднимаю…" : st.running ? "Перезапустить" : "Включить"}
+          </button>
+          {st.running && (
+            <button className="btn small" disabled={busy !== ""}
+              onClick={() => run("off", () => invoke("sub_disable"))}>
+              Выключить
+            </button>
+          )}
+          <span className="grow" />
+          <span className="meta">{st.running ? "страны подняты" : "выключено"}</span>
+        </div>
+      )}
+
+      {countries.length > 0 && (
+        <div className="list" style={{ marginTop: 8 }}>
+          {countries.map((c) => (
+            <div className="item" key={c}><span className="grow">{c}</span></div>
+          ))}
+        </div>
+      )}
+
+      {err && <div className="note" style={{ marginTop: 8 }}>{err}</div>}
+    </details>
   );
 }

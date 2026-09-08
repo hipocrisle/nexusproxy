@@ -67,7 +67,7 @@ pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
     let port = u16::from_be_bytes(pb);
 
     match dial(&routing, &rules, &host, port).await {
-        Ok((mut server, d)) => {
+        Ok((server, d)) => {
             reply(&mut c, 0x00).await?;
             let (id, counters, kill) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
             let (up_b, down_b) = crate::pump::both_ways_until(c, server, counters, kill).await;

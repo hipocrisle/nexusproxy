@@ -37,6 +37,10 @@ pub struct Upstream {
     pub user: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// Пришёл из подписки — такие обновляются и убираются целой пачкой,
+    /// вручную их править незачем.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_subscription: bool,
 }
 
 impl Upstream {
@@ -325,6 +329,7 @@ mod tests {
         Upstream {
             name: name.into(), kind: Kind::Socks5,
             address: "127.0.0.1".into(), port, user: None, password: None,
+            from_subscription: false,
         }
     }
 

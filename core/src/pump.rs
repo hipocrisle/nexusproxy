@@ -83,7 +83,6 @@ pub async fn both_ways_until(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
 
     /// Эхо-сервер: возвращает вдвое больше, чем получил, — чтобы

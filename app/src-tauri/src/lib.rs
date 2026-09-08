@@ -110,6 +110,34 @@ fn rules_list(app: State<App>) -> Result<RuleLists, String> {
     Ok(RuleLists { items, direct: c.direct.clone() })
 }
 
+/// Перевести сразу несколько правил. Нужно для наборов: переключать
+/// их по одному значит на секунду оставлять маршрутизацию несогласованной.
+#[tauri::command]
+fn rules_set_via(app: State<App>, patterns: Vec<String>, via: String) -> Result<(), String> {
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        for pattern in &patterns {
+            c.through_proxy.retain(|p| p != pattern);
+            for g in c.groups.iter_mut() {
+                g.patterns.retain(|p| p != pattern);
+            }
+        }
+        c.groups.retain(|g| !g.patterns.is_empty());
+        if via.is_empty() {
+            c.through_proxy.extend(patterns);
+        } else {
+            match c.groups.iter_mut().find(|g| g.via == via) {
+                Some(g) => g.patterns.extend(patterns),
+                None => c.groups.push(core::config::RouteGroup {
+                    via, enabled: true, patterns,
+                }),
+            }
+        }
+    }
+    e.apply_and_save()
+}
+
 /// Перевести правило на другой прокси. Пустое имя — вернуть на основной.
 #[tauri::command]
 fn rule_set_via(app: State<App>, pattern: String, via: String) -> Result<(), String> {
@@ -315,6 +343,126 @@ fn proxies_in_use(app: State<App>) -> Result<Vec<String>, String> {
     v.sort();
     v.dedup();
     Ok(v)
+}
+
+/// Состояние подписки и xray.
+#[derive(Serialize)]
+pub struct SubState {
+    /// скачан ли xray
+    installed: bool,
+    /// работает ли сейчас
+    running: bool,
+    /// адрес подписки, если брали по ссылке
+    url: String,
+    /// есть ли сохранённое содержимое
+    has_text: bool,
+    enabled: bool,
+    countries: Vec<String>,
+    dir: String,
+}
+
+#[tauri::command]
+fn sub_state(app: State<App>) -> SubState {
+    let path = app.path.lock().unwrap().clone();
+    let dir = core::xray_dir(&path);
+    let (url, has_text, enabled, countries) = match engine(&app) {
+        Ok(e) => {
+            let c = e.cfg.lock().unwrap();
+            let s = c.subscription.clone();
+            (
+                s.as_ref().map(|s| s.url.clone()).unwrap_or_default(),
+                s.as_ref().map(|s| !s.text.trim().is_empty()).unwrap_or(false),
+                s.as_ref().map(|s| s.enabled).unwrap_or(false),
+                c.upstreams.iter().filter(|u| u.from_subscription)
+                    .map(|u| u.name.clone()).collect(),
+            )
+        }
+        Err(_) => (String::new(), false, false, Vec::new()),
+    };
+    SubState {
+        installed: core::xray::is_installed(&dir),
+        running: core::xray::is_running(),
+        url, has_text, enabled, countries,
+        dir: dir.to_string_lossy().to_string(),
+    }
+}
+
+/// Скачать xray. Отдельным действием и только по нажатию: в состав
+/// программы он не входит, чтобы на рабочих машинах его не было вовсе.
+#[tauri::command]
+async fn sub_install(app: tauri::AppHandle) -> Result<String, String> {
+    let path = app.state::<App>().path.lock().unwrap().clone();
+    let dir = core::xray_dir(&path);
+    tauri::async_runtime::spawn_blocking(move || core::xray::download(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Загрузить подписку: из текста или по ссылке. Возвращает список стран.
+#[tauri::command]
+async fn sub_load(app: tauri::AppHandle, source: String) -> Result<Vec<String>, String> {
+    let source = source.trim().to_string();
+    if source.is_empty() {
+        return Err("не указана подписка".into());
+    }
+    let by_url = source.starts_with("http://") || source.starts_with("https://");
+    let (url, text) = if by_url {
+        let u = source.clone();
+        let body = tauri::async_runtime::spawn_blocking(move || {
+            ureq::get(&u)
+                .header("User-Agent", "NexusProxy")
+                .call()
+                .map_err(|e| format!("не скачать подписку: {e}"))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| format!("испорченный ответ: {e}"))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        (source, body)
+    } else {
+        (String::new(), source)
+    };
+
+    // разбираем сразу, чтобы не сохранять заведомо негодное
+    let profiles = core::subscription::parse(&text)?;
+    let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+
+    let state = app.state::<App>();
+    let e = engine(&state)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        c.subscription = Some(core::config::Subscription { url, text, enabled: true });
+    }
+    e.apply_and_save()?;
+    Ok(names)
+}
+
+/// Поднять страны из подписки.
+#[tauri::command]
+async fn sub_apply(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let state = app.state::<App>();
+    let e = engine(&state)?;
+    tauri::async_runtime::spawn_blocking(move || e.apply_subscription())
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Выключить подписку: остановить xray и убрать страны из списка.
+#[tauri::command]
+async fn sub_disable(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<App>();
+    let e = engine(&state)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        if let Some(s) = c.subscription.as_mut() {
+            s.enabled = false;
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || e.apply_subscription())
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(())
 }
 
 /// Доступность каждого прокси.
@@ -591,6 +739,7 @@ fn default_config() -> core::config::Config {
             name: "основной".into(),
             kind: core::upstream::Kind::Socks5,
             address: "127.0.0.1".into(), port: 1080, user: None, password: None,
+            from_subscription: false,
         }],
         default_upstream: "основной".into(),
         groups: vec![],
@@ -600,6 +749,7 @@ fn default_config() -> core::config::Config {
         auto_reconnect: true,
         minimize_to_tray: true,
         enable_on_start: false,
+        subscription: None,
         extra: Default::default(),
     }
 }
@@ -704,6 +854,18 @@ pub fn run() {
                 }
             }
 
+            {
+                let e = app.state::<App>().engine.lock().unwrap().clone();
+                if let Some(e) = e {
+                    // страны из подписки поднимаем при запуске, иначе правила,
+                    // на них ссылающиеся, будут вести в никуда
+                    if let Err(err) = e.apply_subscription() {
+                        core::logfile::line(&core::logfile::now_stamp(),
+                            &format!("подписка не поднялась: {err}"));
+                    }
+                }
+            }
+
             // ⛔ Только ПОСЛЕ запуска движка: раньше этот блок стоял выше,
             // движка ещё не было, и галка «включать при запуске» молча
             // ничего не делала.
@@ -727,13 +889,14 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            status, rules_list, rule_add, rule_edit, rule_remove, rule_set_via,
+            status, rules_list, rule_add, rule_edit, rule_remove, rule_set_via, rules_set_via,
             rule_add_from_file, rules_export, presets, check,
             journal_since, journal_clear, open_folder, install_info, open_installed,
             conns_active, conns_totals, conns_reset,
             upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
             proxies_health, upstream_set_default, failures_recent, failures_clear,
             override_set, override_clear, overrides_list, proxies_in_use,
+            sub_state, sub_install, sub_load, sub_apply, sub_disable,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit
         ])

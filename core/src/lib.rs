@@ -16,9 +16,11 @@ pub mod pump;
 pub mod report;
 pub mod rules;
 pub mod socks_in;
+pub mod subscription;
 pub mod sysproxy;
 pub mod upstream;
 pub mod winproxy;
+pub mod xray;
 
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -38,6 +40,14 @@ pub struct Engine {
 }
 
 pub const NO_PROXY: &str = "localhost,127.0.0.1,::1";
+
+/// Папка, куда кладём скачанный xray и его настройки.
+pub fn xray_dir(config_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(config_path)
+        .parent()
+        .map(|p| p.join("xray"))
+        .unwrap_or_else(|| std::path::PathBuf::from("xray"))
+}
 
 /// Собрать набор прокси из настроек: основной под пустым именем плюс
 /// каждый под своим.
@@ -198,6 +208,83 @@ impl Engine {
         Ok(e)
     }
 
+    /// Поднять страны из подписки: разобрать, запустить xray, вписать их
+    /// в список прокси. Возвращает названия стран.
+    ///
+    /// Прокси из подписки помечены особо: при следующем применении старые
+    /// убираются целиком, иначе от прежней подписки оставались бы хвосты,
+    /// на которые ссылаются правила.
+    pub fn apply_subscription(&self) -> Result<Vec<String>, String> {
+        let (text, enabled) = {
+            let c = self.cfg.lock().unwrap();
+            match &c.subscription {
+                Some(s) => (s.text.clone(), s.enabled),
+                None => return Ok(Vec::new()),
+            }
+        };
+        if !enabled || text.trim().is_empty() {
+            xray::stop();
+            self.drop_subscription_upstreams()?;
+            return Ok(Vec::new());
+        }
+
+        let profiles = subscription::parse(&text)?;
+        let dir = xray_dir(&self.path);
+        xray::start(&dir, &profiles)?;
+
+        let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+        {
+            let mut c = self.cfg.lock().unwrap();
+            c.upstreams.retain(|u| !u.from_subscription);
+            for (i, p) in profiles.iter().enumerate() {
+                // имя может совпасть с уже заведённым вручную — не затираем чужое
+                let name = if c.upstreams.iter().any(|u| u.name == p.name) {
+                    format!("{} (подписка)", p.name)
+                } else {
+                    p.name.clone()
+                };
+                c.upstreams.push(upstream::Upstream {
+                    name,
+                    kind: upstream::Kind::Socks5,
+                    address: "127.0.0.1".into(),
+                    port: xray::port_for(i),
+                    user: None,
+                    password: None,
+                    from_subscription: true,
+                });
+            }
+        }
+        self.apply_and_save()?;
+        logfile::line(&logfile::now_stamp(),
+                      &format!("подписка поднята, стран: {}", names.len()));
+        Ok(names)
+    }
+
+    /// Убрать страны прежней подписки из списка прокси.
+    fn drop_subscription_upstreams(&self) -> Result<(), String> {
+        {
+            let mut c = self.cfg.lock().unwrap();
+            let gone: Vec<String> = c.upstreams.iter()
+                .filter(|u| u.from_subscription)
+                .map(|u| u.name.clone())
+                .collect();
+            c.upstreams.retain(|u| !u.from_subscription);
+            // правила, ссылавшиеся на исчезнувшие страны, возвращаем на основной
+            for name in &gone {
+                if let Some(g) = c.groups.iter().find(|g| &g.via == name) {
+                    let pats = g.patterns.clone();
+                    c.through_proxy.extend(pats);
+                }
+                c.groups.retain(|g| &g.via != name);
+                if &c.default_upstream == name {
+                    c.default_upstream =
+                        c.upstreams.first().map(|u| u.name.clone()).unwrap_or_default();
+                }
+            }
+        }
+        self.apply_and_save()
+    }
+
     /// Перечитать правила и список прокси из настроек, затем сохранить файл.
     pub fn apply_and_save(&self) -> Result<(), String> {
         let c = self.cfg.lock().unwrap();
@@ -279,6 +366,7 @@ impl Engine {
     }
 
     pub fn shutdown(&self) {
+        xray::stop();
         self.system_proxy_off();
         for t in self.tasks.lock().unwrap().drain(..) {
             t.abort();

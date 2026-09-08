@@ -49,6 +49,19 @@ pub fn normalize(pattern: &str) -> String {
     format!("domain:{p}")
 }
 
+/// Подписка: откуда взяли и что в ней было.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subscription {
+    /// адрес, если подписку берут по ссылке — чтобы обновлять
+    #[serde(default)]
+    pub url: String,
+    /// содержимое: по нему поднимаются страны при запуске
+    #[serde(default)]
+    pub text: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
 /// Итог добавления списком — что принято, что уже было, что не разобрано.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct BulkResult {
@@ -103,6 +116,9 @@ pub struct Config {
     /// Включать перехват сразу при запуске программы.
     #[serde(default)]
     pub enable_on_start: bool,
+    /// Подписка со странами. Хранится, чтобы поднимать их при запуске.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<Subscription>,
     /// Всё прочее из файла — чтобы при перезаписи не потерять
     /// комментарии и поля, которых мы не знаем.
     #[serde(flatten)]
@@ -295,6 +311,7 @@ mod tests {
             upstreams: vec![Upstream {
                 name: "основной".into(), kind: Default::default(),
                 address: "127.0.0.1".into(), port: 1080, user: None, password: None,
+                from_subscription: false,
             }],
             default_upstream: "основной".into(),
             groups: vec![],
@@ -303,6 +320,7 @@ mod tests {
             auto_reconnect: true,
             minimize_to_tray: true,
             enable_on_start: false,
+            subscription: None,
             extra: Default::default(),
         }
     }
@@ -350,6 +368,7 @@ mod tests {
         Upstream {
             name: name.into(), kind: Default::default(),
             address: "127.0.0.1".into(), port, user: None, password: None,
+            from_subscription: false,
         }
     }
 
