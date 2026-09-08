@@ -19,24 +19,28 @@ pub struct Health {
 pub struct ProxyHealth {
     pub name: String,
     pub up: bool,
-    /// отклик в миллисекундах на последней проверке
+    /// отклик в миллисекундах: время сквозной проверки через прокси
     pub ms: u64,
+    /// прошла ли сквозная проверка. Если прокси отвечает, но наружу
+    /// через него не пройти — это разные вещи, и путать их нельзя.
+    pub probe_ok: bool,
     pub checked_secs_ago: u64,
 }
 
 struct One {
     up: bool,
     ms: u64,
+    probe_ok: bool,
     checked: Instant,
 }
 
 static EACH: Mutex<Option<BTreeMap<String, One>>> = Mutex::new(None);
 
 /// Отметить результат проверки конкретного прокси.
-pub fn set_proxy(name: &str, up: bool, ms: u64) {
+pub fn set_proxy(name: &str, up: bool, ms: u64, probe_ok: bool) {
     let mut g = EACH.lock().unwrap();
     let m = g.get_or_insert_with(BTreeMap::new);
-    m.insert(name.to_string(), One { up, ms, checked: Instant::now() });
+    m.insert(name.to_string(), One { up, ms, probe_ok, checked: Instant::now() });
 }
 
 /// Состояние всех прокси — по одному на каждый из настроек.
@@ -48,6 +52,7 @@ pub fn proxies() -> Vec<ProxyHealth> {
             name: name.clone(),
             up: o.up,
             ms: o.ms,
+            probe_ok: o.probe_ok,
             checked_secs_ago: o.checked.elapsed().as_secs(),
         })
         .collect()
@@ -105,12 +110,13 @@ mod tests {
 
     #[test]
     fn per_proxy_state_is_kept() {
-        set_proxy("офис", true, 12);
-        set_proxy("vpn", false, 0);
+        set_proxy("офис", true, 12, true);
+        set_proxy("vpn", false, 0, false);
         let v = proxies();
         let office = v.iter().find(|p| p.name == "офис").unwrap();
         assert!(office.up);
         assert_eq!(office.ms, 12);
+        assert!(office.probe_ok);
         assert!(!v.iter().find(|p| p.name == "vpn").unwrap().up);
     }
 

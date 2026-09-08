@@ -156,6 +156,7 @@ impl Engine {
                 };
                 let mut main_ok = true;
                 for u in list {
+                    // 1. отвечает ли сам прокси
                     let started = std::time::Instant::now();
                     let ok = tokio::time::timeout(
                         std::time::Duration::from_secs(6),
@@ -164,9 +165,28 @@ impl Engine {
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
-                    let ms = started.elapsed().as_millis() as u64;
+                    let mut ms = started.elapsed().as_millis() as u64;
+
+                    // 2. Сквозная проверка: проходит ли через него наружу.
+                    // Для стран из подписки первый замер бесполезен — там
+                    // локальный порт, всегда ноль. Настоящее время видно
+                    // только сквозь прокси.
+                    let mut probe_ok = false;
+                    if ok {
+                        let t = std::time::Instant::now();
+                        probe_ok = tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            upstream::connect_through(&u, "1.1.1.1", 80),
+                        )
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+                        if probe_ok {
+                            ms = t.elapsed().as_millis() as u64;
+                        }
+                    }
                     let first_time = !health::proxies().iter().any(|p| p.name == u.title());
-                    health::set_proxy(&u.title(), ok, ms);
+                    health::set_proxy(&u.title(), ok, ms, probe_ok);
                     if first_time {
                         logfile::line(&logfile::now_stamp(),
                                       &format!("прокси «{}» взят под наблюдение: {}",

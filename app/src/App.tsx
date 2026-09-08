@@ -58,6 +58,40 @@ function useSticky<T>(key: string, initial: T): [T, (v: T) => void] {
   return [v, set];
 }
 
+/// Флаг для названия прокси.
+///
+/// Если в имени уже есть флаг — берём его. Если нет, пробуем узнать страну
+/// по слову: подписки называют профили по-разному, а видеть флаг привычно.
+const FLAGS: [RegExp, string][] = [
+  [/герман|germany|deutsch|\bde\b/i, "🇩🇪"], [/франц|france|\bfr\b/i, "🇫🇷"],
+  [/финлянд|finland|suomi|\bfi\b/i, "🇫🇮"], [/сша|usa|united states|\bus\b/i, "🇺🇸"],
+  [/литв|lithuania|\blt\b/i, "🇱🇹"], [/нидерл|netherl|holland|\bnl\b/i, "🇳🇱"],
+  [/швец|sweden|\bse\b/i, "🇸🇪"], [/швейцар|switzerl|\bch\b/i, "🇨🇭"],
+  [/великобрит|united kingdom|england|\buk\b|\bgb\b/i, "🇬🇧"],
+  [/польш|poland|\bpl\b/i, "🇵🇱"], [/турц|turkey|türkiye|\btr\b/i, "🇹🇷"],
+  [/япон|japan|\bjp\b/i, "🇯🇵"], [/сингапур|singapore|\bsg\b/i, "🇸🇬"],
+  [/росси|russia|\bru\b/i, "🇷🇺"], [/казахст|kazakh|\bkz\b/i, "🇰🇿"],
+  [/армен|armenia|\bam\b/i, "🇦🇲"], [/груз|georgia|\bge\b/i, "🇬🇪"],
+  [/кипр|cyprus|\bcy\b/i, "🇨🇾"], [/австр(ия|ии)|austria|\bat\b/i, "🇦🇹"],
+  [/испан|spain|\bes\b/i, "🇪🇸"], [/итал|italy|\bit\b/i, "🇮🇹"],
+  [/канад|canada|\bca\b/i, "🇨🇦"], [/латв|latvia|\blv\b/i, "🇱🇻"],
+  [/эстон|estonia|\bee\b/i, "🇪🇪"], [/чех|czech|\bcz\b/i, "🇨🇿"],
+  [/украин|ukraine|\bua\b/i, "🇺🇦"], [/бела?рус|belarus|\bby\b/i, "🇧🇾"],
+];
+
+export function flagOf(name: string): string {
+  // готовый флаг в имени — пара символов из диапазона региональных букв
+  const has = name.match(/[\u{1F1E6}-\u{1F1FF}]{2}/u);
+  if (has) return has[0];
+  for (const [re, flag] of FLAGS) if (re.test(name)) return flag;
+  return "";
+}
+
+/// Имя без флага — чтобы не показывать его дважды.
+function nameOnly(name: string): string {
+  return name.replace(/[\u{1F1E6}-\u{1F1FF}]{2}\s*/u, "").trim() || name;
+}
+
 function duration(sec: number): string {
   const m = Math.floor(sec / 60), s = sec % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
@@ -71,6 +105,10 @@ type Theme = "system" | "light" | "dark";
 export default function App() {
   const [tab, setTab] = useSticky<"rules" | "discover" | "conns" | "log" | "settings">("tab", "rules");
   const [st, setSt] = useState<Status | null>(null);
+  const [version, setVersion] = useState("");
+  useEffect(() => {
+    invoke<{ version: string }>("install_info").then((i) => setVersion(i.version)).catch(() => {});
+  }, []);
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem("theme") as Theme) || "system"
   );
@@ -110,6 +148,7 @@ export default function App() {
     <div className="app">
       <div className="top">
         <span className="brand">NexusProxy</span>
+        <span className="ver">{version || ""}</span>
         <span className={"pill" + (st?.system_on ? " on" : "")}>
           <span className="dot" />
           {st?.system_on ? "включён" : "выключен"}
@@ -361,7 +400,10 @@ function Rules({ onChange }: { onChange: () => void }) {
     });
     load(); onChange();
   };
-  const upName = (u: Upstream) => u.name || "по умолчанию";
+  const upName = (u: Upstream) => {
+    const f = flagOf(u.name);
+    return (f ? f + " " : "") + (nameOnly(u.name) || "по умолчанию");
+  };
   const togglePreset = async (p: Preset) => {
     if (hasAll(p)) {
       // Наборы делят домены: у Gemini и YouTube общие google-адреса.
@@ -1061,7 +1103,8 @@ function Upstreams({ defaultName, onSaved }: { defaultName: string; onSaved: () 
               <span className={"state " + (h ? (h.up ? "up" : "down") : "unknown")}
                 title={h ? (h.up ? `отвечает, ${h.ms} мс` : "не отвечает") : "ещё не проверялся"} />
               <span className="grow">
-                {u.name}
+                {flagOf(u.name) && <span className="flag">{flagOf(u.name)}</span>}
+                {nameOnly(u.name)}
                 {u.name === defaultName && <span className="tag" style={{ marginLeft: 6 }}>по умолчанию</span>}
                 <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
               </span>
@@ -1330,7 +1373,12 @@ function Subscription({ onChange }: { onChange: () => void }) {
       {countries.length > 0 && (
         <div className="list" style={{ marginTop: 8 }}>
           {countries.map((c) => (
-            <div className="item" key={c}><span className="grow">{c}</span></div>
+            <div className="item" key={c}>
+              <span className="grow">
+                {flagOf(c) && <span className="flag">{flagOf(c)}</span>}
+                {nameOnly(c)}
+              </span>
+            </div>
           ))}
         </div>
       )}
