@@ -153,7 +153,70 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::collections::HashMap;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Разбираем вывод lsof: он единственный даёт связку порт → процесс
+    /// без прав администратора и без своих библиотек.
+    static CACHE: Mutex<Option<(Instant, HashMap<u16, (u32, String)>)>> = Mutex::new(None);
+
+    fn table(force: bool) -> HashMap<u16, (u32, String)> {
+        let mut g = CACHE.lock().unwrap();
+        if !force {
+            if let Some((t, m)) = g.as_ref() {
+                if t.elapsed() < Duration::from_secs(1) {
+                    return m.clone();
+                }
+            }
+        }
+        let mut map = HashMap::new();
+        // -n без разрешения имён, -P без имён портов, -F поля через перевод строки
+        if let Ok(out) = Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-FpcnT"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let (mut pid, mut name) = (0u32, String::new());
+            for line in text.lines() {
+                let (tag, val) = line.split_at(1);
+                match tag {
+                    "p" => pid = val.parse().unwrap_or(0),
+                    "c" => name = val.to_string(),
+                    "n" => {
+                        // вида 127.0.0.1:52344->127.0.0.1:18080
+                        if let Some(local) = val.split("->").next() {
+                            if let Some(port) = local.rsplit(':').next() {
+                                if let Ok(p) = port.parse::<u16>() {
+                                    map.insert(p, (pid, name.clone()));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        *g = Some((Instant::now(), map.clone()));
+        map
+    }
+
+    pub fn app_by_port(port: u16) -> super::AppInfo {
+        let mut found = table(false).get(&port).cloned();
+        if found.is_none() {
+            found = table(true).get(&port).cloned();
+        }
+        match found {
+            Some((pid, name)) => super::AppInfo { name, path: String::new(), pid },
+            None => super::AppInfo::default(),
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     pub fn app_by_port(_port: u16) -> super::AppInfo {
         super::AppInfo::default()

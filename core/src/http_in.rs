@@ -3,7 +3,7 @@
 //! SOCKS он не поддерживает.
 
 use crate::rules::Rules;
-use crate::upstream::{dial, Pool};
+use crate::upstream::{dial, Routing};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 
 const MAX_HEAD: usize = 64 * 1024;
 
-pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
+pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
                     rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
@@ -46,7 +46,7 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target, 443)?;
-        return match dial(&pool, &rules, &host, port).await {
+        return match dial(&routing, &rules, &host, port).await {
             Ok((mut server, d)) => {
                 c.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
                 // всё, что клиент успел прислать после заголовка, — уже полезные данные
@@ -75,7 +75,7 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
 
     // обычный запрос в абсолютной форме: GET http://host/path
     let (host, port, path) = split_absolute(&target)?;
-    let (mut server, d) = match dial(&pool, &rules, &host, port).await {
+    let (mut server, d) = match dial(&routing, &rules, &host, port).await {
         Ok(v) => v,
         Err(e) => {
             respond(&mut c, 502, "Bad Gateway").await.ok();

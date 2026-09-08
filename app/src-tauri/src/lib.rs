@@ -274,6 +274,49 @@ fn failures_clear() {
     core::failures::clear()
 }
 
+/// Временно увести правила одного прокси на другой.
+#[tauri::command]
+fn override_set(app: State<App>, from: String, to: String) -> Result<(), String> {
+    engine(&app)?.set_override(&from, &to)
+}
+
+#[tauri::command]
+fn override_clear(app: State<App>, from: String) -> Result<(), String> {
+    engine(&app)?.clear_override(&from);
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct Override {
+    from: String,
+    to: String,
+}
+
+#[tauri::command]
+fn overrides_list(app: State<App>) -> Vec<Override> {
+    match engine(&app) {
+        Ok(e) => e.overrides().into_iter().map(|(from, to)| Override { from, to }).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Прокси, на которые ссылаются правила, — чтобы знать, чей отказ важен.
+#[tauri::command]
+fn proxies_in_use(app: State<App>) -> Result<Vec<String>, String> {
+    let e = engine(&app)?;
+    let c = e.cfg.lock().unwrap();
+    let mut v: Vec<String> = c.groups.iter()
+        .filter(|g| g.enabled && !g.patterns.is_empty())
+        .map(|g| g.via.clone())
+        .collect();
+    if !c.through_proxy.is_empty() {
+        v.push(c.default_upstream.clone());
+    }
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
 /// Доступность каждого прокси.
 #[tauri::command]
 fn proxies_health() -> Vec<core::health::ProxyHealth> {
@@ -690,6 +733,7 @@ pub fn run() {
             conns_active, conns_totals, conns_reset,
             upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
             proxies_health, upstream_set_default, failures_recent, failures_clear,
+            override_set, override_clear, overrides_list, proxies_in_use,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit
         ])

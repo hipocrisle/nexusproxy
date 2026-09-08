@@ -1,6 +1,6 @@
 [package]
 name = "nexusproxy-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Локальный прокси с правилами: выбранные ресурсы — через вышестоящий SOCKS5, остальное напрямую"
 

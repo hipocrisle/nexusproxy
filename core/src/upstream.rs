@@ -13,7 +13,7 @@ pub static AUTO_RECONNECT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
 /// Каким протоколом говорить с вышестоящим прокси.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Socks5,
@@ -55,13 +55,36 @@ pub static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Набор доступных прокси: имя → описание. Пустое имя — основной.
 pub type Pool = std::collections::HashMap<String, Upstream>;
 
+/// Куда на самом деле идти. Кроме списка прокси хранит временные подмены:
+/// когда назначенный прокси лёг, его правила по согласию пользователя
+/// уводятся на другой. Подмена живёт только в памяти — файл настроек не
+/// трогаем, иначе после перезапуска человек получит не ту маршрутизацию,
+/// о которой помнит.
+#[derive(Default)]
+pub struct Routing {
+    pub pool: Pool,
+    /// имя прокси → имя того, кем его временно заменили
+    pub overrides: std::collections::HashMap<String, String>,
+}
+
+impl Routing {
+    /// Прокси с учётом временной подмены.
+    pub fn resolve(&self, name: &str) -> Option<(&Upstream, bool)> {
+        let real = self.pool.get(name)?;
+        match self.overrides.get(real.name.as_str()) {
+            Some(to) => self.pool.get(to).map(|u| (u, true)),
+            None => Some((real, false)),
+        }
+    }
+}
+
 /// Куда пошло соединение — для журнала и таблицы соединений.
 pub struct Decision {
     pub route: Route,
     pub via: String,
 }
 
-pub async fn dial(pool: &std::sync::RwLock<Pool>, rules: &std::sync::RwLock<Rules>,
+pub async fn dial(routing: &std::sync::RwLock<Routing>, rules: &std::sync::RwLock<Rules>,
                   host: &str, port: u16) -> io::Result<(TcpStream, Decision)> {
     let route = rules.read().unwrap().decide(host);
     if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -70,19 +93,24 @@ pub async fn dial(pool: &std::sync::RwLock<Pool>, rules: &std::sync::RwLock<Rule
     }
     crate::report::note(host, &route);
 
-    let up = match &route {
+    let (up, substituted) = match &route {
         Route::Proxy(name) => {
-            let pool = pool.read().unwrap();
-            match pool.get(name.as_str()).or_else(|| pool.get("")) {
-                Some(u) => Some(u.clone()),
+            let r = routing.read().unwrap();
+            match r.resolve(name).or_else(|| r.resolve("")) {
+                Some((u, sub)) => (Some(u.clone()), sub),
                 None => {
                     return Err(bad(&format!("прокси «{name}» не найден в настройках")));
                 }
             }
         }
-        _ => None,
+        _ => (None, false),
     };
-    let via = up.as_ref().map(|u| u.title()).unwrap_or_default();
+    let via = match (&up, substituted) {
+        // видно, что идёт не туда, куда назначено, — иначе подмена незаметна
+        (Some(u), true) => format!("{} (замена)", u.title()),
+        (Some(u), false) => u.title(),
+        (None, _) => String::new(),
+    };
     crate::journal::push(host, port, &route, &via);
     let d = Decision { route: route.clone(), via: via.clone() };
 
@@ -286,4 +314,64 @@ fn socks_error(code: u8) -> &'static str {
 
 fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn up(name: &str, port: u16) -> Upstream {
+        Upstream {
+            name: name.into(), kind: Kind::Socks5,
+            address: "127.0.0.1".into(), port, user: None, password: None,
+        }
+    }
+
+    fn routing() -> Routing {
+        let mut pool = Pool::new();
+        pool.insert("офис".into(), up("офис", 1081));
+        pool.insert("vpn".into(), up("vpn", 10808));
+        pool.insert(String::new(), up("офис", 1081));
+        Routing { pool, overrides: Default::default() }
+    }
+
+    #[test]
+    fn without_override_goes_where_assigned() {
+        let r = routing();
+        let (u, sub) = r.resolve("офис").unwrap();
+        assert_eq!(u.port, 1081);
+        assert!(!sub, "подмены нет");
+    }
+
+    #[test]
+    fn override_redirects_and_is_visible() {
+        let mut r = routing();
+        r.overrides.insert("офис".into(), "vpn".into());
+        let (u, sub) = r.resolve("офис").unwrap();
+        assert_eq!(u.port, 10808, "должен уйти на замену");
+        assert!(sub, "подмена обязана быть заметна — иначе она незаметно врёт");
+
+        // и через пустое имя, то есть «по умолчанию», тоже
+        let (u, sub) = r.resolve("").unwrap();
+        assert_eq!(u.port, 10808);
+        assert!(sub);
+    }
+
+    #[test]
+    fn other_proxies_untouched() {
+        let mut r = routing();
+        r.overrides.insert("офис".into(), "vpn".into());
+        let (u, sub) = r.resolve("vpn").unwrap();
+        assert_eq!(u.port, 10808);
+        assert!(!sub, "у vpn подмены нет, пометки быть не должно");
+    }
+
+    #[test]
+    fn override_to_missing_proxy_is_not_silently_ignored() {
+        let mut r = routing();
+        r.overrides.insert("офис".into(), "нет-такого".into());
+        // молча вернуть исходный нельзя: человек думает, что переключил
+        assert!(r.resolve("офис").is_none());
+    }
 }

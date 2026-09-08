@@ -48,10 +48,10 @@ pub fn all() -> Vec<Preset> {
           &["cursor.com", "cursor.sh", "codeium.com", "windsurf.com",
             "jetbrains.com", "jetbrains.ai"]),
         p("Docker и реестры образов",
-          "Docker Hub, ghcr, quay, gcr",
+          "Docker Hub и реестры. Docker Desktop может требовать свои настройки",
           &["docker.com", "docker.io", "ghcr.io", "quay.io", "gcr.io", "k8s.io"]),
         p("Телеграм",
-          "Веб-версия и приложение",
+          "Веб-версия. Приложению укажите наш SOCKS5 в его настройках связи",
           &["telegram.org", "t.me", "telegram.me", "telegra.ph", "tdesktop.com"]),
         p("Документация и справка",
           "Stack Overflow, MDN, readthedocs",
@@ -74,6 +74,15 @@ mod tests {
                 assert!(!d.contains(' ') && d.contains('.'), "{d} не похож на домен");
             }
         }
+    }
+
+    #[test]
+    fn notes_do_not_promise_desktop_apps_that_ignore_system_proxy() {
+        // Приложение Telegram системный прокси не слушает — набор не должен
+        // обещать, что оно заработает само.
+        let tg = all().into_iter().find(|p| p.name.contains("Телеграм")).unwrap();
+        assert!(!tg.note.contains("приложение") || tg.note.contains("укажите"),
+                "нельзя обещать работу приложения без его собственной настройки: {}", tg.note);
     }
 
     #[test]

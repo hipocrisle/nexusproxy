@@ -85,6 +85,21 @@ pub fn open(host: &str, port: u16, route: &str, via: &str, app: &crate::proc::Ap
     (id, counters, kill)
 }
 
+/// Оборвать все соединения, идущие через прокси. Нужно при подмене:
+/// правило не изменилось, а идти должно в другое место.
+pub fn drop_changed_all(_rules: &std::sync::RwLock<crate::rules::Rules>) -> usize {
+    let g = S.lock().unwrap();
+    let Some(s) = g.as_ref() else { return 0 };
+    let mut n = 0;
+    for c in s.live.values() {
+        if c.route == "proxy" {
+            c.kill.notify_waiters();
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Оборвать соединения, для которых правила теперь дают другой путь.
 /// Возвращает, сколько разорвано.
 ///

@@ -9,12 +9,14 @@ pub mod failures;
 pub mod health;
 pub mod journal;
 pub mod logfile;
+pub mod macproxy;
 pub mod presets;
 pub mod proc;
 pub mod pump;
 pub mod report;
 pub mod rules;
 pub mod socks_in;
+pub mod sysproxy;
 pub mod upstream;
 pub mod winproxy;
 
@@ -25,13 +27,13 @@ use tokio::net::TcpListener;
 pub struct Engine {
     pub cfg: Arc<Mutex<config::Config>>,
     pub rules: Arc<RwLock<rules::Rules>>,
-    /// Доступные прокси: имя → описание. Меняется вместе с настройками.
-    pub pool: Arc<RwLock<upstream::Pool>>,
+    /// Куда идти: список прокси и временные подмены.
+    pub routing: Arc<RwLock<upstream::Routing>>,
     /// Пинок сторожу: проверить прокси немедленно, не дожидаясь очередного круга.
     /// Без этого добавленный прокси до пятнадцати секунд оставался серым.
     recheck: Arc<tokio::sync::Notify>,
     pub path: String,
-    saved: Mutex<Option<winproxy::Saved>>,
+    saved: Mutex<Option<sysproxy::Saved>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -63,7 +65,10 @@ impl Engine {
         cfg.migrate();
         cfg.check_links()?;
         let rules = Arc::new(RwLock::new(cfg.rules()?));
-        let pool = Arc::new(RwLock::new(build_pool(&cfg)));
+        let routing = Arc::new(RwLock::new(upstream::Routing {
+            pool: build_pool(&cfg),
+            overrides: Default::default(),
+        }));
         let recheck = Arc::new(tokio::sync::Notify::new());
         let default_name = cfg.default_proxy().map(|u| u.name.clone()).unwrap_or_default();
         let (hp, sp) = (cfg.listen.http, cfg.listen.socks);
@@ -76,7 +81,7 @@ impl Engine {
         let e = Arc::new(Engine {
             cfg: Arc::new(Mutex::new(cfg)),
             rules: rules.clone(),
-            pool: pool.clone(),
+            routing: routing.clone(),
             recheck: recheck.clone(),
             path: path.to_string(),
             saved: Mutex::new(None),
@@ -86,7 +91,7 @@ impl Engine {
         // ⛔ Раньше здесь было `while let Ok(...) = accept()`, и любая
         // случайная ошибка приёма навсегда убивала вход — молча, без следа.
         // Теперь ошибка только записывается, а цикл продолжается.
-        let (u1, r1) = (pool.clone(), rules.clone());
+        let (u1, r1) = (routing.clone(), rules.clone());
         let t1 = tokio::spawn(async move {
             loop {
                 match http.accept().await {
@@ -101,7 +106,7 @@ impl Engine {
                 }
             }
         });
-        let (u2, r2) = (pool.clone(), rules.clone());
+        let (u2, r2) = (routing.clone(), rules.clone());
         let t2 = tokio::spawn(async move {
             loop {
                 match socks.accept().await {
@@ -119,7 +124,7 @@ impl Engine {
 
         // Сторож проверяет КАЖДЫЙ прокси из настроек, а не только основной:
         // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
-        let watch_pool = pool.clone();
+        let watch_routing = routing.clone();
         let watch_recheck = recheck.clone();
         let main_name = default_name.clone();
         let t3 = tokio::spawn(async move {
@@ -135,9 +140,9 @@ impl Engine {
                 }
                 first = false;
                 let list: Vec<upstream::Upstream> = {
-                    let p = watch_pool.read().unwrap();
+                    let r = watch_routing.read().unwrap();
                     // пустое имя — дубль основного, его пропускаем
-                    p.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
+                    r.pool.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
                 };
                 let mut main_ok = true;
                 for u in list {
@@ -165,6 +170,13 @@ impl Engine {
                     if !ok {
                         logfile::line(&logfile::now_stamp(),
                                       &format!("прокси «{}» не отвечает", u.title()));
+                    } else {
+                        // вернулся — снимаем временную подмену сами
+                        let had = { watch_routing.write().unwrap().overrides.remove(&u.name).is_some() };
+                        if had {
+                            logfile::line(&logfile::now_stamp(),
+                                &format!("прокси «{}» снова доступен, подмена снята", u.title()));
+                        }
                     }
                 }
                 if !upstream::AUTO_RECONNECT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -201,7 +213,7 @@ impl Engine {
         logfile::line(&logfile::now_stamp(),
                       &format!("список прокси обновлён: по умолчанию «{}», всего {} — {}",
                                c.default_upstream, c.upstreams.len(), names.join(", ")));
-        *self.pool.write().unwrap() = pool;
+        self.routing.write().unwrap().pool = pool;
         // сторож должен сразу проверить изменившийся список прокси
         self.recheck.notify_waiters();
         // рвём то, что теперь должно идти иначе, иначе правка не подействует
@@ -213,9 +225,44 @@ impl Engine {
         c.save(&self.path)
     }
 
+    /// Временно увести правила одного прокси на другой.
+    /// Файл настроек не трогаем: подмена живёт до возврата или до
+    /// перезапуска, иначе человек получит не ту маршрутизацию, что помнит.
+    pub fn set_override(&self, from: &str, to: &str) -> Result<(), String> {
+        {
+            let mut r = self.routing.write().unwrap();
+            if !r.pool.contains_key(to) {
+                return Err(format!("прокси «{to}» не найден"));
+            }
+            if from == to {
+                return Err("нельзя заменить прокси им же".into());
+            }
+            r.overrides.insert(from.to_string(), to.to_string());
+        }
+        logfile::line(&logfile::now_stamp(),
+                      &format!("правила «{from}» временно идут через «{to}»"));
+        conns::drop_changed_all(&self.rules);
+        Ok(())
+    }
+
+    pub fn clear_override(&self, from: &str) {
+        let had = self.routing.write().unwrap().overrides.remove(from).is_some();
+        if had {
+            logfile::line(&logfile::now_stamp(),
+                          &format!("правила «{from}» вернулись на свой прокси"));
+            conns::drop_changed_all(&self.rules);
+        }
+    }
+
+    /// Какие подмены сейчас действуют.
+    pub fn overrides(&self) -> Vec<(String, String)> {
+        self.routing.read().unwrap().overrides.iter()
+            .map(|(a, b)| (a.clone(), b.clone())).collect()
+    }
+
     pub fn system_proxy_on(&self) -> Result<(), String> {
         let port = self.cfg.lock().unwrap().listen.http;
-        let s = winproxy::apply(&format!("127.0.0.1:{port}"), NO_PROXY)
+        let s = sysproxy::apply(&format!("127.0.0.1:{port}"), NO_PROXY)
             .map_err(|e| e.to_string())?;
         *self.saved.lock().unwrap() = Some(s);
         Ok(())
@@ -223,7 +270,7 @@ impl Engine {
 
     pub fn system_proxy_off(&self) {
         if let Some(s) = self.saved.lock().unwrap().take() {
-            winproxy::restore(&s);
+            sysproxy::restore(&s);
         }
     }
 

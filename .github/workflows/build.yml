@@ -26,6 +26,69 @@ jobs:
           workspaces: core
       - run: cargo test --release --manifest-path core/Cargo.toml
 
+  macos:
+    name: Сборка под macOS
+    runs-on: macos-latest
+    needs: core
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # оба вида процессоров: и Apple, и Intel
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core
+            app/src-tauri
+          key: macos
+
+      - name: Тесты движка на macOS
+        run: cargo test --release --manifest-path core/Cargo.toml
+
+      - name: Зависимости интерфейса
+        working-directory: app
+        run: npm ci
+
+      - name: Окно программы
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target universal-apple-darwin
+
+      - name: Собрать в одну папку
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out-mac
+          REL=app/src-tauri/target/universal-apple-darwin/release
+          echo "── что лежит в $REL/bundle ──"
+          ls -la "$REL/bundle" || true
+          find "$REL/bundle" -name '*.dmg' -exec cp {} out-mac/ \; 2>/dev/null || true
+          find "$REL/bundle" -name '*.tar.gz' -exec cp {} out-mac/ \; 2>/dev/null || true
+          find "$REL/bundle" -name '*.sig' -exec cp {} out-mac/ \; 2>/dev/null || true
+          ls -la out-mac
+          test -n "$(ls -A out-mac)" || { echo "::error::Ничего не собралось"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexusproxy-macos
+          path: out-mac/*
+
+      - name: Добавить к релизу по тегу
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out-mac/*
+
   windows:
     name: Сборка под Windows
     runs-on: windows-latest
@@ -133,6 +196,9 @@ jobs:
             ls -la out; exit 1
           fi
           NAME=$(basename "$SETUP")
+          # Пока только Windows: задания идут параллельно, и файл от macOS
+          # сюда не доедет. Автообновление для macOS — отдельным шагом,
+          # когда убедимся, что сборка под неё вообще работает.
           cat > out/latest.json <<EOF
           {
             "version": "$VER",

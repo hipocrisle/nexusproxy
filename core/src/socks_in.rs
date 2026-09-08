@@ -1,13 +1,13 @@
 //! Входящий SOCKS5 — для приложений, которые умеют работать через SOCKS.
 
 use crate::rules::Rules;
-use crate::upstream::{dial, Pool};
+use crate::upstream::{dial, Routing};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
+pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
                     rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
@@ -66,7 +66,7 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
     c.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
 
-    match dial(&pool, &rules, &host, port).await {
+    match dial(&routing, &rules, &host, port).await {
         Ok((mut server, d)) => {
             reply(&mut c, 0x00).await?;
             let (id, counters, kill) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);

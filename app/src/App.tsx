@@ -138,6 +138,8 @@ export default function App() {
         </button>
       </div>
 
+      <Alerts st={st} onChange={refresh} />
+
       <div className="tabs">
         {([["rules", "Правила"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
            ["log", "Журнал"], ["settings", "Настройки"]] as const)
@@ -155,6 +157,121 @@ export default function App() {
         {tab === "log" && <Log />}
         {tab === "settings" && <Settings st={st} onSaved={refresh} />}
       </div>
+    </div>
+  );
+}
+
+/* ─────────────── Полоса важных сообщений ─────────────── */
+
+type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number };
+type Override = { from: string; to: string };
+
+/// Всё, о чём человек должен узнать сразу, а не найдя в настройках:
+/// новая версия и упавший прокси, через который идут его правила.
+function Alerts({ st, onChange }: { st: Status | null; onChange: () => void }) {
+  const [newVersion, setNewVersion] = useState("");
+  const [updateHidden, setUpdateHidden] = useState(false);
+  const [installing, setInstalling] = useState(false);
+
+  const [health, setHealth] = useState<ProxyHealth[]>([]);
+  const [inUse, setInUse] = useState<string[]>([]);
+  const [overrides, setOverrides] = useState<Override[]>([]);
+  const [declined, setDeclined] = useState<Set<string>>(new Set());
+  const [pick, setPick] = useState<Record<string, string>>({});
+
+  // Проверка при запуске. Недоступность канала — не ошибка: за периметром
+  // это норма, пугать человека при каждом старте нельзя.
+  useEffect(() => {
+    checkUpdate().then((u) => { if (u) setNewVersion(u.version); }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const tick = async () => {
+      setHealth(await invoke<ProxyHealth[]>("proxies_health").catch(() => []));
+      setInUse(await invoke<string[]>("proxies_in_use").catch(() => []));
+      setOverrides(await invoke<Override[]>("overrides_list").catch(() => []));
+    };
+    tick();
+    const t = setInterval(tick, 4000);
+    return () => clearInterval(t);
+  }, []);
+
+  const install = async () => {
+    setInstalling(true);
+    try {
+      const u = await checkUpdate();
+      if (u) { await u.downloadAndInstall(); await relaunch(); }
+    } catch { setInstalling(false); }
+  };
+
+  // упавшие прокси, через которые реально идут правила и подмены ещё нет
+  const broken = health.filter(
+    (h) => !h.up && inUse.includes(h.name)
+      && !overrides.some((o) => o.from === h.name) && !declined.has(h.name)
+  );
+  const alive = health.filter((h) => h.up).map((h) => h.name);
+
+  const showUpdate = newVersion && !updateHidden;
+  if (!showUpdate && broken.length === 0 && overrides.length === 0) return null;
+
+  return (
+    <div className="alerts">
+      {showUpdate && (
+        <div className="alert">
+          <span className="grow">Доступна версия <b>{newVersion}</b></span>
+          <button className="btn small primary" onClick={install} disabled={installing}>
+            {installing ? "Устанавливаю…" : "Обновить"}
+          </button>
+          <button className="btn small" onClick={() => setUpdateHidden(true)}>Позже</button>
+        </div>
+      )}
+
+      {broken.map((h) => {
+        const options = alive.filter((n) => n !== h.name);
+        const chosen = pick[h.name] ?? options[0] ?? "";
+        return (
+          <div className="alert warn" key={h.name}>
+            <span className="grow">
+              Прокси <b>{h.name}</b> не отвечает
+              {options.length === 0 && " — заменить нечем, других доступных нет"}
+            </span>
+            {options.length > 1 && (
+              <select className="field small-sel" value={chosen}
+                onChange={(e) => setPick({ ...pick, [h.name]: e.target.value })}>
+                {options.map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            )}
+            {options.length > 0 && (
+              <button className="btn small primary" onClick={async () => {
+                await invoke("override_set", { from: h.name, to: chosen });
+                onChange();
+              }}>
+                Перевести на {options.length > 1 ? "выбранный" : chosen}
+              </button>
+            )}
+            <button className="btn small"
+              onClick={() => setDeclined((s) => new Set(s).add(h.name))}>
+              Оставить
+            </button>
+          </div>
+        );
+      })}
+
+      {overrides.map((o) => (
+        <div className="alert sub-on" key={o.from}>
+          <span className="grow">
+            Правила <b>{o.from}</b> временно идут через <b>{o.to}</b>.
+            Вернётся само, когда {o.from} снова ответит
+          </span>
+          <button className="btn small" onClick={async () => {
+            await invoke("override_clear", { from: o.from });
+            onChange();
+          }}>
+            Вернуть сейчас
+          </button>
+        </div>
+      ))}
+      {st && null}
     </div>
   );
 }
@@ -755,6 +872,36 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           <button className="btn" onClick={save}>Применить и перезапустить</button>
           {saved && <span className="meta">{saved}</span>}
         </div>
+
+        <div className="note" style={{ marginTop: 12 }}>
+          <b>Если приложение умеет работать через прокси само</b>
+          <span>
+            Программы со своими настройками связи — Telegram, Docker, часть
+            почтовых клиентов и редакторов — системный прокси не слушают.
+            Впишите в их настройках один из этих адресов, и они пойдут через
+            нас со всеми правилами.
+          </span>
+          <div className="list" style={{ marginTop: 6 }}>
+            <div className="item">
+              <span className="grow">SOCKS5 — <code>127.0.0.1:{st?.socks_port ?? 18081}</code></span>
+              <button className="btn small"
+                onClick={() => navigator.clipboard.writeText(`127.0.0.1:${st?.socks_port ?? 18081}`)}>
+                Копировать
+              </button>
+            </div>
+            <div className="item">
+              <span className="grow">HTTP — <code>127.0.0.1:{st?.http_port ?? 18080}</code></span>
+              <button className="btn small"
+                onClick={() => navigator.clipboard.writeText(`127.0.0.1:${st?.http_port ?? 18080}`)}>
+                Копировать
+              </button>
+            </div>
+          </div>
+          <span>
+            Логин и пароль не нужны. Если в приложении есть выбор — берите SOCKS5,
+            он подходит для любого трафика, а не только для веб-запросов.
+          </span>
+        </div>
       </div>
 
       <div className="card">
@@ -810,8 +957,6 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
 
 /* ─────────────── Несколько прокси ─────────────── */
-
-type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number };
 
 function Upstreams({ defaultName, onSaved }: { defaultName: string; onSaved: () => void }) {
   const [ups, setUps] = useState<Upstream[]>([]);
