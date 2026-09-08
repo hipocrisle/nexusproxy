@@ -60,35 +60,56 @@ mirror-dist:
       VER=$(curl -sSf $CA "$RELEASE_API" | jq -r .tag_name)
       echo "Последний выпуск на GitHub: $VER"
 
-      # уже выкладывали эту версию — второй раз не нужно
+      # Что уже выложено у нас. Сверяем ПО СОСТАВУ, а не по факту наличия
+      # выпуска: иначе добавленный позже файл никогда не доедет — задание
+      # увидит выпуск и молча пропустит.
       HAVE=$(curl -sS $CA --header "PRIVATE-TOKEN: $GL_TOKEN" \
-             "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER" | jq -r '.tag_name // empty')
-      if [ "$HAVE" = "$VER" ]; then
-        echo "Версия $VER уже выложена, пропускаю."
-        exit 0
-      fi
+             "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER" \
+             | jq -r '(.assets.links // [])[].name' 2>/dev/null || true)
+      echo "Уже выложено: ${HAVE:-ничего}"
 
-      # берём установщик и портативный файл
+      # Установщики для обеих систем. Файлы .sig и .app.tar.gz нужны только
+      # автообновлению с GitHub, людям их скачивать незачем.
       curl -sSf $CA "$RELEASE_API" \
-        | jq -r '.assets[] | select(.name|test("\\.exe$")) | .browser_download_url' > urls.txt
-      test -s urls.txt || { echo "В выпуске нет файлов .exe"; exit 1; }
+        | jq -r '.assets[] | select(.name|test("\\.(exe|dmg)$")) | .browser_download_url' > urls.txt
+      test -s urls.txt || { echo "В выпуске нет установщиков"; exit 1; }
 
+      NEW=0
       LINKS=""
       while read -r URL; do
         NAME=$(basename "$URL")
+        DEST="$CI_API_V4_URL/projects/$GL_PROJECT/packages/generic/nexusproxy/${VER#v}/$NAME"
+        LINKS="$LINKS{\"name\":\"$NAME\",\"url\":\"$DEST\"},"
+        if echo "$HAVE" | grep -qx "$NAME"; then
+          echo "$NAME уже есть, пропускаю"
+          continue
+        fi
+        NEW=1
         echo "Скачиваю $NAME..."
         curl -sSfL $CA -o "$NAME" "$URL"
-        DEST="$CI_API_V4_URL/projects/$GL_PROJECT/packages/generic/nexusproxy/${VER#v}/$NAME"
         echo "Выкладываю $NAME..."
         curl -sSf $CA --header "PRIVATE-TOKEN: $GL_TOKEN" --upload-file "$NAME" "$DEST"
-        LINKS="$LINKS{\"name\":\"$NAME\",\"url\":\"$DEST\"},"
+        # если выпуск уже есть — просто дописываем ссылку
+        if [ -n "$HAVE" ]; then
+          curl -sSf $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
+            --data "name=$NAME" --data-urlencode "url=$DEST" \
+            "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER/assets/links" >/dev/null
+          echo "Ссылка на $NAME добавлена в существующий выпуск"
+        fi
       done < urls.txt
 
-      # оформляем выпуск, чтобы коллеги скачивали со страницы
-      curl -sSf $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data "{\"name\":\"NexusProxy $VER\",\"tag_name\":\"$VER\",
-                 \"description\":\"Собрано из GitHub. Ставить файл с -setup в имени, права администратора не нужны.\",
-                 \"assets\":{\"links\":[${LINKS%,}]}}" \
-        "$CI_API_V4_URL/projects/$GL_PROJECT/releases"
-      echo "Выпуск $VER выложен."
+      if [ "$NEW" = "0" ]; then
+        echo "Всё уже выложено, делать нечего."
+        exit 0
+      fi
+
+      # выпуска ещё не было — создаём вместе со всеми ссылками
+      if [ -z "$HAVE" ]; then
+        curl -sSf $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data "{\"name\":\"NexusProxy $VER\",\"tag_name\":\"$VER\",
+                   \"description\":\"Собрано из GitHub. Windows — файл с -setup, права администратора не нужны. macOS — файл .dmg, первый запуск через правый клик и «Открыть».\",
+                   \"assets\":{\"links\":[${LINKS%,}]}}" \
+          "$CI_API_V4_URL/projects/$GL_PROJECT/releases" >/dev/null
+      fi
+      echo "Выпуск $VER готов."
