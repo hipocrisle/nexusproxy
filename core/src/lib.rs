@@ -26,6 +26,9 @@ pub struct Engine {
     pub rules: Arc<RwLock<rules::Rules>>,
     /// Доступные прокси: имя → описание. Меняется вместе с настройками.
     pub pool: Arc<RwLock<upstream::Pool>>,
+    /// Пинок сторожу: проверить прокси немедленно, не дожидаясь очередного круга.
+    /// Без этого добавленный прокси до пятнадцати секунд оставался серым.
+    recheck: Arc<tokio::sync::Notify>,
     pub path: String,
     saved: Mutex<Option<winproxy::Saved>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -58,6 +61,7 @@ impl Engine {
         cfg.check_links()?;
         let rules = Arc::new(RwLock::new(cfg.rules()?));
         let pool = Arc::new(RwLock::new(build_pool(&cfg)));
+        let recheck = Arc::new(tokio::sync::Notify::new());
         let up = Arc::new(cfg.upstream.clone());
         let (hp, sp) = (cfg.listen.http, cfg.listen.socks);
 
@@ -70,6 +74,7 @@ impl Engine {
             cfg: Arc::new(Mutex::new(cfg)),
             rules: rules.clone(),
             pool: pool.clone(),
+            recheck: recheck.clone(),
             path: path.to_string(),
             saved: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
@@ -112,10 +117,20 @@ impl Engine {
         // Сторож проверяет КАЖДЫЙ прокси из настроек, а не только основной:
         // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
         let watch_pool = pool.clone();
+        let watch_recheck = recheck.clone();
         let main_name = up.title();
         let t3 = tokio::spawn(async move {
+            // первая проверка сразу: иначе список прокси до четверти минуты
+            // стоит серым и выглядит сломанным
+            let mut first = true;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if !first {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                        _ = watch_recheck.notified() => {}
+                    }
+                }
+                first = false;
                 let list: Vec<upstream::Upstream> = {
                     let p = watch_pool.read().unwrap();
                     // пустое имя дублирует основной — его пропускаем
@@ -134,7 +149,15 @@ impl Engine {
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
                     let ms = started.elapsed().as_millis() as u64;
+                    let first_time = !health::proxies().iter().any(|p| p.name == u.title());
                     health::set_proxy(&u.title(), ok, ms);
+                    if first_time {
+                        logfile::line(&logfile::now_stamp(),
+                                      &format!("прокси «{}» взят под наблюдение: {}",
+                                               u.title(),
+                                               if ok { format!("отвечает, {ms} мс") }
+                                               else { "не отвечает".into() }));
+                    }
                     if u.title() == main_name {
                         main_ok = ok;
                     }
@@ -167,7 +190,27 @@ impl Engine {
         let c = self.cfg.lock().unwrap();
         c.check_links()?;
         *self.rules.write().unwrap() = c.rules()?;
-        *self.pool.write().unwrap() = build_pool(&c);
+        let pool = build_pool(&c);
+        // пишем состав в журнал: если прокси не появился, здесь будет видно,
+        // дошёл он до движка или потерялся раньше
+        let names: Vec<String> = pool.iter()
+            .filter(|(k, _)| !k.is_empty())
+            .map(|(k, v)| format!("{k} → {}:{}", v.address, v.port))
+            .collect();
+        logfile::line(&logfile::now_stamp(),
+                      &format!("список прокси обновлён: основной {}:{}{}",
+                               c.upstream.address, c.upstream.port,
+                               if names.is_empty() { String::new() }
+                               else { format!(", ещё {}", names.join(", ")) }));
+        *self.pool.write().unwrap() = pool;
+        // сторож должен сразу проверить изменившийся список прокси
+        self.recheck.notify_waiters();
+        // рвём то, что теперь должно идти иначе, иначе правка не подействует
+        let dropped = conns::drop_changed(&self.rules);
+        if dropped > 0 {
+            logfile::line(&logfile::now_stamp(),
+                          &format!("правила изменены, разорвано соединений: {dropped}"));
+        }
         c.save(&self.path)
     }
 

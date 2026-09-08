@@ -56,9 +56,9 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
                 if !rest.is_empty() {
                     server.write_all(rest).await?;
                 }
-                let (id, counters) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+                let (id, counters, kill) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
                 counters.sent.fetch_add(pre, std::sync::atomic::Ordering::Relaxed);
-                let (up_b, down_b) = crate::pump::both_ways(c, server, counters).await;
+                let (up_b, down_b) = crate::pump::both_ways_until(c, server, counters, kill).await;
                 crate::conns::close(id, up_b, down_b);
                 crate::logfile::line(
                     &crate::logfile::now_stamp(),
@@ -107,9 +107,9 @@ pub async fn handle(mut c: TcpStream, pool: Arc<std::sync::RwLock<Pool>>,
     if !rest.is_empty() {
         server.write_all(rest).await?;
     }
-    let (id, counters) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
+    let (id, counters, kill) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);
     counters.sent.fetch_add(pre, std::sync::atomic::Ordering::Relaxed);
-    let (up_b, down_b) = crate::pump::both_ways(c, server, counters).await;
+    let (up_b, down_b) = crate::pump::both_ways_until(c, server, counters, kill).await;
     crate::conns::close(id, up_b, down_b);
     Ok(())
 }

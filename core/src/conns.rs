@@ -19,8 +19,11 @@ pub struct Conn {
     pub route: String,
     /// через какой прокси, если через прокси
     pub via: String,
-    /// имя приложения, если удалось определить
+    /// имя исполняемого файла, если удалось определить
     pub app: String,
+    /// полный путь — различает одноимённые программы
+    pub app_path: String,
+    pub pid: u32,
     pub seconds: u64,
     pub sent: u64,
     pub received: u64,
@@ -40,11 +43,13 @@ struct Live {
     port: u16,
     route: String,
     via: String,
-    app: String,
+    app: crate::proc::AppInfo,
     started: Instant,
     /// Счётчики обновляются по ходу перекачки, поэтому в таблице
     /// видно объём ещё до закрытия соединения.
     counters: std::sync::Arc<crate::pump::Counters>,
+    /// Чем оборвать соединение, если правило для него поменялось.
+    kill: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -62,19 +67,45 @@ pub fn enable() {
 
 /// Соединение открылось. Возвращает номер и счётчики, которые
 /// заполняются по ходу передачи.
-pub fn open(host: &str, port: u16, route: &str, via: &str, app: &str)
-    -> (u64, std::sync::Arc<crate::pump::Counters>)
+pub fn open(host: &str, port: u16, route: &str, via: &str, app: &crate::proc::AppInfo)
+    -> (u64, std::sync::Arc<crate::pump::Counters>, std::sync::Arc<tokio::sync::Notify>)
 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let counters = std::sync::Arc::new(crate::pump::Counters::default());
+    let kill = std::sync::Arc::new(tokio::sync::Notify::new());
     if let Some(s) = S.lock().unwrap().as_mut() {
         s.live.insert(id, Live {
             host: host.to_string(), port, route: route.to_string(),
-            via: via.to_string(), app: app.to_string(),
-            started: Instant::now(), counters: counters.clone(),
+            via: via.to_string(), app: app.clone(),
+            started: Instant::now(), counters: counters.clone(), kill: kill.clone(),
         });
     }
-    (id, counters)
+    (id, counters, kill)
+}
+
+/// Оборвать соединения, для которых правила теперь дают другой путь.
+/// Возвращает, сколько разорвано.
+///
+/// Без этого правка правил не действует на уже открытые соединения:
+/// браузеры держат их подолгу, и человек видит «настройка не работает».
+pub fn drop_changed(rules: &std::sync::RwLock<crate::rules::Rules>) -> usize {
+    let g = S.lock().unwrap();
+    let Some(s) = g.as_ref() else { return 0 };
+    let r = rules.read().unwrap();
+    let mut n = 0;
+    for c in s.live.values() {
+        let now = r.decide(&c.host);
+        let same_route = now.tag() == c.route;
+        let same_via = match &now {
+            crate::rules::Route::Proxy(name) => name.is_empty() || *name == c.via,
+            _ => true,
+        };
+        if !(same_route && same_via) {
+            c.kill.notify_waiters();
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Соединение закрылось: переносим объём в итоги по домену.
@@ -98,7 +129,8 @@ pub fn active() -> Vec<Conn> {
         let (sent, received) = c.counters.get();
         Conn {
             id: *id, host: c.host.clone(), port: c.port, route: c.route.clone(),
-            via: c.via.clone(), app: c.app.clone(),
+            via: c.via.clone(), app: c.app.name.clone(),
+            app_path: c.app.path.clone(), pid: c.app.pid,
             seconds: c.started.elapsed().as_secs(), sent, received,
         }
     }).collect();
@@ -134,7 +166,10 @@ mod tests {
     #[test]
     fn open_shows_up_and_close_moves_to_totals() {
         let _g = fresh();
-        let (id, counters) = open("api.openai.com", 443, "proxy", "офис", "codex.exe");
+        let app = crate::proc::AppInfo {
+            name: "codex.exe".into(), path: r"C:\tools\codex.exe".into(), pid: 4242,
+        };
+        let (id, counters, _) = open("api.openai.com", 443, "proxy", "офис", &app);
         counters.sent.fetch_add(700, std::sync::atomic::Ordering::Relaxed);
         let live = active();
         assert_eq!(live[0].sent, 700, "объём должен быть виден до закрытия");
@@ -142,6 +177,8 @@ mod tests {
         assert_eq!(live[0].host, "api.openai.com");
         assert_eq!(live[0].via, "офис");
         assert_eq!(live[0].app, "codex.exe");
+        assert_eq!(live[0].pid, 4242, "номер процесса различает одноимённые программы");
+        assert!(live[0].app_path.ends_with("codex.exe"));
 
         close(id, 1024, 4096);
         assert!(active().is_empty(), "закрытое соединение не должно висеть");
@@ -157,7 +194,7 @@ mod tests {
         // у ютуба каждое соединение с новым именем — в итогах должна быть одна строка
         let _g = fresh();
         for i in 0..3 {
-            let (id, _) = open(&format!("rr{i}---sn-x.googlevideo.com"), 443, "proxy", "", "");
+            let (id, _, _) = open(&format!("rr{i}---sn-x.googlevideo.com"), 443, "proxy", "", &Default::default());
             close(id, 100, 1_000_000);
         }
         let t = totals();
@@ -168,10 +205,24 @@ mod tests {
     }
 
     #[test]
+    fn drops_only_connections_whose_route_changed() {
+        use crate::rules::{Route, Rules};
+        let _g = fresh();
+        let (_, _, _) = open("stays.example", 443, "direct", "", &Default::default());
+        let (_, _, _) = open("moves.example", 443, "direct", "", &Default::default());
+
+        let mut r = Rules::new(Route::Direct);
+        r.add("domain:moves.example", Route::proxy()).unwrap();
+        let lock = std::sync::RwLock::new(r);
+
+        assert_eq!(drop_changed(&lock), 1, "рвётся только то, у чего путь изменился");
+    }
+
+    #[test]
     fn totals_sorted_by_volume() {
         let _g = fresh();
-        let (a, _) = open("small.example", 443, "direct", "", ""); close(a, 1, 1);
-        let (b, _) = open("big.example", 443, "direct", "", ""); close(b, 1, 999_999);
+        let (a, _, _) = open("small.example", 443, "direct", "", &Default::default()); close(a, 1, 1);
+        let (b, _, _) = open("big.example", 443, "direct", "", &Default::default()); close(b, 1, 999_999);
         assert_eq!(totals()[0].domain, "big.example");
     }
 }

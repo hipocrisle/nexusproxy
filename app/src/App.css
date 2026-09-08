@@ -205,3 +205,5 @@ select.field { appearance: auto; }
 .state.up { background: var(--ok); }
 .state.down { background: var(--danger); }
 .state.unknown { background: var(--line); }
+
+.pid { opacity: .55; font-size: .9em; }

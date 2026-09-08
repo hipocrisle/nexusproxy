@@ -1,6 +1,17 @@
 //! Какое приложение открыло соединение.
+//!
+//! Возвращаем не только имя файла, но и полный путь с номером процесса:
+//! одного имени мало, когда одноимённых программ несколько.
 //! Сопоставляем локальный порт клиента с процессом — та самая колонка,
 //! ради которой держат Proxifier.
+
+/// Что удалось узнать о программе, открывшей соединение.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct AppInfo {
+    pub name: String,
+    pub path: String,
+    pub pid: u32,
+}
 
 #[cfg(windows)]
 mod imp {
@@ -79,11 +90,13 @@ mod imp {
         }
     }
 
-    fn port_to_pid() -> HashMap<u16, u32> {
+    fn port_to_pid(force: bool) -> HashMap<u16, u32> {
         let mut g = CACHE.lock().unwrap();
-        if let Some((t, m)) = g.as_ref() {
-            if t.elapsed() < Duration::from_secs(1) {
-                return m.clone();
+        if !force {
+            if let Some((t, m)) = g.as_ref() {
+                if t.elapsed() < Duration::from_secs(1) {
+                    return m.clone();
+                }
             }
         }
         let mut map = HashMap::new();
@@ -96,13 +109,15 @@ mod imp {
         map
     }
 
-    /// Имя исполняемого файла процесса.
+    /// Полный путь к исполняемому файлу процесса.
+    /// Путь нужен, чтобы различать одноимённые программы: у пользователя
+    /// четыре разных браузера с одним и тем же именем файла.
     ///
     /// ⛔ Раньше здесь был GetModuleBaseNameW — он требует прав
     /// PROCESS_VM_READ, которых мы не просим, и потому всегда возвращал
     /// пусто: колонка приложений была вечно в прочерках.
     /// QueryFullProcessImageNameW обходится теми правами, что есть.
-    fn pid_name(pid: u32) -> Option<String> {
+    fn pid_path(pid: u32) -> Option<String> {
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {
@@ -115,24 +130,33 @@ mod imp {
             if ok == 0 || len == 0 {
                 return None;
             }
-            let full = String::from_utf16_lossy(&buf[..len as usize]);
-            // показываем только имя файла, путь в таблице не нужен
-            Some(full.rsplit(['\\', '/']).next().unwrap_or(&full).to_string())
+            Some(String::from_utf16_lossy(&buf[..len as usize]))
         }
     }
 
-    pub fn app_by_port(port: u16) -> String {
-        port_to_pid()
-            .get(&port)
-            .and_then(|pid| pid_name(*pid))
-            .unwrap_or_default()
+    pub fn app_by_port(port: u16) -> super::AppInfo {
+        // Соединение могло появиться уже после снимка таблицы — тогда
+        // с первого раза процесс не находится. Раньше в колонке из-за
+        // этого стояли прочерки: пробуем ещё раз со свежей таблицей.
+        let mut pid = port_to_pid(false).get(&port).copied();
+        if pid.is_none() {
+            pid = port_to_pid(true).get(&port).copied();
+        }
+        match pid {
+            Some(pid) => {
+                let full = pid_path(pid).unwrap_or_default();
+                let name = full.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+                super::AppInfo { name, path: full, pid }
+            }
+            None => super::AppInfo::default(),
+        }
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
-    pub fn app_by_port(_port: u16) -> String {
-        String::new()
+    pub fn app_by_port(_port: u16) -> super::AppInfo {
+        super::AppInfo::default()
     }
 }
 

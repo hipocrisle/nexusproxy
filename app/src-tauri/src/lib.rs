@@ -130,10 +130,33 @@ fn rule_set_via(app: State<App>, pattern: String, via: String) -> Result<(), Str
     e.apply_and_save()
 }
 
+/// Добавить правила. `via` — через какой прокси их пускать;
+/// пусто или не указано — через основной.
 #[tauri::command]
-fn rule_add(app: State<App>, text: String) -> Result<core::config::BulkResult, String> {
+fn rule_add(
+    app: State<App>,
+    text: String,
+    via: Option<String>,
+) -> Result<core::config::BulkResult, String> {
     let e = engine(&app)?;
-    let r = { e.cfg.lock().unwrap().add_many(&text) };
+    let via = via.unwrap_or_default();
+    let r = {
+        let mut c = e.cfg.lock().unwrap();
+        let r = c.add_many(&text);
+        if !via.is_empty() {
+            // добавленное сразу переносим в группу выбранного прокси
+            for pat in &r.added {
+                c.through_proxy.retain(|p| p != pat);
+            }
+            match c.groups.iter_mut().find(|g| g.via == via) {
+                Some(g) => g.patterns.extend(r.added.iter().cloned()),
+                None => c.groups.push(core::config::RouteGroup {
+                    via: via.clone(), enabled: true, patterns: r.added.clone(),
+                }),
+            }
+        }
+        r
+    };
     e.apply_and_save()?;
     Ok(r)
 }

@@ -25,42 +25,52 @@ impl Counters {
 /// Гонит данные в обе стороны, обновляя счётчики на каждом куске.
 /// «Отдано» — от клиента наружу, «получено» — обратно.
 pub async fn both_ways(client: TcpStream, server: TcpStream, c: Arc<Counters>) -> (u64, u64) {
+    both_ways_until(client, server, c, Arc::new(tokio::sync::Notify::new())).await
+}
+
+/// То же, но соединение можно оборвать снаружи.
+/// Нужно, когда правило поменялось: уже открытое соединение продолжало бы
+/// идти через прежний прокси, и правка выглядела бы как «не работает».
+pub async fn both_ways_until(
+    client: TcpStream,
+    server: TcpStream,
+    c: Arc<Counters>,
+    kill: Arc<tokio::sync::Notify>,
+) -> (u64, u64) {
     let (mut cr, mut cw) = client.into_split();
     let (mut sr, mut sw) = server.into_split();
 
     let up = {
-        let c = c.clone();
+        let (c, kill) = (c.clone(), kill.clone());
         tokio::spawn(async move {
             let mut buf = vec![0u8; 32 * 1024];
             loop {
-                match cr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if sw.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        c.sent.fetch_add(n as u64, Ordering::Relaxed);
-                    }
+                let n = tokio::select! {
+                    r = cr.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n },
+                    _ = kill.notified() => break,
+                };
+                if sw.write_all(&buf[..n]).await.is_err() {
+                    break;
                 }
+                c.sent.fetch_add(n as u64, Ordering::Relaxed);
             }
             let _ = sw.shutdown().await;
         })
     };
 
     let down = {
-        let c = c.clone();
+        let (c, kill) = (c.clone(), kill.clone());
         tokio::spawn(async move {
             let mut buf = vec![0u8; 32 * 1024];
             loop {
-                match sr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if cw.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        c.received.fetch_add(n as u64, Ordering::Relaxed);
-                    }
+                let n = tokio::select! {
+                    r = sr.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n },
+                    _ = kill.notified() => break,
+                };
+                if cw.write_all(&buf[..n]).await.is_err() {
+                    break;
                 }
+                c.received.fetch_add(n as u64, Ordering::Relaxed);
             }
             let _ = cw.shutdown().await;
         })

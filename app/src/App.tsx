@@ -21,14 +21,14 @@ type Candidate = {
 type Preset = { name: string; note: string; domains: string[] };
 type Conn = {
   id: number; host: string; port: number; route: string; via: string;
-  app: string; seconds: number; sent: number; received: number;
+  app: string; app_path: string; pid: number;
+  seconds: number; sent: number; received: number;
 };
 type DomainStat = { domain: string; route: string; conns: number; sent: number; received: number };
 type Upstream = {
   name: string; kind: "socks5" | "http"; address: string; port: number;
   user: string | null; password: string | null;
 };
-type Group = { via: string; enabled: boolean; patterns: string[] };
 
 export function human(b: number): string {
   const u = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
@@ -170,6 +170,7 @@ function Rules({ onChange }: { onChange: () => void }) {
   const [filter, setFilter] = useSticky("rules.filter", "");
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  const [addVia, setAddVia] = useSticky("rules.addVia", "");
 
   const load = useCallback(async () => {
     try {
@@ -183,7 +184,7 @@ function Rules({ onChange }: { onChange: () => void }) {
 
   const addText = async (t: string) => {
     if (!t.trim()) return;
-    try { setResult(await invoke<Bulk>("rule_add", { text: t })); load(); onChange(); }
+    try { setResult(await invoke<Bulk>("rule_add", { text: t, via: addVia })); load(); onChange(); }
     catch (e) { alert(String(e)); }
   };
 
@@ -221,7 +222,7 @@ function Rules({ onChange }: { onChange: () => void }) {
     if (hasAll(p)) {
       for (const d of p.domains) await invoke("rule_remove", { pattern: "domain:" + d });
     } else {
-      await invoke<Bulk>("rule_add", { text: p.domains.join("\n") });
+      await invoke<Bulk>("rule_add", { text: p.domains.join("\n"), via: addVia });
     }
     load(); onChange();
   };
@@ -259,6 +260,18 @@ function Rules({ onChange }: { onChange: () => void }) {
             Добавить
           </button>
           <button className="btn" onClick={fromFile}>Загрузить из файла</button>
+          {ups.length > 1 && (
+            <>
+              <span className="grow" />
+              <label className="check">через прокси</label>
+              <select className="field small-sel" value={addVia}
+                onChange={(e) => setAddVia(e.target.value)}>
+                {ups.map((u, i) => (
+                  <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                ))}
+              </select>
+            </>
+          )}
         </div>
         {result && (
           <p className="hint" style={{ marginTop: 8, marginBottom: 0 }}>
@@ -440,6 +453,7 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
 /* ─────────────── Соединения и трафик ─────────────── */
 
 type SortKey = "host" | "app" | "seconds" | "sent" | "received";
+type TotalKey = "domain" | "conns" | "sent" | "received";
 
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
@@ -451,6 +465,11 @@ function Connections() {
 
   const flip = (k: SortKey) => { if (sort === k) setAsc(!asc); else { setSort(k); setAsc(false); } };
   const arrow = (k: SortKey) => (sort === k ? (asc ? " ↑" : " ↓") : "");
+
+  const [tSort, setTSort] = useSticky<TotalKey>("tot.sort", "received");
+  const [tAsc, setTAsc] = useSticky("tot.asc", false);
+  const tFlip = (k: TotalKey) => { if (tSort === k) setTAsc(!tAsc); else { setTSort(k); setTAsc(false); } };
+  const tArrow = (k: TotalKey) => (tSort === k ? (tAsc ? " ↑" : " ↓") : "");
 
   useEffect(() => {
     const tick = async () => {
@@ -470,7 +489,7 @@ function Connections() {
     !filter || (host + " " + app).toLowerCase().includes(filter.toLowerCase());
 
   const shownLive = live
-    .filter((c) => (!onlyProxy || c.route === "proxy") && match(c.host, c.app))
+    .filter((c) => (!onlyProxy || c.route === "proxy") && match(c.host, c.app + " " + c.app_path))
     .sort((a, b) => {
       const d = sort === "host" ? a.host.localeCompare(b.host)
         : sort === "app" ? (a.app || "").localeCompare(b.app || "")
@@ -479,7 +498,12 @@ function Connections() {
     });
 
   const shownTotals = totals
-    .filter((t) => (!onlyProxy || t.route === "proxy") && match(t.domain, ""));
+    .filter((t) => (!onlyProxy || t.route === "proxy") && match(t.domain, ""))
+    .sort((a, b) => {
+      const d = tSort === "domain" ? a.domain.localeCompare(b.domain)
+        : (a[tSort] as number) - (b[tSort] as number);
+      return tAsc ? d : -d;
+    });
 
   return (
     <div className="panel">
@@ -493,7 +517,7 @@ function Connections() {
           <button className="btn small" onClick={() => invoke("conns_reset")}>Сбросить счётчики</button>
         </div>
         <div className="row" style={{ marginTop: 8 }}>
-          <input className="field" placeholder="поиск по адресу или приложению"
+          <input className="field" placeholder="поиск по адресу, программе или её пути"
             value={filter} onChange={(e) => setFilter(e.target.value)} />
           <label className="check">
             <input type="checkbox" checked={onlyProxy} onChange={(e) => setOnlyProxy(e.target.checked)} />
@@ -513,7 +537,10 @@ function Connections() {
           {shownLive.map((c) => (
             <div className="item" key={c.id}>
               <span className="grow">{c.host}:{c.port}</span>
-              <span className="col-app sub">{c.app || "—"}</span>
+              <span className="col-app sub"
+                title={c.app_path ? `${c.app_path}\nпроцесс ${c.pid}` : "программу определить не удалось"}>
+                {c.app || "—"}{c.pid ? <span className="pid"> {c.pid}</span> : null}
+              </span>
               <span className="col-t sub">{duration(c.seconds)}</span>
               <span className={"col-v tag " + c.route}>{c.via || routeLabel[c.route]}</span>
               <span className="col-b sub">{human(c.sent)}</span>
@@ -528,11 +555,11 @@ function Connections() {
         <p className="hint">Учёт по домену второго уровня, за всё время работы программы.</p>
         <div className="list">
           <div className="item head">
-            <span className="grow">Домен</span>
+            <span className="grow sortable" onClick={() => tFlip("domain")}>Домен{tArrow("domain")}</span>
             <span className="col-v">Каким путём</span>
-            <span className="col-n">Соединений</span>
-            <span className="col-b">Отдано</span>
-            <span className="col-b">Получено</span>
+            <span className="col-n sortable" onClick={() => tFlip("conns")}>Соединений{tArrow("conns")}</span>
+            <span className="col-b sortable" onClick={() => tFlip("sent")}>Отдано{tArrow("sent")}</span>
+            <span className="col-b sortable" onClick={() => tFlip("received")}>Получено{tArrow("received")}</span>
           </div>
           {shownTotals.length === 0 && <div className="empty">Пока пусто.</div>}
           {shownTotals.map((t) => (
@@ -736,7 +763,6 @@ type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: nu
 function Upstreams() {
   const [ups, setUps] = useState<Upstream[]>([]);
   const [health, setHealth] = useState<ProxyHealth[]>([]);
-  const [groups, setGroups] = useState<Group[]>([]);
   const [adding, setAdding] = useState(false);
   /// имя, под которым прокси был до правки; null — добавляем новый
   const [editingName, setEditingName] = useState<string | null>(null);
@@ -746,8 +772,8 @@ function Upstreams() {
 
   const load = useCallback(async () => {
     try {
-      const r = await invoke<{ upstreams: Upstream[]; groups: Group[] }>("upstreams_list");
-      setUps(r.upstreams); setGroups(r.groups);
+      const r = await invoke<{ upstreams: Upstream[] }>("upstreams_list");
+      setUps(r.upstreams);
     } catch { /* движок ещё не поднялся */ }
   }, []);
   useEffect(() => { load(); }, [load]);
@@ -783,11 +809,6 @@ function Upstreams() {
     catch (e) { setErr(String(e)); }
   };
 
-  const toggleGroup = async (g: Group) => {
-    await invoke("group_save", { group: { ...g, enabled: !g.enabled } });
-    load();
-  };
-
   return (
     <div className="card">
       <h3>Дополнительные прокси</h3>
@@ -813,28 +834,6 @@ function Upstreams() {
           );
         })}
       </div>
-
-      {groups.length > 0 && (
-        <>
-          <h3 style={{ marginTop: 12 }}>Группы правил</h3>
-          <div className="list">
-            {groups.map((g) => (
-              <div className="item" key={g.via}>
-                <label className="check grow">
-                  <input type="checkbox" checked={g.enabled} onChange={() => toggleGroup(g)} />
-                  через «{g.via}» — {g.patterns.length} правил
-                </label>
-                <button className="btn small" onClick={async () => {
-                  await invoke("group_remove", { via: g.via }); load();
-                }}>Убрать</button>
-              </div>
-            ))}
-          </div>
-          <p className="hint" style={{ marginTop: 6, marginBottom: 0 }}>
-Снятая галка отключает правила группы, не удаляя их.
-          </p>
-        </>
-      )}
 
       {adding ? (
         <div style={{ marginTop: 10 }}>
