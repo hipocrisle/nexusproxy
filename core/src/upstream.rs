@@ -69,7 +69,6 @@ pub async fn dial(pool: &std::sync::RwLock<Pool>, rules: &std::sync::RwLock<Rule
         println!("  {mark}  {host}:{port}");
     }
     crate::report::note(host, &route);
-    crate::journal::push(host, port, &route);
 
     let up = match &route {
         Route::Proxy(name) => {
@@ -84,7 +83,8 @@ pub async fn dial(pool: &std::sync::RwLock<Pool>, rules: &std::sync::RwLock<Rule
         _ => None,
     };
     let via = up.as_ref().map(|u| u.title()).unwrap_or_default();
-    let d = Decision { route: route.clone(), via };
+    crate::journal::push(host, port, &route, &via);
+    let d = Decision { route: route.clone(), via: via.clone() };
 
     let stream = match route {
         Route::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, "запрещено правилом")),
@@ -114,8 +114,12 @@ pub async fn dial(pool: &std::sync::RwLock<Pool>, rules: &std::sync::RwLock<Rule
                 }
             }
         }
-    }?;
-    Ok((stream, d))
+    };
+    match &stream {
+        Ok(_) => crate::failures::forget(host),
+        Err(e) => crate::failures::note(host, &route, &d.via, &e.to_string()),
+    }
+    Ok((stream?, d))
 }
 
 /// Открыть соединение через указанный прокси — каким бы протоколом он ни говорил.

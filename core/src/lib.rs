@@ -5,6 +5,7 @@ pub mod config;
 pub mod conns;
 pub mod domain;
 pub mod http_in;
+pub mod failures;
 pub mod health;
 pub mod journal;
 pub mod logfile;
@@ -40,29 +41,31 @@ pub const NO_PROXY: &str = "localhost,127.0.0.1,::1";
 /// каждый под своим.
 fn build_pool(cfg: &config::Config) -> upstream::Pool {
     let mut m = upstream::Pool::new();
-    m.insert(String::new(), cfg.upstream.clone());
-    if !cfg.upstream.name.is_empty() {
-        m.insert(cfg.upstream.name.clone(), cfg.upstream.clone());
-    }
     for u in &cfg.upstreams {
         m.insert(u.name.clone(), u.clone());
+    }
+    // пустое имя — «через тот, что по умолчанию»
+    if let Some(d) = cfg.default_proxy() {
+        m.insert(String::new(), d.clone());
     }
     m
 }
 
 impl Engine {
     /// Поднимает оба входа. Системный прокси НЕ трогает — это отдельным шагом.
-    pub async fn start(cfg: config::Config, path: &str) -> Result<Arc<Self>, String> {
+    pub async fn start(mut cfg: config::Config, path: &str) -> Result<Arc<Self>, String> {
         journal::enable();
         report::enable();
         health::enable();
         conns::enable();
+        failures::enable();
         upstream::AUTO_RECONNECT.store(cfg.auto_reconnect, std::sync::atomic::Ordering::Relaxed);
+        cfg.migrate();
         cfg.check_links()?;
         let rules = Arc::new(RwLock::new(cfg.rules()?));
         let pool = Arc::new(RwLock::new(build_pool(&cfg)));
         let recheck = Arc::new(tokio::sync::Notify::new());
-        let up = Arc::new(cfg.upstream.clone());
+        let default_name = cfg.default_proxy().map(|u| u.name.clone()).unwrap_or_default();
         let (hp, sp) = (cfg.listen.http, cfg.listen.socks);
 
         let http = TcpListener::bind(("127.0.0.1", hp)).await
@@ -118,7 +121,7 @@ impl Engine {
         // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
         let watch_pool = pool.clone();
         let watch_recheck = recheck.clone();
-        let main_name = up.title();
+        let main_name = default_name.clone();
         let t3 = tokio::spawn(async move {
             // первая проверка сразу: иначе список прокси до четверти минуты
             // стоит серым и выглядит сломанным
@@ -133,10 +136,8 @@ impl Engine {
                 first = false;
                 let list: Vec<upstream::Upstream> = {
                     let p = watch_pool.read().unwrap();
-                    // пустое имя дублирует основной — его пропускаем
-                    p.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone())
-                        .chain(p.get("").cloned())
-                        .collect()
+                    // пустое имя — дубль основного, его пропускаем
+                    p.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
                 };
                 let mut main_ok = true;
                 for u in list {
@@ -198,10 +199,8 @@ impl Engine {
             .map(|(k, v)| format!("{k} → {}:{}", v.address, v.port))
             .collect();
         logfile::line(&logfile::now_stamp(),
-                      &format!("список прокси обновлён: основной {}:{}{}",
-                               c.upstream.address, c.upstream.port,
-                               if names.is_empty() { String::new() }
-                               else { format!(", ещё {}", names.join(", ")) }));
+                      &format!("список прокси обновлён: по умолчанию «{}», всего {} — {}",
+                               c.default_upstream, c.upstreams.len(), names.join(", ")));
         *self.pool.write().unwrap() = pool;
         // сторож должен сразу проверить изменившийся список прокси
         self.recheck.notify_waiters();

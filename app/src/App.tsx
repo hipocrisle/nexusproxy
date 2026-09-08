@@ -10,6 +10,7 @@ type Status = {
   running: boolean; upstream: string; http_port: number; socks_port: number;
   system_on: boolean; discovering: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
+  enable_on_start: boolean; default_upstream: string;
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
@@ -452,12 +453,18 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
 
 /* ─────────────── Соединения и трафик ─────────────── */
 
+type Failure = {
+  domain: string; count: number; route: string; via: string;
+  error: string; secs_ago: number;
+};
+
 type SortKey = "host" | "app" | "seconds" | "sent" | "received";
 type TotalKey = "domain" | "conns" | "sent" | "received";
 
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
   const [totals, setTotals] = useState<DomainStat[]>([]);
+  const [fails, setFails] = useState<Failure[]>([]);
   const [filter, setFilter] = useSticky("conn.filter", "");
   const [onlyProxy, setOnlyProxy] = useSticky("conn.onlyProxy", false);
   const [sort, setSort] = useSticky<SortKey>("conn.sort", "received");
@@ -475,6 +482,7 @@ function Connections() {
     const tick = async () => {
       setLive(await invoke<Conn[]>("conns_active").catch(() => []));
       setTotals(await invoke<DomainStat[]>("conns_totals").catch(() => []));
+      setFails(await invoke<Failure[]>("failures_recent").catch(() => []));
     };
     tick();
     const t = setInterval(tick, 1000);
@@ -507,6 +515,43 @@ function Connections() {
 
   return (
     <div className="panel">
+      {fails.length > 0 && (
+        <div className="card">
+          <div className="row" style={{ marginBottom: 6 }}>
+            <h3 style={{ margin: 0 }}>Не удалось подключиться — {fails.length}</h3>
+            <span className="grow" />
+            <button className="btn small" onClick={() => { invoke("failures_clear"); setFails([]); }}>
+              Очистить
+            </button>
+          </div>
+          <div className="list">
+            {fails.map((f) => (
+              <div className="item" key={f.domain}>
+                <span className="grow">
+                  {f.domain}
+                  <span className="sub"> · {f.error} · попыток {f.count}</span>
+                </span>
+                {f.route === "direct" ? (
+                  <button className="btn small" title="пустить этот домен через прокси"
+                    onClick={async () => {
+                      await invoke("rule_add", { text: f.domain });
+                      invoke("failures_clear"); setFails([]);
+                    }}>
+                    Пустить через прокси
+                  </button>
+                ) : (
+                  <span className="tag">шёл через {f.via || "прокси"}</span>
+                )}
+              </div>
+            ))}
+          </div>
+          <p className="hint" style={{ marginTop: 8, marginBottom: 0 }}>
+            Шло напрямую и не открылось — вероятно, ресурс доступен только через прокси.
+            Шло через прокси и не открылось — проверьте его доступность в настройках.
+          </p>
+        </div>
+      )}
+
       <div className="card">
         <div className="row">
           <h3 style={{ margin: 0 }}>Открыто сейчас — {live.length}</h3>
@@ -680,11 +725,16 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
   return (
     <div className="panel">
-      <Upstreams />
+      <Upstreams defaultName={st?.default_upstream ?? ""} onSaved={onSaved} />
 
       <div className="card">
-        <h3>Наши порты</h3>
-        <p className="hint">Локальные порты программы. Менять при конфликте портов.</p>
+        <h3>Локальные порты</h3>
+        <p className="hint">
+          На них программа принимает трафик от приложений: HTTP-порт прописывается
+          в системные настройки, SOCKS5 — для приложений, работающих напрямую.
+          Менять только при конфликте с другой программой; после изменения
+          движок перезапускается.
+        </p>
         <div className="grid2">
           <label className="lbl">HTTP-прокси<input className="field" value={httpPort} onChange={(e) => setHttpPort(e.target.value)} /></label>
           <label className="lbl">SOCKS5-прокси<input className="field" value={socksPort} onChange={(e) => setSocksPort(e.target.value)} /></label>
@@ -707,6 +757,11 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 Выход — через меню значка. При выходе системные настройки прокси
           возвращаются к прежним.
         </p>
+        <label className="check" style={{ marginTop: 12 }}>
+          <input type="checkbox" checked={st?.enable_on_start ?? false}
+            onChange={(e) => invoke("set_flag", { name: "enable_on_start", value: e.target.checked }).then(onSaved)} />
+          Включать перехват при запуске программы
+        </label>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
             onChange={(e) => invoke("set_flag", { name: "auto_reconnect", value: e.target.checked }).then(onSaved)} />
@@ -740,7 +795,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
 type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number };
 
-function Upstreams() {
+function Upstreams({ defaultName, onSaved }: { defaultName: string; onSaved: () => void }) {
   const [ups, setUps] = useState<Upstream[]>([]);
   const [health, setHealth] = useState<ProxyHealth[]>([]);
   const [adding, setAdding] = useState(false);
@@ -804,13 +859,20 @@ function Upstreams() {
               <span className={"state " + (h ? (h.up ? "up" : "down") : "unknown")}
                 title={h ? (h.up ? `отвечает, ${h.ms} мс` : "не отвечает") : "ещё не проверялся"} />
               <span className="grow">
-                {u.name || "без имени"}
-                {i === 0 && <span className="tag" style={{ marginLeft: 6 }}>по умолчанию</span>}
+                {u.name}
+                {u.name === defaultName && <span className="tag" style={{ marginLeft: 6 }}>по умолчанию</span>}
                 <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
               </span>
               <span className="sub">{h ? (h.up ? `${h.ms} мс` : "не отвечает") : "—"}</span>
+              {u.name !== defaultName && (
+                <button className="btn small" title="правила без явного назначения пойдут через него"
+                  onClick={async () => { await invoke("upstream_set_default", { name: u.name }); onSaved(); load(); }}>
+                  Сделать основным
+                </button>
+              )}
               <button className="btn small" onClick={() => startEdit(u)}>Править</button>
-              {i > 0 && <button className="btn small" onClick={() => remove(u.name)}>Убрать</button>}
+              {ups.length > 1 && u.name !== defaultName &&
+                <button className="btn small" onClick={() => remove(u.name)}>Убрать</button>}
             </div>
           );
         })}

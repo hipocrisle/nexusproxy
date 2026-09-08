@@ -71,11 +71,17 @@ pub struct RouteGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Основной прокси. Оставлен ради совместимости со старыми настройками.
-    pub upstream: Upstream,
-    /// Дополнительные прокси, на которые ссылаются группы правил.
+    /// Старый формат: единственный прокси отдельным полем.
+    /// Читается ради совместимости и при загрузке переносится в список.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<Upstream>,
+    /// Все прокси одним списком. У каждого есть имя — иначе его не показать
+    /// ни в журнале, ни в таблице соединений.
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
+    /// Имя прокси, через который идут правила без явного назначения.
+    #[serde(default)]
+    pub default_upstream: String,
     /// Правила, идущие через отдельные прокси.
     #[serde(default)]
     pub groups: Vec<RouteGroup>,
@@ -94,6 +100,9 @@ pub struct Config {
     /// Закрытие окна сворачивает в трей, а не завершает программу.
     #[serde(default = "yes")]
     pub minimize_to_tray: bool,
+    /// Включать перехват сразу при запуске программы.
+    #[serde(default)]
+    pub enable_on_start: bool,
     /// Всё прочее из файла — чтобы при перезаписи не потерять
     /// комментарии и поля, которых мы не знаем.
     #[serde(flatten)]
@@ -103,7 +112,54 @@ pub struct Config {
 impl Config {
     pub fn load(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("не читается {path}: {e}"))?;
-        serde_json::from_str(&text).map_err(|e| format!("испорченный {path}: {e}"))
+        let mut c: Config =
+            serde_json::from_str(&text).map_err(|e| format!("испорченный {path}: {e}"))?;
+        c.migrate();
+        Ok(c)
+    }
+
+    /// Переносит старое поле `upstream` в общий список и следит,
+    /// чтобы у каждого прокси было имя, а «по умолчанию» указывал
+    /// на существующую запись.
+    pub fn migrate(&mut self) {
+        if let Some(mut u) = self.upstream.take() {
+            if u.name.is_empty() {
+                u.name = "основной".into();
+            }
+            if !self.upstreams.iter().any(|x| x.name == u.name) {
+                self.upstreams.insert(0, u.clone());
+            }
+            if self.default_upstream.is_empty() {
+                self.default_upstream = u.name;
+            }
+        }
+        // имена обязательны: безымянный прокси не показать и не выбрать
+        let mut n = 1;
+        for u in self.upstreams.iter_mut() {
+            if u.name.is_empty() {
+                u.name = format!("прокси {n}");
+                n += 1;
+            }
+        }
+        if self.upstreams.iter().all(|u| u.name != self.default_upstream) {
+            self.default_upstream =
+                self.upstreams.first().map(|u| u.name.clone()).unwrap_or_default();
+        }
+    }
+
+    /// Прокси, через который идут правила без явного назначения.
+    pub fn default_proxy(&self) -> Option<&Upstream> {
+        self.upstreams.iter().find(|u| u.name == self.default_upstream)
+            .or_else(|| self.upstreams.first())
+    }
+
+    /// Сделать указанный прокси основным.
+    pub fn set_default(&mut self, name: &str) -> Result<(), String> {
+        if !self.upstreams.iter().any(|u| u.name == name) {
+            return Err(format!("прокси «{name}» не найден"));
+        }
+        self.default_upstream = name.to_string();
+        Ok(())
     }
 
     /// Пишем через временный файл: если запись оборвётся, старый конфиг цел.
@@ -203,22 +259,17 @@ impl Config {
         Ok(r)
     }
 
-    /// Найти прокси по имени. Пустое имя — основной.
+    /// Найти прокси по имени. Пустое имя — тот, что по умолчанию.
     pub fn upstream_by_name(&self, name: &str) -> Option<&Upstream> {
         if name.is_empty() {
-            return Some(&self.upstream);
+            return self.default_proxy();
         }
-        self.upstreams
-            .iter()
-            .find(|u| u.name == name)
-            .or(if self.upstream.name == name { Some(&self.upstream) } else { None })
+        self.upstreams.iter().find(|u| u.name == name)
     }
 
     /// Все прокси одним списком — для показа и для проверки ссылок.
     pub fn all_upstreams(&self) -> Vec<Upstream> {
-        let mut v = vec![self.upstream.clone()];
-        v.extend(self.upstreams.iter().cloned());
-        v
+        self.upstreams.clone()
     }
 
     /// Группы не должны ссылаться на несуществующий прокси —
@@ -239,17 +290,19 @@ mod tests {
 
     fn cfg(through: &[&str], direct: &[&str]) -> Config {
         Config {
-            upstream: Upstream {
-                name: String::new(), kind: Default::default(),
-                address: "127.0.0.1".into(), port: 1080, user: None, password: None,
-            },
+            upstream: None,
             listen: Listen::default(),
-            upstreams: vec![],
+            upstreams: vec![Upstream {
+                name: "основной".into(), kind: Default::default(),
+                address: "127.0.0.1".into(), port: 1080, user: None, password: None,
+            }],
+            default_upstream: "основной".into(),
             groups: vec![],
             through_proxy: through.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
             auto_reconnect: true,
             minimize_to_tray: true,
+            enable_on_start: false,
             extra: Default::default(),
         }
     }
@@ -303,7 +356,7 @@ mod tests {
     #[test]
     fn group_routes_to_its_own_proxy() {
         let mut c = cfg(&["domain:openai.com"], &[]);
-        c.upstreams = vec![up("vpn", 10808)];
+        c.upstreams.push(up("vpn", 10808));
         c.groups = vec![RouteGroup {
             via: "vpn".into(), enabled: true,
             patterns: vec!["domain:youtube.com".into()],
@@ -317,7 +370,7 @@ mod tests {
     #[test]
     fn removing_cleans_groups_too() {
         let mut c = cfg(&[], &[]);
-        c.upstreams = vec![up("vpn", 10808)];
+        c.upstreams.push(up("vpn", 10808));
         c.groups = vec![RouteGroup {
             via: "vpn".into(), enabled: true,
             patterns: vec!["domain:youtube.com".into(), "domain:ytimg.com".into()],
@@ -332,7 +385,7 @@ mod tests {
     #[test]
     fn disabled_group_falls_back() {
         let mut c = cfg(&[], &[]);
-        c.upstreams = vec![up("vpn", 10808)];
+        c.upstreams.push(up("vpn", 10808));
         c.groups = vec![RouteGroup {
             via: "vpn".into(), enabled: false,
             patterns: vec!["domain:youtube.com".into()],
@@ -349,6 +402,29 @@ mod tests {
         }];
         // иначе трафик молча никуда не пойдёт
         assert!(c.check_links().is_err());
+    }
+
+    #[test]
+    fn old_config_is_migrated() {
+        // старый файл: единственный прокси отдельным полем, без имени
+        let old = r#"{"upstream":{"address":"10.0.0.1","port":1080},
+                      "through_proxy":["domain:a.example"]}"#;
+        let mut c: Config = serde_json::from_str(old).unwrap();
+        c.migrate();
+        assert!(c.upstream.is_none(), "старое поле должно опустеть");
+        assert_eq!(c.upstreams.len(), 1);
+        assert_eq!(c.upstreams[0].name, "основной", "безымянному даётся имя");
+        assert_eq!(c.default_upstream, "основной");
+        assert_eq!(c.default_proxy().unwrap().address, "10.0.0.1");
+    }
+
+    #[test]
+    fn default_can_be_switched() {
+        let mut c = cfg(&[], &[]);
+        c.upstreams.push(up("vpn", 10808));
+        assert!(c.set_default("vpn").is_ok());
+        assert_eq!(c.default_proxy().unwrap().name, "vpn");
+        assert!(c.set_default("нет-такого").is_err(), "несуществующий выбрать нельзя");
     }
 
     #[test]

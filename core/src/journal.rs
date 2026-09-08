@@ -30,14 +30,10 @@ pub fn enable() {
     *J.lock().unwrap() = Some(Journal { items: VecDeque::new(), next_id: 1 });
 }
 
-pub fn push(host: &str, port: u16, route: &Route) {
+pub fn push(host: &str, port: u16, route: &Route, via: &str) {
     let stamp = crate::logfile::now_stamp();
     // в окне удобнее только время, дата и так видна в файле
     let short = stamp.rsplit(' ').next().unwrap_or(&stamp).to_string();
-    let via = match route {
-        Route::Proxy(n) => n.clone(),
-        _ => String::new(),
-    };
     let mut g = J.lock().unwrap();
     let Some(j) = g.as_mut() else { return };
     let id = j.next_id;
@@ -48,7 +44,7 @@ pub fn push(host: &str, port: u16, route: &Route) {
         host: host.to_string(),
         port,
         route: route.tag().to_string(),
-        via,
+        via: via.to_string(),
     });
     while j.items.len() > CAP {
         j.items.pop_front();
@@ -82,12 +78,13 @@ mod tests {
     fn journal_behaviour() {
         let _guard = crate::logfile::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         enable();
-        push("a.example", 443, &Route::proxy());
-        push("b.example", 80, &Route::Direct);
+        push("a.example", 443, &Route::proxy(), "офис");
+        push("b.example", 80, &Route::Direct, "");
         let all = since(0);
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].host, "a.example");
         assert_eq!(all[0].route, "proxy");
+        assert_eq!(all[0].via, "офис", "в журнале должно стоять имя прокси");
         let tail = since(all[0].id);
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].host, "b.example");
@@ -96,7 +93,7 @@ mod tests {
         assert!(since(0).is_empty(), "очистка должна опустошать журнал");
 
         for i in 0..(CAP + 50) {
-            push(&format!("h{i}.example"), 443, &Route::Direct);
+            push(&format!("h{i}.example"), 443, &Route::Direct, "");
         }
         assert_eq!(since(0).len(), CAP);
     }

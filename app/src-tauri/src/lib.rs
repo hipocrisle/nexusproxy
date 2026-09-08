@@ -25,6 +25,8 @@ pub struct Status {
     discovering: bool,
     auto_reconnect: bool,
     minimize_to_tray: bool,
+    enable_on_start: bool,
+    default_upstream: String,
     rules_count: usize,
     upstream_up: bool,
     upstream_error: Option<String>,
@@ -46,13 +48,17 @@ fn status(app: State<App>) -> Status {
             let h = core::health::get();
             Status {
                 running: true,
-                upstream: format!("{}:{}", c.upstream.address, c.upstream.port),
+                upstream: c.default_proxy()
+                    .map(|u| format!("{} · {}:{}", u.name, u.address, u.port))
+                    .unwrap_or_else(|| "прокси не задан".into()),
                 http_port: c.listen.http,
                 socks_port: c.listen.socks,
                 system_on: e.system_proxy_is_ours(),
                 discovering: core::report::session_active(),
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,
+                enable_on_start: c.enable_on_start,
+                default_upstream: c.default_upstream.clone(),
                 rules_count: c.through_proxy.iter().filter(|s| !s.starts_with('_')).count(),
                 upstream_up: h.up,
                 upstream_error: h.last_error,
@@ -64,7 +70,8 @@ fn status(app: State<App>) -> Status {
         None => Status {
             running: false, upstream: String::new(), http_port: 0, socks_port: 0,
             system_on: false, discovering: false,
-            auto_reconnect: true, minimize_to_tray: true, rules_count: 0,
+            auto_reconnect: true, minimize_to_tray: true, enable_on_start: false,
+            default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
             config_path: path, log_path: String::new(),
             error: Some("движок не запущен".into()),
@@ -248,6 +255,25 @@ fn conns_reset() {
     core::conns::reset_totals()
 }
 
+/// Сделать прокси основным — одним нажатием, без правки правил.
+#[tauri::command]
+fn upstream_set_default(app: State<App>, name: String) -> Result<(), String> {
+    let e = engine(&app)?;
+    { e.cfg.lock().unwrap().set_default(&name)?; }
+    e.apply_and_save()
+}
+
+/// Отказы соединений за последние 10 минут — для подсказок.
+#[tauri::command]
+fn failures_recent() -> Vec<core::failures::Failure> {
+    core::failures::recent(600)
+}
+
+#[tauri::command]
+fn failures_clear() {
+    core::failures::clear()
+}
+
 /// Доступность каждого прокси.
 #[tauri::command]
 fn proxies_health() -> Vec<core::health::ProxyHealth> {
@@ -279,39 +305,41 @@ fn upstream_save(
     if up.address.trim().is_empty() {
         return Err("не указан адрес".into());
     }
+    if up.name.trim().is_empty() {
+        return Err("не указано имя".into());
+    }
     let e = engine(&app)?;
     {
         let mut c = e.cfg.lock().unwrap();
         let old = old_name.unwrap_or_default();
-        let editing_main = old == c.upstream.name && !c.upstream.name.is_empty()
-            || (old.is_empty() && up.name.is_empty());
 
-        // имя не должно совпадать с чужим
-        if !up.name.is_empty() && up.name != old {
-            let taken = c.upstream.name == up.name
-                || c.upstreams.iter().any(|x| x.name == up.name);
-            if taken {
-                return Err(format!("прокси с именем «{}» уже есть", up.name));
-            }
+        // имя должно быть свободно
+        if up.name != old && c.upstreams.iter().any(|x| x.name == up.name) {
+            return Err(format!("прокси с именем «{}» уже есть", up.name));
         }
 
-        if editing_main {
-            c.upstream = up.clone();
-        } else if !old.is_empty() {
-            match c.upstreams.iter_mut().find(|x| x.name == old) {
-                Some(x) => *x = up.clone(),
-                None => c.upstreams.push(up.clone()),
-            }
-            // группы должны переехать на новое имя
-            if old != up.name {
-                for g in c.groups.iter_mut() {
-                    if g.via == old {
-                        g.via = up.name.clone();
+        match c.upstreams.iter_mut().find(|x| x.name == old) {
+            Some(x) => {
+                *x = up.clone();
+                // переименование обязано тянуть за собой ссылки, иначе
+                // группы и «по умолчанию» укажут на исчезнувшее имя
+                if old != up.name {
+                    for g in c.groups.iter_mut() {
+                        if g.via == old {
+                            g.via = up.name.clone();
+                        }
+                    }
+                    if c.default_upstream == old {
+                        c.default_upstream = up.name.clone();
                     }
                 }
             }
-        } else {
-            c.upstreams.push(up.clone());
+            None => {
+                c.upstreams.push(up.clone());
+                if c.default_upstream.is_empty() {
+                    c.default_upstream = up.name.clone();
+                }
+            }
         }
     }
     e.apply_and_save()
@@ -321,15 +349,18 @@ fn upstream_save(
 /// на который ещё ссылается группа правил.
 #[tauri::command]
 fn upstream_remove(app: State<App>, name: String) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("основной прокси убрать нельзя".into());
-    }
     let e = engine(&app)?;
     {
         let mut c = e.cfg.lock().unwrap();
+        if c.default_upstream == name {
+            return Err("сначала выберите основным другой прокси".into());
+        }
+        if c.upstreams.len() <= 1 {
+            return Err("это последний прокси, убрать его нельзя".into());
+        }
         if let Some(g) = c.groups.iter().find(|g| g.via == name) {
             return Err(format!(
-                "на него ссылается группа с {} правилами — сначала переключи её",
+                "на него ссылаются {} правил — сначала переключите их на другой прокси",
                 g.patterns.len()
             ));
         }
@@ -457,6 +488,7 @@ fn set_flag(app: State<App>, name: String, value: bool) -> Result<(), String> {
                     .store(value, std::sync::atomic::Ordering::Relaxed);
             }
             "minimize_to_tray" => c.minimize_to_tray = value,
+            "enable_on_start" => c.enable_on_start = value,
             other => return Err(format!("неизвестная настройка: {other}")),
         }
     }
@@ -511,18 +543,20 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
 
 fn default_config() -> core::config::Config {
     core::config::Config {
-        upstream: core::upstream::Upstream {
-            name: String::new(),
+        upstream: None,
+        upstreams: vec![core::upstream::Upstream {
+            name: "основной".into(),
             kind: core::upstream::Kind::Socks5,
             address: "127.0.0.1".into(), port: 1080, user: None, password: None,
-        },
-        upstreams: vec![],
+        }],
+        default_upstream: "основной".into(),
         groups: vec![],
         listen: core::config::Listen { http: 18080, socks: 18081 },
         through_proxy: vec![],
         direct: vec![],
         auto_reconnect: true,
         minimize_to_tray: true,
+        enable_on_start: false,
         extra: Default::default(),
     }
 }
@@ -610,6 +644,19 @@ pub fn run() {
             let cfg = core::config::Config::load(&path_s)
                 .unwrap_or_else(|_| default_config());
 
+            {
+                let st = app.state::<App>();
+                let e = st.engine.lock().unwrap().clone();
+                if let Some(e) = e {
+                    let want = e.cfg.lock().unwrap().enable_on_start;
+                    if want {
+                        if let Err(err) = e.system_proxy_on() {
+                            eprintln!("не удалось включить перехват при запуске: {err}");
+                        }
+                    }
+                }
+            }
+
             if started_hidden() {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.hide();
@@ -637,7 +684,7 @@ pub fn run() {
             journal_since, journal_clear, open_folder, install_info, open_installed,
             conns_active, conns_totals, conns_reset,
             upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
-            proxies_health,
+            proxies_health, upstream_set_default, failures_recent, failures_clear,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit
         ])
