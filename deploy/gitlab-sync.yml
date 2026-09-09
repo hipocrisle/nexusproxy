@@ -27,6 +27,11 @@ stages:
 
 mirror-code:
   stage: code
+  # ⛔ Не роняем весь конвейер: установщики важнее кода. Если ветка в GitLab
+  # защищена, а история на GitHub переписывалась, зеркалу нужен force —
+  # его запретят, задание упадёт, и БЕЗ этой строки следом не поедут
+  # и дистрибутивы, хотя к ним претензий нет.
+  allow_failure: true
   # Обычный alpine, git ставим сами. Образ alpine/git считает всё,
   # что ему передали, командой для git — скрипт до оболочки не доходит.
   image: alpine:latest
@@ -42,11 +47,34 @@ mirror-code:
     - git clone --mirror "$SOURCE_REPO" repo.git
     - cd repo.git
     # --mirror переносит все ветки и теги как есть
-    - git push --mirror "https://oauth2:${GL_TOKEN}@${CI_SERVER_HOST}/${MIRROR_PATH}.git"
-    - echo "Код обновлён."
+    - |
+      if git push --mirror "https://oauth2:${GL_TOKEN}@${CI_SERVER_HOST}/${MIRROR_PATH}.git" 2>push.log; then
+        echo "Код обновлён."
+      else
+        cat push.log
+        if grep -q "not allowed to force push" push.log; then
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "Зеркало не может обновиться: ветка защищена, а истории"
+          echo "разошлись — на GitHub её переписывали."
+          echo ""
+          echo "Что сделать один раз в проекте-зеркале:"
+          echo "  Settings → Repository → Protected branches → main"
+          echo "  включить «Allowed to force push»."
+          echo ""
+          echo "Установщики при этом выкладываются как обычно —"
+          echo "следующим заданием, оно от этого не зависит."
+          echo "═══════════════════════════════════════════════════════════"
+        fi
+        exit 1
+      fi
 
 mirror-dist:
   stage: dist
+  # Пустой needs: задание не ждёт синхронизации кода и не зависит от её
+  # исхода. Коллеги качают именно отсюда, и упавшее зеркало кода не должно
+  # оставлять их без новой версии.
+  needs: []
   image: alpine:latest
   script:
     - apk add --no-cache curl jq ca-certificates
