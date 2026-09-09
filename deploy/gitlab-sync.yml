@@ -148,11 +148,19 @@ mirror-dist:
       # без выпуска их никто не найдёт. Раньше сюда не доходили, если хоть
       # один файл споткнулся.
       if [ -z "$HAVE" ]; then
-        echo "Создаю выпуск $VER..."
+        # ⛔ Выпуск создаётся НА ТЕГ, и если тега в зеркале ещё нет,
+        # GitLab отвечает 422 «Ref is not specified». Тег приезжает
+        # синхронизацией кода, а она может отставать или падать — тогда
+        # установщики повисают в реестре без выпуска, и найти их нельзя.
+        # Поэтому передаём ref: GitLab создаст тег сам, из головы ветки.
+        REF=$(curl -sS $CA --header "PRIVATE-TOKEN: $GL_TOKEN" \
+              "$CI_API_V4_URL/projects/$GL_PROJECT" | jq -r '.default_branch // "main"')
+        [ -n "$REF" ] && [ "$REF" != "null" ] || REF=main
+        echo "Создаю выпуск $VER (ветка для тега: $REF)..."
         CODE=$(curl -sS $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
           --header "Content-Type: application/json" \
           -o rel.log -w '%{http_code}' \
-          --data "{\"name\":\"NexusProxy $VER\",\"tag_name\":\"$VER\",
+          --data "{\"name\":\"NexusProxy $VER\",\"tag_name\":\"$VER\",\"ref\":\"$REF\",
                    \"description\":\"Собрано из GitHub. Windows — файл с -setup, права администратора не нужны. macOS — файл .dmg, первый запуск через правый клик и «Открыть».\",
                    \"assets\":{\"links\":[${LINKS%,}]}}" \
           "$CI_API_V4_URL/projects/$GL_PROJECT/releases")
