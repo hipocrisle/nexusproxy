@@ -27,6 +27,9 @@ stages:
 
 mirror-code:
   stage: code
+  # Один прогон за раз: ручной запуск и расписание могут совпасть, и тогда
+  # два задания лезут в один репозиторий и реестр одновременно.
+  resource_group: gitlab-sync
   # ⛔ Не роняем весь конвейер: установщики важнее кода. Если ветка в GitLab
   # защищена, а история на GitHub переписывалась, зеркалу нужен force —
   # его запретят, задание упадёт, и БЕЗ этой строки следом не поедут
@@ -71,6 +74,7 @@ mirror-code:
 
 mirror-dist:
   stage: dist
+  resource_group: gitlab-sync-dist
   # Пустой needs: задание не ждёт синхронизации кода и не зависит от её
   # исхода. Коллеги качают именно отсюда, и упавшее зеркало кода не должно
   # оставлять их без новой версии.
@@ -104,40 +108,63 @@ mirror-dist:
 
       NEW=0
       LINKS=""
+      FAILED=""
       while read -r URL; do
         NAME=$(basename "$URL")
         DEST="$CI_API_V4_URL/projects/$GL_PROJECT/packages/generic/nexusproxy/${VER#v}/$NAME"
         LINKS="$LINKS{\"name\":\"$NAME\",\"url\":\"$DEST\"},"
         if echo "$HAVE" | grep -qx "$NAME"; then
-          echo "$NAME уже есть, пропускаю"
+          echo "$NAME уже есть в выпуске, пропускаю"
           continue
         fi
-        NEW=1
         echo "Скачиваю $NAME..."
-        curl -sSfL $CA -o "$NAME" "$URL"
+        if ! curl -sSfL $CA -o "$NAME" "$URL"; then
+          echo "  не скачался — пропускаю"; FAILED="$FAILED $NAME"; continue
+        fi
         echo "Выкладываю $NAME..."
-        curl -sSf $CA --header "PRIVATE-TOKEN: $GL_TOKEN" --upload-file "$NAME" "$DEST"
-        # если выпуск уже есть — просто дописываем ссылку
+        # ⛔ Не через -f и не под set -e: повторная выкладка того же файла
+        # возвращает 4xx, и это НЕ ошибка. Пайплайн может идти дважды
+        # (ручной запуск плюс расписание) — тогда второй приходит на уже
+        # занятое имя. Раньше это роняло задание до создания выпуска.
+        CODE=$(curl -sS $CA --header "PRIVATE-TOKEN: $GL_TOKEN" \
+               --upload-file "$NAME" -o up.log -w '%{http_code}' "$DEST" || echo 000)
+        case "$CODE" in
+          200|201) echo "  выложен"; NEW=1 ;;
+          400|403|409|422)
+            echo "  уже был выложен ранее (код $CODE) — считаем сделанным" ;;
+          *) echo "  не выложился, код $CODE: $(head -c 200 up.log)"
+             FAILED="$FAILED $NAME"; continue ;;
+        esac
+        # если выпуск уже есть — дописываем ссылку в него
         if [ -n "$HAVE" ]; then
-          curl -sSf $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
+          curl -sS $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
             --data "name=$NAME" --data-urlencode "url=$DEST" \
-            "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER/assets/links" >/dev/null
-          echo "Ссылка на $NAME добавлена в существующий выпуск"
+            "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER/assets/links" >/dev/null || true
+          echo "  ссылка добавлена в существующий выпуск"
         fi
       done < urls.txt
 
-      if [ "$NEW" = "0" ]; then
-        echo "Всё уже выложено, делать нечего."
-        exit 0
-      fi
-
-      # выпуска ещё не было — создаём вместе со всеми ссылками
+      # Выпуск создаём ВСЕГДА, если его ещё нет: файлы уже в реестре, и
+      # без выпуска их никто не найдёт. Раньше сюда не доходили, если хоть
+      # один файл споткнулся.
       if [ -z "$HAVE" ]; then
-        curl -sSf $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
+        echo "Создаю выпуск $VER..."
+        CODE=$(curl -sS $CA --request POST --header "PRIVATE-TOKEN: $GL_TOKEN" \
           --header "Content-Type: application/json" \
+          -o rel.log -w '%{http_code}' \
           --data "{\"name\":\"NexusProxy $VER\",\"tag_name\":\"$VER\",
                    \"description\":\"Собрано из GitHub. Windows — файл с -setup, права администратора не нужны. macOS — файл .dmg, первый запуск через правый клик и «Открыть».\",
                    \"assets\":{\"links\":[${LINKS%,}]}}" \
-          "$CI_API_V4_URL/projects/$GL_PROJECT/releases" >/dev/null
+          "$CI_API_V4_URL/projects/$GL_PROJECT/releases")
+        case "$CODE" in
+          200|201) echo "Выпуск создан." ;;
+          409) echo "Выпуск уже существует — ничего не делаем." ;;
+          *) echo "Выпуск не создан, код $CODE: $(head -c 300 rel.log)"; exit 1 ;;
+        esac
+      fi
+
+      if [ -n "$FAILED" ]; then
+        echo "Не доехали файлы:$FAILED"
+        exit 1
       fi
       echo "Выпуск $VER готов."
