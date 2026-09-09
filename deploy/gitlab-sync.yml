@@ -51,26 +51,48 @@ mirror-code:
     - cd repo.git
     # --mirror переносит все ветки и теги как есть
     - |
-      if git push --mirror "https://oauth2:${GL_TOKEN}@${CI_SERVER_HOST}/${MIRROR_PATH}.git" 2>push.log; then
-        echo "Код обновлён."
+      TARGET="https://oauth2:${GL_TOKEN}@${CI_SERVER_HOST}/${MIRROR_PATH}.git"
+      # ⛔ Ветку и теги пушим ОТДЕЛЬНО. Раньше шло одним --mirror, и по логу
+      # нельзя было понять, во что именно упёрлось: отклонение защищённой
+      # ветки выглядело как отказ по всем тринадцати ссылкам разом.
+      # После переписывания истории обе операции требуют force: и ветка
+      # разошлась, и существующие теги надо передвинуть.
+      RC=0
+
+      echo "── Ветка main ──"
+      if git push --force "$TARGET" "+refs/heads/main:refs/heads/main" 2>br.log; then
+        echo "  обновлена"
       else
-        cat push.log
-        if grep -q "not allowed to force push" push.log; then
-          echo ""
-          echo "═══════════════════════════════════════════════════════════"
-          echo "Зеркало не может обновиться: ветка защищена, а истории"
-          echo "разошлись — на GitHub её переписывали."
-          echo ""
-          echo "Что сделать один раз в проекте-зеркале:"
-          echo "  Settings → Repository → Protected branches → main"
-          echo "  включить «Allowed to force push»."
-          echo ""
-          echo "Установщики при этом выкладываются как обычно —"
-          echo "следующим заданием, оно от этого не зависит."
-          echo "═══════════════════════════════════════════════════════════"
+        cat br.log
+        if grep -q "not allowed to force push" br.log; then
+          echo "  ⛔ защищена от force. В проекте-ЗЕРКАЛЕ (не в nexusproxy-sync):"
+          echo "     Settings → Repository → Protected branches → main"
+          echo "     → «Allowed to force push» включить,"
+          echo "     → и убедиться, что токен GL_TOKEN есть в «Allowed to push and merge»."
         fi
+        RC=1
+      fi
+
+      echo "── Теги ──"
+      if git push --force --tags "$TARGET" 2>tg.log; then
+        echo "  обновлены"
+      else
+        cat tg.log
+        if grep -qi "protected tag\|not allowed" tg.log; then
+          echo "  ⛔ теги защищены. В проекте-ЗЕРКАЛЕ:"
+          echo "     Settings → Repository → Protected tags — снять правило на v*"
+          echo "     (или разрешить его изменение роли токена)."
+        fi
+        RC=1
+      fi
+
+      if [ "$RC" != "0" ]; then
+        echo ""
+        echo "Установщики это НЕ задевает: они выкладываются отдельным"
+        echo "заданием, которое ничего тут не ждёт."
         exit 1
       fi
+      echo "Код обновлён."
 
 mirror-dist:
   stage: dist
