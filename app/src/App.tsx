@@ -148,8 +148,9 @@ export default function App() {
   return (
     <div className="app">
       <div className="top">
-        <span className="brand">NexusProxy</span>
-        <span className="ver">{version || ""}</span>
+        <span className="brand">
+          NexusProxy{version && <span className="ver">{version}</span>}
+        </span>
         <span className={"pill" + (st?.system_on ? " on" : "")}>
           <span className="dot" />
           {st?.system_on ? "включён" : "выключен"}
