@@ -13,6 +13,22 @@ pub struct AppInfo {
     pub pid: u32,
 }
 
+/// Полный путь к файлу процесса. Нужен, чтобы отличать СВОЙ xray от чужого:
+/// у Happ и прочих клиентов свой такой же по имени.
+pub fn path_of_pid(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    { imp::pid_path(pid) }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()]).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    { let _ = pid; None }
+}
+
 #[cfg(windows)]
 mod imp {
     use std::collections::HashMap;
@@ -117,7 +133,7 @@ mod imp {
     /// PROCESS_VM_READ, которых мы не просим, и потому всегда возвращал
     /// пусто: колонка приложений была вечно в прочерках.
     /// QueryFullProcessImageNameW обходится теми правами, что есть.
-    fn pid_path(pid: u32) -> Option<String> {
+    pub fn pid_path(pid: u32) -> Option<String> {
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {

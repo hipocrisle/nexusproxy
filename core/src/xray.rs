@@ -163,7 +163,13 @@ pub fn port_for(index: usize) -> u16 {
 static CHILD: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Запустить xray с настройками под список стран.
+/// Запуск не должен идти в два голоса: сторож раз в 15 секунд видит, что
+/// ядра нет, и лезет поднимать — а поднятие уже идёт. Два ядра дерутся
+/// за одни порты, и оба падают.
+static STARTING: Mutex<()> = Mutex::new(());
+
 pub fn start(dir: &Path, profiles: &[Profile]) -> Result<(), String> {
+    let _one_at_a_time = STARTING.lock().unwrap_or_else(|e| e.into_inner());
     stop();
     if profiles.is_empty() {
         return Err("список стран пуст".into());
@@ -172,6 +178,15 @@ pub fn start(dir: &Path, profiles: &[Profile]) -> Result<(), String> {
     if !bin.is_file() {
         return Err("xray ещё не скачан".into());
     }
+    // Осиротевшее ядро от прошлого запуска держит порты — новое их не займёт
+    let orphans = kill_orphans(&bin);
+    if orphans > 0 {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("осталось ядер от прошлого запуска: {orphans}, остановлены"));
+        // порту нужно время освободиться
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
     let cfg_path = dir.join("xray-config.json");
     std::fs::write(&cfg_path, serde_json::to_vec_pretty(&build_config(profiles)).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
@@ -213,9 +228,59 @@ pub fn start(dir: &Path, profiles: &[Profile]) -> Result<(), String> {
         return Err(m);
     }
 
+    #[cfg(windows)]
+    assign_to_job(&child);
+
     *LAST_ERROR.lock().unwrap() = None;
     *CHILD.lock().unwrap() = Some(child);
     Ok(())
+}
+
+/// ⛔ Windows: без Job Object дочерний процесс переживает родителя.
+/// Программу закрыли, а ядро осталось держать порты — и следующий запуск
+/// падает с «Only one usage of each socket address». Привязка к заданию
+/// с KILL_ON_JOB_CLOSE решает это в корне.
+#[cfg(windows)]
+fn assign_to_job(child: &Child) {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    struct Job(HANDLE);
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+    static JOB: OnceLock<Job> = OnceLock::new();
+
+    let job = JOB.get_or_init(|| unsafe {
+        let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if !h.is_null() {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                h, JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+        }
+        Job(h)
+    });
+    if job.0.is_null() {
+        return;
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, child.id());
+        if !h.is_null() {
+            AssignProcessToJobObject(job.0, h);
+            CloseHandle(h);
+        }
+    }
 }
 
 pub fn stop() {
@@ -299,4 +364,70 @@ mod tests {
         let dir = std::env::temp_dir();
         assert!(start(&dir, &[]).is_err());
     }
+}
+
+// ── Осиротевшее ядро ────────────────────────────────────────────────────
+// ⛔ Самая частая причина «страны недоступны»: от прошлого запуска остался
+// живой xray и держит порты 20800+, а новый не может их занять и умирает
+// с «Only one usage of each socket address». На Windows дочерний процесс
+// переживает родителя, если его не привязать к Job Object, — вот и копятся.
+//
+// Убиваем СТРОГО по полному пути своего файла: у Happ и других клиентов
+// свой xray.exe, трогать его нельзя. [[feedback-no-broad-process-kill]]
+
+#[cfg(windows)]
+pub fn kill_orphans(bin: &Path) -> usize {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    let want = bin.to_string_lossy().to_lowercase();
+    let mut pids = vec![0u32; 4096];
+    let mut needed = 0u32;
+    let mut killed = 0;
+    unsafe {
+        if EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) == 0 {
+            return 0;
+        }
+        let count = needed as usize / 4;
+        let me = std::process::id();
+        for &pid in pids.iter().take(count) {
+            if pid == 0 || pid == me {
+                continue;
+            }
+            match crate::proc::path_of_pid(pid) {
+                Some(p) if p.to_lowercase() == want => {
+                    let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    if !h.is_null() {
+                        if TerminateProcess(h, 1) != 0 {
+                            killed += 1;
+                        }
+                        CloseHandle(h);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    killed
+}
+
+#[cfg(not(windows))]
+pub fn kill_orphans(bin: &Path) -> usize {
+    let out = Command::new("pgrep").arg("-f").arg(bin.to_string_lossy().as_ref()).output();
+    let Ok(out) = out else { return 0 };
+    let me = std::process::id().to_string();
+    let mut killed = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let pid = line.trim();
+        if pid.is_empty() || pid == me {
+            continue;
+        }
+        if Command::new("kill").arg("-9").arg(pid).status().map(|s| s.success()).unwrap_or(false) {
+            killed += 1;
+        }
+    }
+    killed
 }
