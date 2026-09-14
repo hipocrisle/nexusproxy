@@ -117,15 +117,18 @@ mirror-dist:
       # Что уже выложено у нас. Сверяем ПО СОСТАВУ, а не по факту наличия
       # выпуска: иначе добавленный позже файл никогда не доедет — задание
       # увидит выпуск и молча пропустит.
-      HAVE=$(curl -sS $CA --header "PRIVATE-TOKEN: $GL_TOKEN" \
-             "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER" \
-             | jq -r '(.assets.links // [])[].name' 2>/dev/null || true)
+      curl -sS $CA --header "PRIVATE-TOKEN: $GL_TOKEN" \
+        "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER" > rel.json 2>/dev/null || echo '{}' > rel.json
+      HAVE=$(jq -r '(.assets.links // [])[].name' rel.json 2>/dev/null || true)
       echo "Уже выложено: ${HAVE:-ничего}"
 
-      # Установщики для обеих систем. Файлы .sig и .app.tar.gz нужны только
-      # автообновлению с GitHub, людям их скачивать незачем.
+      # ТОЛЬКО установщики: файл с -setup для Windows и .dmg для macOS.
+      # Раньше фильтр брал любой .exe, и в выпуск ехали ещё NexusProxy.exe
+      # с nexusproxy-console.exe — несобранные бинарники, которые человеку
+      # скачивать незачем и в которых легко ошибиться. Файлы .sig
+      # и .app.tar.gz нужны только автообновлению с GitHub.
       curl -sSf $CA "$RELEASE_API" \
-        | jq -r '.assets[] | select(.name|test("\\.(exe|dmg)$")) | .browser_download_url' > urls.txt
+        | jq -r '.assets[] | select(.name|test("-setup\\.exe$|\\.dmg$")) | .browser_download_url' > urls.txt
       test -s urls.txt || { echo "В выпуске нет установщиков"; exit 1; }
 
       NEW=0
@@ -192,6 +195,24 @@ mirror-dist:
           *) echo "Выпуск не создан, код $CODE: $(head -c 300 rel.log)"; exit 1 ;;
         esac
       fi
+
+      # Убираем из выпуска лишнее, что натащила прежняя версия задания:
+      # она брала любой .exe, и рядом с установщиком лежали несобранные
+      # NexusProxy.exe и nexusproxy-console.exe. Трогаем ТОЛЬКО файлы
+      # программы (.exe/.dmg), которых нет в нашем списке, — чужие ссылки,
+      # если их кто-то добавил руками, не при чём.
+      awk -F/ '{print $NF}' urls.txt > wanted.txt
+      jq -r '(.assets.links // [])[] | "\(.id)\t\(.name)"' rel.json 2>/dev/null | while IFS="$(printf '\t')" read -r ID NAME; do
+        [ -n "$ID" ] || continue
+        case "$NAME" in
+          *.exe|*.dmg)
+            if ! grep -qx "$NAME" wanted.txt; then
+              echo "Убираю лишнее из выпуска: $NAME"
+              curl -sS $CA --request DELETE --header "PRIVATE-TOKEN: $GL_TOKEN" \
+                "$CI_API_V4_URL/projects/$GL_PROJECT/releases/$VER/assets/links/$ID" >/dev/null || true
+            fi ;;
+        esac
+      done
 
       if [ -n "$FAILED" ]; then
         echo "Не доехали файлы:$FAILED"
