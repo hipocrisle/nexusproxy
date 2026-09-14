@@ -11,8 +11,28 @@
 use crate::subscription::Profile;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+
+/// Последняя причина, по которой ядро не поднялось. Держим отдельно:
+/// процесс может умереть и через минуту после запуска, и тогда рассказать
+/// об этом больше нечему.
+pub static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn log_path(dir: &Path) -> PathBuf {
+    dir.join("xray.log")
+}
+
+/// Хвост журнала ядра — то, что оно сказало перед смертью.
+pub fn log_tail(dir: &Path, lines: usize) -> String {
+    let text = std::fs::read_to_string(log_path(dir)).unwrap_or_default();
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+pub fn last_error() -> Option<String> {
+    LAST_ERROR.lock().unwrap().clone()
+}
 
 /// С какого порта начинаем раздавать входы по странам.
 pub const FIRST_PORT: u16 = 20800;
@@ -156,14 +176,44 @@ pub fn start(dir: &Path, profiles: &[Profile]) -> Result<(), String> {
     std::fs::write(&cfg_path, serde_json::to_vec_pretty(&build_config(profiles)).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
 
+    // ⛔ Вывод ядра обязан куда-то писаться. Без этого его падение —
+    // немая красная точка в списке прокси: порт не слушается, а почему —
+    // узнать неоткуда.
+    let log = std::fs::File::create(log_path(dir))
+        .map_err(|e| format!("не создать журнал ядра: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| format!("не создать журнал ядра: {e}"))?;
+
     let mut cmd = Command::new(&bin);
-    cmd.arg("run").arg("-c").arg(&cfg_path).current_dir(dir);
+    cmd.arg("run").arg("-c").arg(&cfg_path).current_dir(dir)
+        .stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // без окна консоли
     }
-    let child = cmd.spawn().map_err(|e| format!("не запустить xray: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        let m = format!("не запустить xray: {e}");
+        *LAST_ERROR.lock().unwrap() = Some(m.clone());
+        m
+    })?;
+
+    // ⛔ Мало запустить — надо убедиться, что ядро не умерло сразу.
+    // Битые настройки, снесённый антивирусом файл, занятый порт: всё это
+    // раньше выглядело как успешный запуск, потому что spawn отработал.
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    if let Ok(Some(status)) = child.try_wait() {
+        let tail = log_tail(dir, 6);
+        let m = if tail.is_empty() {
+            format!("ядро xray сразу завершилось ({status}) и ничего не сказало. \
+                     Так ведёт себя файл, удалённый антивирусом")
+        } else {
+            format!("ядро xray сразу завершилось ({status}):\n{tail}")
+        };
+        *LAST_ERROR.lock().unwrap() = Some(m.clone());
+        return Err(m);
+    }
+
+    *LAST_ERROR.lock().unwrap() = None;
     *CHILD.lock().unwrap() = Some(child);
     Ok(())
 }

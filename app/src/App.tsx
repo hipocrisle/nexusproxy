@@ -1284,6 +1284,7 @@ function Updates() {
 type SubState = {
   installed: boolean; running: boolean; url: string;
   has_text: boolean; enabled: boolean; countries: string[]; dir: string;
+  error?: string | null; log_tail?: string;
 };
 
 function Subscription({ onChange }: { onChange: () => void }) {
@@ -1311,13 +1312,35 @@ function Subscription({ onChange }: { onChange: () => void }) {
       <summary>
         Подписка со странами
         {countries.length > 0 && ` — ${countries.length} шт.`}
-        {st?.running && " · работает"}
+        {st?.enabled && (st.running
+          ? <span className="ok-mark"> · ядро работает</span>
+          : <span className="bad-mark"> · ядро не работает</span>)}
       </summary>
 
       <span className="hint">
         Вставьте ссылку на подписку или её содержимое. Каждая страна станет
         отдельным прокси в списке, и любому правилу можно будет назначить любую.
       </span>
+
+      {st?.installed && st.enabled && !st.running && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <b>Ядро подписки не работает</b>
+          <span>
+            Страны из подписки — это локальные порты, которые открывает xray.
+            Пока он не работает, все они помечены как недоступные, хотя сами
+            серверы могут быть в порядке. Программа поднимает его заново сама,
+            раз в пятнадцать секунд.
+          </span>
+          {st.error && <pre className="log-tail">{st.error}</pre>}
+          {!st.error && st.log_tail && <pre className="log-tail">{st.log_tail}</pre>}
+          <div className="row">
+            <button className="btn small primary" disabled={busy !== ""}
+              onClick={() => run("apply", () => invoke("sub_apply"))}>
+              {busy === "apply" ? "Поднимаю…" : "Поднять сейчас"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {!st?.installed && (
         <div className="note" style={{ marginTop: 8 }}>

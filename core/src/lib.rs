@@ -139,6 +139,8 @@ impl Engine {
         // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
         let watch_routing = routing.clone();
         let watch_recheck = recheck.clone();
+        let watch_cfg = e.cfg.clone();
+        let watch_path = path.to_string();
         let t3 = tokio::spawn(async move {
             // первая проверка сразу: иначе список прокси до четверти минуты
             // стоит серым и выглядит сломанным
@@ -151,6 +153,47 @@ impl Engine {
                     }
                 }
                 first = false;
+
+                // ── Присмотр за ядром подписки ───────────────────────────
+                // ⛔ Ядро может умереть молча уже после запуска: битые
+                // настройки, антивирус, занятый порт. Снаружи это выглядит
+                // как «страны позеленели, потом по одной покраснели» —
+                // сторож просто перекрашивает их по мере обхода. Поднимаем
+                // обратно и говорим об этом вслух.
+                {
+                    let want_xray = {
+                        let c = watch_cfg.lock().unwrap();
+                        c.subscription.as_ref().map_or(false, |s| s.enabled && !s.text.trim().is_empty())
+                    };
+                    if want_xray && !xray::is_running() {
+                        let dir = xray_dir(&watch_path);
+                        let profiles = {
+                            let c = watch_cfg.lock().unwrap();
+                            c.subscription.as_ref().map(|s| s.text.clone())
+                        };
+                        let parsed = profiles.as_deref().map(subscription::parse);
+                        match parsed {
+                            Some(Ok(pr)) => {
+                                let tail = xray::log_tail(&dir, 4);
+                                logfile::line(&logfile::now_stamp(),
+                                    &if tail.is_empty() {
+                                        "ядро подписки не работает, поднимаю заново".to_string()
+                                    } else {
+                                        format!("ядро подписки не работает, поднимаю заново. Последнее, что оно сказало:\n{tail}")
+                                    });
+                                match xray::start(&dir, &pr) {
+                                    Ok(_) => logfile::line(&logfile::now_stamp(), "ядро подписки поднято"),
+                                    Err(e) => logfile::line(&logfile::now_stamp(),
+                                        &format!("ядро подписки не поднялось: {e}")),
+                                }
+                            }
+                            Some(Err(e)) => logfile::line(&logfile::now_stamp(),
+                                &format!("подписка не разбирается: {e}")),
+                            None => {}
+                        }
+                    }
+                }
+
                 let list: Vec<upstream::Upstream> = {
                     let r = watch_routing.read().unwrap();
                     // пустое имя — дубль основного, его пропускаем

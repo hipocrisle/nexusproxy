@@ -158,6 +158,10 @@ textarea.field { min-height: 92px; resize: vertical; font-family: ui-monospace, 
 .log .who { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .note { background: var(--warn-soft); color: var(--warn-ink); border-radius: 8px; padding: 9px 12px; font-size: 12.5px; }
+/* Заголовок и пояснение внутри — разными строками: подряд они слипались
+   в одно предложение. */
+.note > b { display: block; margin-bottom: 3px; }
+.note > span { display: block; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 label.lbl { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
 .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
@@ -258,3 +262,16 @@ select.field { appearance: auto; }
   letter-spacing: 0; font-variant-numeric: tabular-nums;
 }
 .flag { margin-right: 7px; font-size: 15px; line-height: 1; }
+
+/* Состояние ядра подписки: видно прямо в заголовке раздела, не надо
+   разворачивать. Красные точки у стран без объяснения — худшее,
+   что может показать программа. */
+.ok-mark { color: var(--accent); font-weight: 600; }
+.bad-mark { color: var(--warn-ink); font-weight: 600; }
+.log-tail {
+  margin: 8px 0 0; padding: 8px 10px; border-radius: 6px;
+  background: var(--surface-2); color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+  white-space: pre-wrap; word-break: break-word; max-height: 140px;
+  overflow: auto;
+}

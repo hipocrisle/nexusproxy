@@ -362,6 +362,10 @@ pub struct SubState {
     enabled: bool,
     countries: Vec<String>,
     dir: String,
+    /// почему ядро не поднялось — если не поднялось
+    error: Option<String>,
+    /// последние строки, сказанные ядром
+    log_tail: String,
 }
 
 #[tauri::command]
@@ -385,6 +389,8 @@ fn sub_state(app: State<App>) -> SubState {
     SubState {
         installed: core::xray::is_installed(&dir),
         running: core::xray::is_running(),
+        error: core::xray::last_error(),
+        log_tail: core::xray::log_tail(&dir, 8),
         url, has_text, enabled, countries,
         dir: dir.to_string_lossy().to_string(),
     }
