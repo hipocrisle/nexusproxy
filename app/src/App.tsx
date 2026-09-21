@@ -623,6 +623,15 @@ function Rules({ onChange }: { onChange: () => void }) {
 
 // На Windows отбираем .exe, на macOS — бандлы .app; в Linux
 // исполняемые файлы расширения не имеют, поэтому не фильтруем вовсе.
+// Что именно сделает запись — видно в списке, без захода в правку.
+function describe(a: LaunchApp): string {
+  const kinds = { auto: "способ выберем сами", chromium: "как Chromium", env: "через переменные окружения" };
+  const parts = [kinds[a.kind]];
+  if (a.webrtc_via_proxy) parts.push("видео и звонки тоже через прокси");
+  if (a.args.length) parts.push("ключи: " + a.args.join(" "));
+  return parts.join(" · ");
+}
+
 // Ключи вводят строкой, как в ярлыке: делим по пробелам, кавычки бережём.
 function splitArgs(text: string): string[] {
   const out: string[] = [];
@@ -654,6 +663,8 @@ function Apps() {
   const [kind, setKind] = useState<LaunchApp["kind"]>("auto");
   const [argsText, setArgsText] = useState("");
   const [webrtc, setWebrtc] = useState(false);
+  // Путь записи, которую правим. Пусто — добавляем новую.
+  const [editing, setEditing] = useState<string | null>(null);
   const [hint, setHint] = useState("");
   const [said, setSaid] = useState("");
 
@@ -689,8 +700,21 @@ function Apps() {
       await invoke("app_save", {
         item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc },
       });
-      setName(""); setPath(""); setKind("auto"); setArgsText(""); setWebrtc(false); load();
+      // путь правили — старая запись осталась бы вторым, мёртвым пунктом
+      if (editing && editing !== path) await invoke("app_remove", { path: editing });
+      reset(); load();
     } catch (e) { alert(String(e)); }
+  };
+
+  const reset = () => {
+    setName(""); setPath(""); setKind("auto");
+    setArgsText(""); setWebrtc(false); setEditing(null);
+  };
+
+  const edit = (a: LaunchApp) => {
+    setName(a.name); setPath(a.path); setKind(a.kind);
+    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy);
+    setEditing(a.path);
   };
 
   const launch = async (p: string) => {
@@ -750,9 +774,14 @@ function Apps() {
             <tbody>
               {items.map(a => (
                 <tr key={a.path}>
-                  <td><b>{a.name}</b><br /><span className="hint mono">{a.path}</span></td>
+                  <td>
+                    <b>{a.name}</b><br />
+                    <span className="hint mono">{a.path}</span><br />
+                    <span className="hint">{describe(a)}</span>
+                  </td>
                   <td style={{ whiteSpace: "nowrap" }}>
                     <button className="primary" onClick={() => launch(a.path)}>Запустить через прокси</button>
+                    <button onClick={() => edit(a)}>Изменить</button>
                     <button onClick={() => remove(a.path)}>Убрать</button>
                   </td>
                 </tr>
