@@ -121,6 +121,13 @@ pub struct Config {
     /// как галки сняли вручную.
     #[serde(default)]
     pub defaults_applied: bool,
+    /// Приложения, запускаемые через нас.
+    ///
+    /// ⛔ Для тех, кто НЕ читает системные настройки прокси: Cursor,
+    /// Electron и часть консольных программ. Их трафик до нас не доходит
+    /// вовсе, поэтому и подбор доменов для них пуст.
+    #[serde(default)]
+    pub apps: Vec<crate::launch::App>,
     /// Подписка со странами. Хранится, чтобы поднимать их при запуске.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
@@ -354,6 +361,7 @@ mod tests {
             minimize_to_tray: true,
             enable_on_start: true,
             defaults_applied: false,
+            apps: Vec::new(),
             subscription: None,
             extra: Default::default(),
         }
