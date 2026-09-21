@@ -112,12 +112,20 @@ pub fn get() -> Health {
     }
 }
 
+/// Наблюдение за прокси — глобальное на всю программу, и `retain`
+/// вычищает из него чужие записи. Тесты бегут в потоках параллельно,
+/// поэтому те из них, кто трогает этот список, обязаны идти по одному —
+/// иначе соседний тест сносит записи под ногами.
+#[cfg(test)]
+pub(crate) static TEST_REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn per_proxy_state_is_kept() {
+        let _one_at_a_time = TEST_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         set_proxy("офис", true, 12, true);
         set_proxy("vpn", false, 0, false);
         let v = proxies();
@@ -147,6 +155,7 @@ mod tests {
 mod retain_tests {
     #[test]
     fn убранный_прокси_исчезает_из_наблюдения() {
+        let _one_at_a_time = super::TEST_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         super::set_proxy("основной", true, 5, true);
         super::set_proxy("WL", true, 7, true);
         super::retain(&["WL".to_string()]);
