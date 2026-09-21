@@ -448,3 +448,29 @@ mod handshake_tests {
                 "пустая строка в логине означает, что входа по логину нет");
     }
 }
+
+/// Пускает ли вышестоящий прокси на этот хост и порт.
+///
+/// Нужно, чтобы не гадать: у корпоративных прокси часто свой белый
+/// список, и «сайт не работает» может значить как «прокси туда не
+/// пускает», так и «хост сам не отвечает» — разные беды, разное лечение.
+pub async fn reach(up: &Upstream, host: &str, port: u16) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    match connect_through(up, host, port).await {
+        Ok(_) => Ok(format!(
+            "{} пускает на {host}:{port} — соединение открылось за {} мс",
+            up.name,
+            started.elapsed().as_millis()
+        )),
+        Err(e) => {
+            let text = e.to_string();
+            // Отличаем отказ самого прокси от молчания хоста за ним.
+            let verdict = if text.contains("рукопожатие") || text.contains("не ответил") {
+                format!("{} сам не отвечает — проверьте адрес и порт прокси", up.name)
+            } else {
+                format!("{} не пускает на {host}:{port}: {text}", up.name)
+            };
+            Err(verdict)
+        }
+    }
+}

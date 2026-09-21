@@ -332,6 +332,11 @@ function Rules({ onChange }: { onChange: () => void }) {
   const [result, setResult] = useState<Bulk | null>(null);
   const [probe, setProbe] = useState("");
   const [verdicts, setVerdicts] = useState<{ host: string; route: string }[]>([]);
+  const [reachHost, setReachHost] = useState("");
+  const [reachPort, setReachPort] = useState("443");
+  const [reachVia, setReachVia] = useSticky("reach.via", "");
+  const [reachSaid, setReachSaid] = useState("");
+  const [reaching, setReaching] = useState(false);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [filter, setFilter] = useSticky("rules.filter", "");
   const [editing, setEditing] = useState<string | null>(null);
@@ -379,6 +384,17 @@ function Rules({ onChange }: { onChange: () => void }) {
     setVerdicts(await invoke("check", { hosts }));
   };
 
+
+  // Настоящее соединение через прокси: отличает «не пускает» от «молчит».
+  const doReach = async () => {
+    setReaching(true); setReachSaid("");
+    try {
+      setReachSaid(await invoke<string>("reach_check", {
+        host: reachHost.trim(), port: Number(reachPort) || 443, via: reachVia,
+      }));
+    } catch (e) { setReachSaid(String(e)); }
+    finally { setReaching(false); }
+  };
   const plain = items.filter((i) => !i.pattern.startsWith("_"));
   const shown = plain.filter((i) => !filter || i.pattern.toLowerCase().includes(filter.toLowerCase()));
   const copyAll = () => navigator.clipboard.writeText(shown.map((i) => i.pattern).join("\n"));
@@ -515,6 +531,31 @@ function Rules({ onChange }: { onChange: () => void }) {
             ))}
           </div>
         )}
+      </div>
+
+      <div className="card">
+        <h3>Пускает ли прокси на этот адрес</h3>
+        <p className="hint">
+          Настоящее соединение, а не разбор правил. У корпоративных прокси
+          свой список разрешённого, и «не работает» может значить как
+          «прокси туда не пускает», так и «сам адрес молчит» — лечится это
+          по-разному.
+        </p>
+        <div className="row">
+          <input className="field" value={reachHost} placeholder="turn-fra-1.dolby.io"
+            onChange={(e) => setReachHost(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && doReach()} />
+          <input className="field" value={reachPort} style={{ maxWidth: 80 }}
+            onChange={(e) => setReachPort(e.target.value)} />
+          <select value={reachVia} onChange={(e) => setReachVia(e.target.value)}>
+            <option value="">по умолчанию</option>
+            {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+          </select>
+          <button className="btn" onClick={doReach} disabled={reaching || !reachHost.trim()}>
+            {reaching ? "Проверяю…" : "Проверить"}
+          </button>
+        </div>
+        {reachSaid && <p className="hint" style={{ marginTop: 8 }}>{reachSaid}</p>}
       </div>
 
       <div className="card wide">

@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, State, WindowEvent};
 
 pub struct App {
     engine: Mutex<Option<Arc<core::Engine>>>,
@@ -830,6 +830,25 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
                item.name, core::launch::explain(&item, socks, http)))
 }
 
+/// Пускает ли выбранный прокси на этот хост и порт — чтобы отличать
+/// «прокси туда не пускает» от «хост сам молчит».
+#[tauri::command]
+async fn reach_check(app: AppHandle, host: String, port: u16, via: String) -> Result<String, String> {
+    let host = host.trim().to_string();
+    if host.is_empty() {
+        return Err("не указан адрес".into());
+    }
+    let up = {
+        let state = app.state::<App>();
+        let e = engine(&state)?;
+        let c = e.cfg.lock().unwrap();
+        let name = if via.trim().is_empty() { c.default_upstream.clone() } else { via };
+        c.all_upstreams().into_iter().find(|u| u.name == name)
+            .ok_or_else(|| format!("прокси «{name}» не найден"))?
+    };
+    core::upstream::reach(&up, &host, port).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -987,7 +1006,8 @@ pub fn run() {
             sub_state, sub_install, sub_load, sub_apply, sub_disable,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
-            apps_list, app_save, app_remove, app_explain, app_launch
+            apps_list, app_save, app_remove, app_explain, app_launch,
+            reach_check
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
