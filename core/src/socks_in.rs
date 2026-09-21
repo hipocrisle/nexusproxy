@@ -8,7 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
-                    rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
+                    rules: Arc<std::sync::RwLock<Rules>>,
+                    apps: Arc<std::sync::RwLock<crate::approutes::AppRoutes>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
     let app = c.peer_addr().map(|a| crate::proc::app_by_port(a.port())).unwrap_or_default();
@@ -66,7 +67,7 @@ pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
     c.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
 
-    match dial(&routing, &rules, &host, port).await {
+    match dial(&routing, &rules, &apps, &app, &host, port).await {
         Ok((server, d)) => {
             reply(&mut c, 0x00).await?;
             let (id, counters, kill) = crate::conns::open(&host, port, d.route.tag(), &d.via, &app);

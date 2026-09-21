@@ -12,7 +12,8 @@ use tokio::net::TcpStream;
 const MAX_HEAD: usize = 64 * 1024;
 
 pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
-                    rules: Arc<std::sync::RwLock<Rules>>) -> io::Result<()>
+                    rules: Arc<std::sync::RwLock<Rules>>,
+                    apps: Arc<std::sync::RwLock<crate::approutes::AppRoutes>>) -> io::Result<()>
 {
     c.set_nodelay(true).ok();
     // порт клиента нужен, чтобы понять, какое приложение пришло
@@ -46,7 +47,7 @@ pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target, 443)?;
-        return match dial(&routing, &rules, &host, port).await {
+        return match dial(&routing, &rules, &apps, &app, &host, port).await {
             Ok((mut server, d)) => {
                 c.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
                 // всё, что клиент успел прислать после заголовка, — уже полезные данные
@@ -75,7 +76,7 @@ pub async fn handle(mut c: TcpStream, routing: Arc<std::sync::RwLock<Routing>>,
 
     // обычный запрос в абсолютной форме: GET http://host/path
     let (host, port, path) = split_absolute(&target)?;
-    let (mut server, d) = match dial(&routing, &rules, &host, port).await {
+    let (mut server, d) = match dial(&routing, &rules, &apps, &app, &host, port).await {
         Ok(v) => v,
         Err(e) => {
             respond(&mut c, 502, "Bad Gateway").await.ok();

@@ -26,6 +26,15 @@ pub struct App {
     /// Свои доводы при запуске, если нужны.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Через какой прокси идёт ВЕСЬ трафик этой программы.
+    ///
+    /// Пусто — программа подчиняется общим правилам по доменам, как
+    /// и всё остальное. Имя прокси — весь её трафик уходит туда, а
+    /// доменные правила к ней не применяются: именно этого ждут от
+    /// «запустить программу через прокси», иначе получается мешанина,
+    /// где запущенная через нас программа всё равно ходит напрямую.
+    #[serde(default)]
+    pub via: String,
     /// Гнать через прокси и WebRTC — видеозвонки и трансляции.
     ///
     /// Без этого Chromium ведёт медиа по UDP мимо прокси: в обычной
@@ -193,10 +202,10 @@ mod tests {
     #[test]
     fn человеку_объясняем_способ_до_запуска() {
         let a = App { name: "Cursor".into(), path: "Cursor.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("socks5"));
         let b = App { name: "Своё".into(), path: "my.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
         assert!(explain(&b, 18081, 18080).contains("HTTP_PROXY"));
     }
 
@@ -212,7 +221,7 @@ mod tests {
     #[test]
     fn несуществующий_файл_отвергается_с_объяснением() {
         let a = App { name: "Нет".into(), path: "/нет/такого".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
         let e = start(&a, 18081, 18080).unwrap_err();
         assert!(e.contains("не найден"), "{e}");
     }
@@ -227,7 +236,7 @@ mod webrtc_tests {
     #[test]
     fn webrtc_через_прокси_виден_до_запуска() {
         let mut a = App { name: "Chrome".into(), path: "chrome.exe".into(),
-                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true };
+                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("WebRTC"),
                 "человек должен видеть это до запуска");
         a.webrtc_via_proxy = false;
@@ -238,7 +247,7 @@ mod webrtc_tests {
     fn свои_ключи_показываются() {
         let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
                       kind: Kind::Chromium, args: vec!["--incognito".into()],
-                      webrtc_via_proxy: false };
+                      webrtc_via_proxy: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("--incognito"));
     }
 }

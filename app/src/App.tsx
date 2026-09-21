@@ -626,7 +626,7 @@ function Rules({ onChange }: { onChange: () => void }) {
 // Что именно сделает запись — видно в списке, без захода в правку.
 function describe(a: LaunchApp): string {
   const kinds = { auto: "способ выберем сами", chromium: "как Chromium", env: "через переменные окружения" };
-  const parts = [kinds[a.kind]];
+  const parts = [a.via ? `весь трафик через «${a.via}»` : "по общим правилам", kinds[a.kind]];
   if (a.webrtc_via_proxy) parts.push("видео и звонки тоже через прокси");
   if (a.args.length) parts.push("ключи: " + a.args.join(" "));
   return parts.join(" · ");
@@ -650,7 +650,7 @@ const EXE_FILTERS = (() => {
 
 type LaunchApp = {
   name: string; path: string; kind: "auto" | "chromium" | "env";
-  args: string[]; webrtc_via_proxy: boolean;
+  args: string[]; webrtc_via_proxy: boolean; via: string;
 };
 
 /// Cursor, VS Code и прочий Electron системные настройки прокси не читают —
@@ -665,11 +665,15 @@ function Apps() {
   const [webrtc, setWebrtc] = useState(false);
   // Путь записи, которую правим. Пусто — добавляем новую.
   const [editing, setEditing] = useState<string | null>(null);
+  const [via, setVia] = useState("");
+  const [ups, setUps] = useState<Upstream[]>([]);
   const [hint, setHint] = useState("");
   const [said, setSaid] = useState("");
 
   const load = useCallback(() => {
     invoke<LaunchApp[]>("apps_list").then(setItems).catch(() => {});
+    invoke<{ upstreams: Upstream[] }>("upstreams_list")
+      .then((u) => setUps(u.upstreams)).catch(() => {});
   }, []);
   useEffect(load, [load]);
 
@@ -677,9 +681,9 @@ function Apps() {
   useEffect(() => {
     if (!path.trim()) { setHint(""); return; }
     invoke<string>("app_explain", {
-      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc },
+      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, via },
     }).then(setHint).catch(() => setHint(""));
-  }, [path, kind, name, argsText, webrtc]);
+  }, [path, kind, name, argsText, webrtc, via]);
 
   const pick = async () => {
     const picked = await openFile({
@@ -698,7 +702,7 @@ function Apps() {
     if (!path.trim()) return;
     try {
       await invoke("app_save", {
-        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc },
+        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, via },
       });
       // путь правили — старая запись осталась бы вторым, мёртвым пунктом
       if (editing && editing !== path) await invoke("app_remove", { path: editing });
@@ -708,12 +712,12 @@ function Apps() {
 
   const reset = () => {
     setName(""); setPath(""); setKind("auto");
-    setArgsText(""); setWebrtc(false); setEditing(null);
+    setArgsText(""); setWebrtc(false); setVia(""); setEditing(null);
   };
 
   const edit = (a: LaunchApp) => {
     setName(a.name); setPath(a.path); setKind(a.kind);
-    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy);
+    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy); setVia(a.via || "");
     setEditing(a.path);
   };
 
@@ -752,6 +756,19 @@ function Apps() {
         </select>
         <button className="primary" onClick={save} disabled={!path.trim()}>Добавить</button>
       </div>
+      <div className="row wrap">
+        <span className="hint">Весь трафик программы вести через:</span>
+        <select value={via} onChange={e => setVia(e.target.value)}>
+          <option value="">по правилам, как обычно</option>
+          {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+        </select>
+      </div>
+      <p className="hint">
+        Выбрав прокси, вы отправляете туда <b>всё</b>, что делает программа,
+        и доменные правила к ней больше не применяются — так работает
+        Proxifier. «По правилам» оставляет программу жить общей жизнью:
+        через прокси уйдёт только то, что совпало с правилом.
+      </p>
       <div className="row wrap">
         <input value={argsText} onChange={e => setArgsText(e.target.value)}
                placeholder="Свои ключи запуска, через пробел" style={{ flex: 1, minWidth: 260 }} />
