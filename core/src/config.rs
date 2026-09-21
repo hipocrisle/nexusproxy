@@ -82,13 +82,6 @@ pub struct RouteGroup {
     pub patterns: Vec<String>,
 }
 
-/// Что при режиме «всё через прокси» всё равно идёт напрямую.
-const LOCAL_NETWORKS: &[&str] = &[
-    "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12",
-    "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10",
-    "localhost",
-];
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Старый формат: единственный прокси отдельным полем.
@@ -113,15 +106,6 @@ pub struct Config {
     /// Исключения: идут напрямую, даже если попали под правило выше.
     #[serde(default)]
     pub direct: Vec<String>,
-    /// Через прокси идёт ВСЁ, кроме перечисленного в `direct`.
-    ///
-    /// Нужно там, где прямого выхода в интернет нет вовсе и весь трафик
-    /// обязан идти через корпоративный прокси: при обычном порядке
-    /// страница тянет картинки и скрипты с чужих доменов, те под правила
-    /// не попадают, уходят «напрямую» — и упираются в пустоту. Внешне
-    /// это выглядит как «половина вкладок не открывается».
-    #[serde(default)]
-    pub proxy_by_default: bool,
     /// Повторять подключение, если вышестоящий прокси на мгновение отвалился,
     /// и следить за его доступностью. Выключается, если мешает.
     #[serde(default = "yes")]
@@ -311,14 +295,7 @@ impl Config {
     }
 
     pub fn rules(&self) -> Result<Rules, String> {
-        let mut r = Rules::new(if self.proxy_by_default { Route::proxy() } else { Route::Direct });
-        // Свои же машины через прокси гонять нельзя: он до них не достанет,
-        // а перехват системных настроек направит к нам и localhost.
-        if self.proxy_by_default {
-            for local in LOCAL_NETWORKS {
-                r.add(local, Route::Direct)?;
-            }
-        }
+        let mut r = Rules::new(Route::Direct);
         // исключения проверяются раньше — первое совпадение побеждает
         for p in &self.direct {
             r.add(p, Route::Direct)?;
@@ -380,7 +357,6 @@ mod tests {
             groups: vec![],
             through_proxy: through.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
-            proxy_by_default: false,
             auto_reconnect: true,
             minimize_to_tray: true,
             enable_on_start: true,
@@ -611,42 +587,3 @@ mod remove_tests {
     }
 }
 
-#[cfg(test)]
-mod proxy_by_default_tests {
-    use super::tests::cfg;
-    use crate::rules::Route;
-
-    /// В сети без прямого выхода «напрямую» означает «никуда»: страница
-    /// тянет картинки с чужих доменов, они под правила не попадают — и
-    /// половина вкладок не открывается. Тут всё должно идти через прокси.
-    #[test]
-    fn неизвестный_домен_идёт_через_прокси() {
-        let mut c = cfg(&["grid.gg"], &[]);
-        c.proxy_by_default = true;
-        let r = c.rules().unwrap();
-        assert!(r.decide("cdn.чужой-домен.example").is_proxy(),
-                "всё неперечисленное обязано идти через прокси");
-        assert!(r.decide("grid.gg").is_proxy());
-    }
-
-    /// Свои же машины прокси не достанет, а перехват направит к нам
-    /// даже обращение к localhost — получилась бы петля.
-    #[test]
-    fn свои_адреса_остаются_напрямую() {
-        let mut c = cfg(&[], &[]);
-        c.proxy_by_default = true;
-        let r = c.rules().unwrap();
-        for own in ["127.0.0.1", "192.168.1.5", "10.8.0.1", "localhost"] {
-            assert_eq!(r.decide(own), Route::Direct, "{own} обязан идти напрямую");
-        }
-    }
-
-    /// Обычный порядок не должен измениться от появления нового режима.
-    #[test]
-    fn обычный_режим_не_изменился() {
-        let c = cfg(&["grid.gg"], &[]);
-        let r = c.rules().unwrap();
-        assert_eq!(r.decide("cdn.чужой-домен.example"), Route::Direct);
-        assert!(r.decide("grid.gg").is_proxy());
-    }
-}
