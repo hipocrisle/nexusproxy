@@ -8,6 +8,7 @@ pub mod http_in;
 pub mod failures;
 pub mod health;
 pub mod journal;
+pub mod launch;
 pub mod logfile;
 pub mod macproxy;
 pub mod presets;

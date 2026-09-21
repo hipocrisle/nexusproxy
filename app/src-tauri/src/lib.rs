@@ -754,6 +754,7 @@ fn default_config() -> core::config::Config {
         enable_on_start: true,
         defaults_applied: false,
         subscription: None,
+        apps: vec![],
         extra: Default::default(),
     }
 }
@@ -762,6 +763,71 @@ fn default_config() -> core::config::Config {
 /// в систему окно лезет на передний план.
 fn started_hidden() -> bool {
     std::env::args().any(|a| a == "--hidden" || a == "--minimized")
+}
+
+/// Список приложений, запускаемых через нас.
+///
+/// ⛔ Нужно тем, кто НЕ читает системные настройки прокси: Cursor,
+/// Electron и часть консольных программ. Их трафик до нас не доходит
+/// вовсе, поэтому и подбор доменов для них пуст — он показывает только
+/// то, что через нас прошло.
+#[tauri::command]
+fn apps_list(app: State<App>) -> Vec<core::launch::App> {
+    match engine(&app) {
+        Ok(e) => e.cfg.lock().unwrap().apps.clone(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[tauri::command]
+fn app_save(state: State<App>, item: core::launch::App) -> Result<(), String> {
+    if item.path.trim().is_empty() {
+        return Err("не указан путь к программе".into());
+    }
+    let e = engine(&state)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        match c.apps.iter_mut().find(|a| a.path == item.path) {
+            Some(x) => *x = item,
+            None => c.apps.push(item),
+        }
+    }
+    e.apply_and_save()
+}
+
+#[tauri::command]
+fn app_remove(state: State<App>, path: String) -> Result<(), String> {
+    let e = engine(&state)?;
+    e.cfg.lock().unwrap().apps.retain(|a| a.path != path);
+    e.apply_and_save()
+}
+
+/// На каких портах мы слушаем — берём из живого движка.
+fn ports(state: &State<App>) -> (u16, u16) {
+    match engine(state) {
+        Ok(e) => { let c = e.cfg.lock().unwrap(); (c.listen.socks, c.listen.http) }
+        Err(_) => (18081, 18080),
+    }
+}
+
+/// Чем именно передадим прокси — показываем ДО запуска, чтобы не гадать.
+#[tauri::command]
+fn app_explain(state: State<App>, item: core::launch::App) -> String {
+    let (socks, http) = ports(&state);
+    core::launch::explain(&item, socks, http)
+}
+
+#[tauri::command]
+fn app_launch(state: State<App>, path: String) -> Result<String, String> {
+    let item = {
+        let e = engine(&state)?;
+        let c = e.cfg.lock().unwrap();
+        c.apps.iter().find(|a| a.path == path).cloned()
+    }.ok_or("такого приложения нет в списке")?;
+    let (socks, http) = ports(&state);
+    let pid = core::launch::start(&item, socks, http)?;
+    Ok(format!("{} запущен через прокси ({}), процесс {pid}",
+               item.name, core::launch::explain(&item, socks, http)))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -920,7 +986,8 @@ pub fn run() {
             override_set, override_clear, overrides_list, proxies_in_use,
             sub_state, sub_install, sub_load, sub_apply, sub_disable,
             discovery_start, discovery_live, discovery_stop,
-            system_proxy, settings_save, set_flag, quit
+            system_proxy, settings_save, set_flag, quit,
+            apps_list, app_save, app_remove, app_explain, app_launch
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

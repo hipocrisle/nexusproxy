@@ -104,7 +104,7 @@ const routeLabel: Record<string, string> = { proxy: "через прокси", d
 type Theme = "system" | "light" | "dark";
 
 export default function App() {
-  const [tab, setTab] = useSticky<"rules" | "discover" | "conns" | "log" | "settings">("tab", "rules");
+  const [tab, setTab] = useSticky<"rules" | "apps" | "discover" | "conns" | "log" | "settings">("tab", "rules");
   const [st, setSt] = useState<Status | null>(null);
   const [version, setVersion] = useState("");
   useEffect(() => {
@@ -185,7 +185,7 @@ export default function App() {
       <Alerts st={st} onChange={refresh} />
 
       <div className="tabs">
-        {([["rules", "Правила"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
+        {([["rules", "Правила"], ["apps", "Программы"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
            ["log", "Журнал"], ["settings", "Настройки"]] as const)
           .map(([k, label]) => (
             <button key={k} className={"tab" + (tab === k ? " sel" : "")} onClick={() => setTab(k)}>
@@ -196,6 +196,7 @@ export default function App() {
 
       <div className="body">
         {tab === "rules" && <Rules onChange={refresh} />}
+          {tab === "apps" && <Apps />}
         {tab === "discover" && <Discover active={!!st?.discovering} onChange={refresh} />}
         {tab === "conns" && <Connections />}
         {tab === "log" && <Log />}
@@ -572,6 +573,122 @@ function Rules({ onChange }: { onChange: () => void }) {
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/* ─────────────── Программы ─────────────── */
+
+// На Windows отбираем .exe, на macOS — бандлы .app; в Linux
+// исполняемые файлы расширения не имеют, поэтому не фильтруем вовсе.
+const EXE_FILTERS = (() => {
+  const ua = navigator.userAgent;
+  if (ua.includes("Windows")) return [{ name: "Программа", extensions: ["exe"] }];
+  if (ua.includes("Mac")) return [{ name: "Программа", extensions: ["app"] }];
+  return [];
+})();
+
+type LaunchApp = { name: string; path: string; kind: "auto" | "chromium" | "env"; args: string[] };
+
+/// Cursor, VS Code и прочий Electron системные настройки прокси не читают —
+/// их трафик до нас не доходит, поэтому и «Подбор доменов» по ним пуст.
+/// Здесь мы запускаем такую программу сами, передав ей адрес прокси напрямую.
+function Apps() {
+  const [items, setItems] = useState<LaunchApp[]>([]);
+  const [name, setName] = useState("");
+  const [path, setPath] = useState("");
+  const [kind, setKind] = useState<LaunchApp["kind"]>("auto");
+  const [hint, setHint] = useState("");
+  const [said, setSaid] = useState("");
+
+  const load = useCallback(() => {
+    invoke<LaunchApp[]>("apps_list").then(setItems).catch(() => {});
+  }, []);
+  useEffect(load, [load]);
+
+  // Показываем ключ запуска ДО того, как человек нажмёт «Запустить».
+  useEffect(() => {
+    if (!path.trim()) { setHint(""); return; }
+    invoke<string>("app_explain", { item: { name: name || "программа", path, kind, args: [] } })
+      .then(setHint).catch(() => setHint(""));
+  }, [path, kind, name]);
+
+  const pick = async () => {
+    const picked = await openFile({
+      multiple: false,
+      filters: EXE_FILTERS,
+    });
+    if (typeof picked !== "string") return;
+    setPath(picked);
+    if (!name.trim()) {
+      const base = picked.split(/[\\/]/).pop() || "";
+      setName(base.replace(/\.(exe|app)$/i, ""));
+    }
+  };
+
+  const save = async () => {
+    if (!path.trim()) return;
+    try {
+      await invoke("app_save", { item: { name: name.trim() || path, path, kind, args: [] } });
+      setName(""); setPath(""); setKind("auto"); load();
+    } catch (e) { alert(String(e)); }
+  };
+
+  const launch = async (p: string) => {
+    setSaid("");
+    try { setSaid(await invoke<string>("app_launch", { path: p })); }
+    catch (e) { alert(String(e)); }
+  };
+
+  const remove = async (p: string) => {
+    try { await invoke("app_remove", { path: p }); load(); } catch (e) { alert(String(e)); }
+  };
+
+  return (
+    <div className="pane">
+      <p className="hint">
+        Некоторые программы — Cursor, VS Code, часть консольных —
+        не смотрят в системные настройки прокси. Добавьте их сюда и
+        запускайте отсюда: адрес прокси мы передадим им напрямую.
+      </p>
+      <p className="hint">
+        ⚠️ Перед запуском закройте программу полностью. Иначе она просто
+        откроет новое окно уже работающей копии — без прокси.
+      </p>
+
+      <div className="row wrap">
+        <input value={name} onChange={e => setName(e.target.value)}
+               placeholder="Название" style={{ width: 160 }} />
+        <input value={path} onChange={e => setPath(e.target.value)}
+               placeholder="Путь к программе" style={{ flex: 1, minWidth: 220 }} />
+        <button onClick={pick}>Выбрать…</button>
+        <select value={kind} onChange={e => setKind(e.target.value as LaunchApp["kind"])}>
+          <option value="auto">Определить самим</option>
+          <option value="chromium">Как Chromium</option>
+          <option value="env">Через переменные окружения</option>
+        </select>
+        <button className="primary" onClick={save} disabled={!path.trim()}>Добавить</button>
+      </div>
+      {hint && <p className="hint mono">{hint}</p>}
+
+      {items.length === 0
+        ? <p className="hint">Пока ничего не добавлено.</p>
+        : <table className="list">
+            <tbody>
+              {items.map(a => (
+                <tr key={a.path}>
+                  <td><b>{a.name}</b><br /><span className="hint mono">{a.path}</span></td>
+                  <td style={{ whiteSpace: "nowrap" }}>
+                    <button className="primary" onClick={() => launch(a.path)}>Запустить через прокси</button>
+                    <button onClick={() => remove(a.path)}>Убрать</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>}
+
+      {said && <p className="hint">{said}</p>}
     </div>
   );
 }
