@@ -26,6 +26,7 @@ pub struct Status {
     auto_reconnect: bool,
     minimize_to_tray: bool,
     enable_on_start: bool,
+    proxy_by_default: bool,
     default_upstream: String,
     rules_count: usize,
     upstream_up: bool,
@@ -59,6 +60,7 @@ fn status(app: State<App>) -> Status {
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,
                 enable_on_start: c.enable_on_start,
+                proxy_by_default: c.proxy_by_default,
                 os: std::env::consts::OS.to_string(),
                 default_upstream: c.default_upstream.clone(),
                 rules_count: c.through_proxy.iter().filter(|s| !s.starts_with('_')).count(),
@@ -73,6 +75,7 @@ fn status(app: State<App>) -> Status {
             running: false, upstream: String::new(), http_port: 0, socks_port: 0,
             system_on: false, discovering: false,
             auto_reconnect: true, minimize_to_tray: true, enable_on_start: true,
+            proxy_by_default: false,
             os: std::env::consts::OS.to_string(),
             default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
@@ -683,6 +686,7 @@ fn set_flag(app: State<App>, name: String, value: bool) -> Result<(), String> {
             }
             "minimize_to_tray" => c.minimize_to_tray = value,
             "enable_on_start" => c.enable_on_start = value,
+            "proxy_by_default" => c.proxy_by_default = value,
             other => return Err(format!("неизвестная настройка: {other}")),
         }
     }
@@ -755,6 +759,7 @@ fn default_config() -> core::config::Config {
         defaults_applied: false,
         subscription: None,
         apps: vec![],
+        proxy_by_default: false,
         extra: Default::default(),
     }
 }

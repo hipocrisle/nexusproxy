@@ -11,7 +11,7 @@ type Status = {
   running: boolean; upstream: string; http_port: number; socks_port: number;
   system_on: boolean; discovering: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
-  enable_on_start: boolean; default_upstream: string;
+  enable_on_start: boolean; proxy_by_default: boolean; default_upstream: string;
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
@@ -1170,6 +1170,18 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           То же, что нажать «Включить» в шапке: программа прописывается
           в системные настройки прокси, и приложения начинают ходить через неё.
           Без галки после запуска нужно включать вручную.
+        </p>
+        <label className="check" style={{ marginTop: 12 }}>
+          <input type="checkbox" checked={st?.proxy_by_default ?? false}
+            onChange={(e) => invoke("set_flag", { name: "proxy_by_default", value: e.target.checked }).then(onSaved)} />
+          Через прокси идёт всё, кроме исключений
+        </label>
+        <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
+          Для сетей, где прямого выхода в интернет нет вовсе. Обычно
+          наоборот: через прокси идёт только перечисленное, остальное —
+          напрямую. Но если «напрямую» никуда не ведёт, страница не
+          дотянется до чужих картинок и скриптов, и половина вкладок
+          не откроется. Свои адреса и локальная сеть исключаются сами.
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
