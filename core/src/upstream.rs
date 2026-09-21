@@ -89,8 +89,22 @@ pub struct Decision {
 }
 
 pub async fn dial(routing: &std::sync::RwLock<Routing>, rules: &std::sync::RwLock<Rules>,
+                  apps: &std::sync::RwLock<crate::approutes::AppRoutes>,
+                  app: &crate::proc::AppInfo,
                   host: &str, port: u16) -> io::Result<(TcpStream, Decision)> {
-    let route = rules.read().unwrap().decide(host);
+    // Прокси, назначенный программе, сильнее доменных правил: «вести эту
+    // программу через прокси» значит весь её трафик, а не ту его часть,
+    // что совпала с доменом. Свои же адреса — всё равно напрямую, до них
+    // никакой прокси не достанет.
+    let by_app = if is_own_address(host) {
+        None
+    } else {
+        apps.read().unwrap().route_for(app).map(|v| Route::Proxy(v.to_string()))
+    };
+    let route = match by_app {
+        Some(r) => r,
+        None => rules.read().unwrap().decide(host),
+    };
     if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
         let mark = route.label();
         println!("  {mark}  {host}:{port}");
@@ -152,6 +166,21 @@ pub async fn dial(routing: &std::sync::RwLock<Routing>, rules: &std::sync::RwLoc
         Err(e) => crate::failures::note(host, &route, &d.via, &e.to_string()),
     }
     Ok((stream?, d))
+}
+
+/// Свои же машины: прокси до них не достанет, а перехват направляет
+/// к нам даже обращение к самому себе.
+fn is_own_address(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback() || a.is_private() || a.is_link_local(),
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.segments()[0] & 0xfe00 == 0xfc00
+                                        || a.segments()[0] & 0xffc0 == 0xfe80,
+        Err(_) => false,
+    }
 }
 
 /// Открыть соединение через указанный прокси — каким бы протоколом он ни говорил.

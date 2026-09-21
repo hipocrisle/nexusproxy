@@ -8,6 +8,7 @@ pub mod http_in;
 pub mod failures;
 pub mod health;
 pub mod journal;
+pub mod approutes;
 pub mod launch;
 pub mod logfile;
 pub mod macproxy;
@@ -30,6 +31,8 @@ use tokio::net::TcpListener;
 pub struct Engine {
     pub cfg: Arc<Mutex<config::Config>>,
     pub rules: Arc<RwLock<rules::Rules>>,
+    /// Какой программе какой прокси — сильнее доменных правил.
+    pub apps: Arc<RwLock<approutes::AppRoutes>>,
     /// Куда идти: список прокси и временные подмены.
     pub routing: Arc<RwLock<upstream::Routing>>,
     /// Пинок сторожу: проверить прокси немедленно, не дожидаясь очередного круга.
@@ -79,6 +82,7 @@ impl Engine {
         cfg.migrate();
         cfg.check_links()?;
         let rules = Arc::new(RwLock::new(cfg.rules()?));
+        let apps = Arc::new(RwLock::new(approutes::AppRoutes::build(&cfg.apps)));
         let routing = Arc::new(RwLock::new(upstream::Routing {
             pool: build_pool(&cfg),
             overrides: Default::default(),
@@ -94,6 +98,7 @@ impl Engine {
         let e = Arc::new(Engine {
             cfg: Arc::new(Mutex::new(cfg)),
             rules: rules.clone(),
+            apps: apps.clone(),
             routing: routing.clone(),
             recheck: recheck.clone(),
             path: path.to_string(),
@@ -105,13 +110,13 @@ impl Engine {
         // ⛔ Раньше здесь было `while let Ok(...) = accept()`, и любая
         // случайная ошибка приёма навсегда убивала вход — молча, без следа.
         // Теперь ошибка только записывается, а цикл продолжается.
-        let (u1, r1) = (routing.clone(), rules.clone());
+        let (u1, r1, a1) = (routing.clone(), rules.clone(), apps.clone());
         let t1 = tokio::spawn(async move {
             loop {
                 match http.accept().await {
                     Ok((c, _)) => {
-                        let (u, r) = (u1.clone(), r1.clone());
-                        tokio::spawn(async move { let _ = http_in::handle(c, u, r).await; });
+                        let (u, r, a) = (u1.clone(), r1.clone(), a1.clone());
+                        tokio::spawn(async move { let _ = http_in::handle(c, u, r, a).await; });
                     }
                     Err(e) => {
                         logfile::line(&logfile::now_stamp(), &format!("вход HTTP: {e}"));
@@ -120,13 +125,13 @@ impl Engine {
                 }
             }
         });
-        let (u2, r2) = (routing.clone(), rules.clone());
+        let (u2, r2, a2) = (routing.clone(), rules.clone(), apps.clone());
         let t2 = tokio::spawn(async move {
             loop {
                 match socks.accept().await {
                     Ok((c, _)) => {
-                        let (u, r) = (u2.clone(), r2.clone());
-                        tokio::spawn(async move { let _ = socks_in::handle(c, u, r).await; });
+                        let (u, r, a) = (u2.clone(), r2.clone(), a2.clone());
+                        tokio::spawn(async move { let _ = socks_in::handle(c, u, r, a).await; });
                     }
                     Err(e) => {
                         logfile::line(&logfile::now_stamp(), &format!("вход SOCKS: {e}"));
@@ -372,6 +377,7 @@ impl Engine {
         let c = self.cfg.lock().unwrap();
         c.check_links()?;
         *self.rules.write().unwrap() = c.rules()?;
+        *self.apps.write().unwrap() = approutes::AppRoutes::build(&c.apps);
         let pool = build_pool(&c);
         // пишем состав в журнал: если прокси не появился, здесь будет видно,
         // дошёл он до движка или потерялся раньше
