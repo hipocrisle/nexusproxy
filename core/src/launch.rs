@@ -26,6 +26,13 @@ pub struct App {
     /// Свои доводы при запуске, если нужны.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Гнать через прокси и WebRTC — видеозвонки и трансляции.
+    ///
+    /// Без этого Chromium ведёт медиа по UDP мимо прокси: в обычной
+    /// сети так быстрее, но там, где наружу пускает только прокси,
+    /// видео просто не появляется. Ключ запрещает такой обход.
+    #[serde(default)]
+    pub webrtc_via_proxy: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -63,10 +70,23 @@ pub fn detect(path: &str) -> Kind {
 /// Как именно запустим — показываем человеку до запуска, чтобы не гадал.
 pub fn explain(app: &App, socks_port: u16, http_port: u16) -> String {
     match if app.kind == Kind::Auto { detect(&app.path) } else { app.kind } {
-        Kind::Chromium => format!(
-            "ключ --proxy-server=socks5://127.0.0.1:{socks_port}"),
-        _ => format!(
-            "переменные HTTP_PROXY и HTTPS_PROXY на 127.0.0.1:{http_port}"),
+        Kind::Chromium => {
+            let mut t = format!("ключ --proxy-server=socks5://127.0.0.1:{socks_port}");
+            if app.webrtc_via_proxy {
+                t.push_str(", WebRTC тоже через прокси");
+            }
+            if !app.args.is_empty() {
+                t.push_str(&format!(", свои ключи: {}", app.args.join(" ")));
+            }
+            t
+        }
+        _ => {
+            let mut t = format!("переменные HTTP_PROXY и HTTPS_PROXY на 127.0.0.1:{http_port}");
+            if !app.args.is_empty() {
+                t.push_str(&format!(", свои ключи: {}", app.args.join(" ")));
+            }
+            t
+        }
     }
 }
 
@@ -124,6 +144,9 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
             cmd.arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"));
             // без этого Chromium ходит мимо прокси за своими адресами
             cmd.arg("--proxy-bypass-list=<-loopback>");
+            if app.webrtc_via_proxy {
+                cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
+            }
         }
         _ => {
             let http = format!("http://127.0.0.1:{http_port}");
@@ -170,10 +193,10 @@ mod tests {
     #[test]
     fn человеку_объясняем_способ_до_запуска() {
         let a = App { name: "Cursor".into(), path: "Cursor.exe".into(),
-                      kind: Kind::Auto, args: vec![] };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
         assert!(explain(&a, 18081, 18080).contains("socks5"));
         let b = App { name: "Своё".into(), path: "my.exe".into(),
-                      kind: Kind::Auto, args: vec![] };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
         assert!(explain(&b, 18081, 18080).contains("HTTP_PROXY"));
     }
 
@@ -189,8 +212,33 @@ mod tests {
     #[test]
     fn несуществующий_файл_отвергается_с_объяснением() {
         let a = App { name: "Нет".into(), path: "/нет/такого".into(),
-                      kind: Kind::Auto, args: vec![] };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false };
         let e = start(&a, 18081, 18080).unwrap_err();
         assert!(e.contains("не найден"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod webrtc_tests {
+    use super::*;
+
+    /// Chromium по умолчанию ведёт медиа по UDP мимо прокси. Там, где
+    /// наружу пускает только прокси, из-за этого просто нет видео.
+    #[test]
+    fn webrtc_через_прокси_виден_до_запуска() {
+        let mut a = App { name: "Chrome".into(), path: "chrome.exe".into(),
+                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true };
+        assert!(explain(&a, 18081, 18080).contains("WebRTC"),
+                "человек должен видеть это до запуска");
+        a.webrtc_via_proxy = false;
+        assert!(!explain(&a, 18081, 18080).contains("WebRTC"));
+    }
+
+    #[test]
+    fn свои_ключи_показываются() {
+        let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
+                      kind: Kind::Chromium, args: vec!["--incognito".into()],
+                      webrtc_via_proxy: false };
+        assert!(explain(&a, 18081, 18080).contains("--incognito"));
     }
 }

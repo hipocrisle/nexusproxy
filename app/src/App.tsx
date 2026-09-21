@@ -623,6 +623,15 @@ function Rules({ onChange }: { onChange: () => void }) {
 
 // На Windows отбираем .exe, на macOS — бандлы .app; в Linux
 // исполняемые файлы расширения не имеют, поэтому не фильтруем вовсе.
+// Ключи вводят строкой, как в ярлыке: делим по пробелам, кавычки бережём.
+function splitArgs(text: string): string[] {
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+
 const EXE_FILTERS = (() => {
   const ua = navigator.userAgent;
   if (ua.includes("Windows")) return [{ name: "Программа", extensions: ["exe"] }];
@@ -630,7 +639,10 @@ const EXE_FILTERS = (() => {
   return [];
 })();
 
-type LaunchApp = { name: string; path: string; kind: "auto" | "chromium" | "env"; args: string[] };
+type LaunchApp = {
+  name: string; path: string; kind: "auto" | "chromium" | "env";
+  args: string[]; webrtc_via_proxy: boolean;
+};
 
 /// Cursor, VS Code и прочий Electron системные настройки прокси не читают —
 /// их трафик до нас не доходит, поэтому и «Подбор доменов» по ним пуст.
@@ -640,6 +652,8 @@ function Apps() {
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [kind, setKind] = useState<LaunchApp["kind"]>("auto");
+  const [argsText, setArgsText] = useState("");
+  const [webrtc, setWebrtc] = useState(false);
   const [hint, setHint] = useState("");
   const [said, setSaid] = useState("");
 
@@ -651,9 +665,10 @@ function Apps() {
   // Показываем ключ запуска ДО того, как человек нажмёт «Запустить».
   useEffect(() => {
     if (!path.trim()) { setHint(""); return; }
-    invoke<string>("app_explain", { item: { name: name || "программа", path, kind, args: [] } })
-      .then(setHint).catch(() => setHint(""));
-  }, [path, kind, name]);
+    invoke<string>("app_explain", {
+      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc },
+    }).then(setHint).catch(() => setHint(""));
+  }, [path, kind, name, argsText, webrtc]);
 
   const pick = async () => {
     const picked = await openFile({
@@ -671,8 +686,10 @@ function Apps() {
   const save = async () => {
     if (!path.trim()) return;
     try {
-      await invoke("app_save", { item: { name: name.trim() || path, path, kind, args: [] } });
-      setName(""); setPath(""); setKind("auto"); load();
+      await invoke("app_save", {
+        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc },
+      });
+      setName(""); setPath(""); setKind("auto"); setArgsText(""); setWebrtc(false); load();
     } catch (e) { alert(String(e)); }
   };
 
