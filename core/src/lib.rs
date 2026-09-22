@@ -74,6 +74,13 @@ impl Engine {
     /// Поднимает оба входа. Системный прокси НЕ трогает — это отдельным шагом.
     pub async fn start(mut cfg: config::Config, path: &str) -> Result<Arc<Self>, String> {
         journal::enable();
+        // ⛔ Прежде всего прибираемся за прошлым сеансом: если он ушёл не
+        // по-хорошему, системный прокси до сих пор указывает на программу,
+        // которой нет, и у человека молча не работает всё подряд.
+        if sysproxy::restore_leftovers(path) {
+            logfile::line(&logfile::now_stamp(),
+                          "системные настройки прокси возвращены: прошлый запуск завершился неожиданно");
+        }
         report::enable();
         health::enable();
         conns::enable();
@@ -447,6 +454,8 @@ impl Engine {
         let port = self.cfg.lock().unwrap().listen.http;
         let s = sysproxy::apply(&format!("127.0.0.1:{port}"), NO_PROXY)
             .map_err(|e| e.to_string())?;
+        // на диск — чтобы прибраться, даже если уйдём не по-хорошему
+        sysproxy::remember(&self.path, &s);
         *self.saved.lock().unwrap() = Some(s);
         Ok(())
     }
@@ -455,6 +464,7 @@ impl Engine {
         if let Some(s) = self.saved.lock().unwrap().take() {
             sysproxy::restore(&s);
         }
+        sysproxy::forget(&self.path);
     }
 
     pub fn system_proxy_is_ours(&self) -> bool {
