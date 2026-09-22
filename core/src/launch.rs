@@ -80,7 +80,10 @@ pub fn detect(path: &str) -> Kind {
 pub fn explain(app: &App, socks_port: u16, http_port: u16) -> String {
     match if app.kind == Kind::Auto { detect(&app.path) } else { app.kind } {
         Kind::Chromium => {
-            let mut t = format!("ключ --proxy-server=socks5://127.0.0.1:{socks_port}");
+            let mut t = format!(
+                "ключ --proxy-server=socks5://127.0.0.1:{socks_port} и переменные \
+                 HTTP_PROXY/HTTPS_PROXY на 127.0.0.1:{http_port} — Electron \
+                 ходит и тем, и другим");
             if app.webrtc_via_proxy {
                 t.push_str(", WebRTC тоже через прокси");
             }
@@ -145,6 +148,20 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
         cmd.current_dir(dir);
     }
 
+    // ⛔ Переменные ставим ВСЕМ, включая Chromium. Electron — это не
+    // только Chromium: расширения, языковые серверы и часть запросов
+    // идут через Node внутри него, а Node про --proxy-server не знает
+    // и смотрит только на окружение. Без этого Cursor открывается,
+    // соединения видно, а работать он не работает: половина его
+    // хозяйства ходит мимо нас.
+    {
+        let http = format!("http://127.0.0.1:{http_port}");
+        cmd.env("HTTP_PROXY", &http).env("HTTPS_PROXY", &http)
+           .env("http_proxy", &http).env("https_proxy", &http)
+           .env("ALL_PROXY", format!("socks5://127.0.0.1:{socks_port}"))
+           .env("NO_PROXY", "localhost,127.0.0.1,::1");
+    }
+
     match kind {
         Kind::Chromium => {
             // ⛔ Именно socks5, а не http: Chromium через http-прокси
@@ -157,13 +174,7 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
             }
         }
-        _ => {
-            let http = format!("http://127.0.0.1:{http_port}");
-            cmd.env("HTTP_PROXY", &http).env("HTTPS_PROXY", &http)
-               .env("http_proxy", &http).env("https_proxy", &http)
-               .env("ALL_PROXY", format!("socks5://127.0.0.1:{socks_port}"))
-               .env("NO_PROXY", "localhost,127.0.0.1,::1");
-        }
+        _ => {}
     }
     for a in &app.args {
         cmd.arg(a);
@@ -249,5 +260,23 @@ mod webrtc_tests {
                       kind: Kind::Chromium, args: vec!["--incognito".into()],
                       webrtc_via_proxy: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("--incognito"));
+    }
+}
+
+#[cfg(test)]
+mod electron_tests {
+    use super::*;
+
+    /// Electron — не только Chromium: расширения и языковые серверы
+    /// работают через Node внутри него, а тот знает лишь окружение.
+    /// Cursor из-за этого открывался, но не работал.
+    #[test]
+    fn chromium_получает_и_ключ_и_переменные() {
+        let a = App { name: "Cursor".into(), path: "cursor.exe".into(),
+                      kind: Kind::Chromium, args: vec![],
+                      webrtc_via_proxy: false, via: String::new() };
+        let t = explain(&a, 18081, 18080);
+        assert!(t.contains("--proxy-server"), "{t}");
+        assert!(t.contains("HTTP_PROXY"), "{t}");
     }
 }
