@@ -59,7 +59,7 @@ mod tests {
 
     fn app(path: &str, via: &str) -> App {
         App { name: "x".into(), path: path.into(), kind: Kind::Auto,
-              args: vec![], webrtc_via_proxy: false, no_http2: false, via: via.into() }
+              via: via.into() }
     }
 
     #[test]

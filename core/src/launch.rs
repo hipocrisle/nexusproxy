@@ -23,9 +23,6 @@ pub struct App {
     /// Каким способом передавать адрес прокси.
     #[serde(default)]
     pub kind: Kind,
-    /// Свои доводы при запуске, если нужны.
-    #[serde(default)]
-    pub args: Vec<String>,
     /// Через какой прокси идёт ВЕСЬ трафик этой программы.
     ///
     /// Пусто — программа подчиняется общим правилам по доменам, как
@@ -35,21 +32,6 @@ pub struct App {
     /// где запущенная через нас программа всё равно ходит напрямую.
     #[serde(default)]
     pub via: String,
-    /// Запретить программе HTTP/2.
-    ///
-    /// Корпоративные прокси, разбирающие TLS, часто не переваривают
-    /// HTTP/2 и отвечают отказом. Внутри туннеля мы этого не видим —
-    /// там шифрованный поток, — поэтому запрещать приходится самой
-    /// программе, до того как она откроет соединение.
-    #[serde(default)]
-    pub no_http2: bool,
-    /// Гнать через прокси и WebRTC — видеозвонки и трансляции.
-    ///
-    /// Без этого Chromium ведёт медиа по UDP мимо прокси: в обычной
-    /// сети так быстрее, но там, где наружу пускает только прокси,
-    /// видео просто не появляется. Ключ запрещает такой обход.
-    #[serde(default)]
-    pub webrtc_via_proxy: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -87,33 +69,11 @@ pub fn detect(path: &str) -> Kind {
 /// Как именно запустим — показываем человеку до запуска, чтобы не гадал.
 pub fn explain(app: &App, socks_port: u16, http_port: u16) -> String {
     match if app.kind == Kind::Auto { detect(&app.path) } else { app.kind } {
-        Kind::Chromium => {
-            let via = if app.webrtc_via_proxy {
-                format!("http://127.0.0.1:{http_port}")
-            } else {
-                format!("socks5://127.0.0.1:{socks_port}")
-            };
-            let mut t = format!(
-                "ключ --proxy-server={via} и переменные HTTP_PROXY/HTTPS_PROXY \
-                 на 127.0.0.1:{http_port} — Electron ходит и тем, и другим");
-            if app.webrtc_via_proxy {
-                t.push_str(", WebRTC тоже через прокси (ему нужен именно http-вход)");
-            }
-            if app.no_http2 {
-                t.push_str(", HTTP/2 запрещён");
-            }
-            if !app.args.is_empty() {
-                t.push_str(&format!(", свои ключи: {}", app.args.join(" ")));
-            }
-            t
-        }
-        _ => {
-            let mut t = format!("переменные HTTP_PROXY и HTTPS_PROXY на 127.0.0.1:{http_port}");
-            if !app.args.is_empty() {
-                t.push_str(&format!(", свои ключи: {}", app.args.join(" ")));
-            }
-            t
-        }
+        Kind::Chromium => format!(
+            "ключ --proxy-server=socks5://127.0.0.1:{socks_port} и переменные \
+             HTTP_PROXY/HTTPS_PROXY на 127.0.0.1:{http_port} — Electron ходит \
+             и тем, и другим"),
+        _ => format!("переменные HTTP_PROXY и HTTPS_PROXY на 127.0.0.1:{http_port}"),
     }
 }
 
@@ -188,24 +148,11 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
             // В остальных случаях socks5: через http-прокси Chromium
             // капризничает с WebSocket, на котором держится половина
             // современных приложений.
-            if app.webrtc_via_proxy {
-                cmd.arg(format!("--proxy-server=http://127.0.0.1:{http_port}"));
-            } else {
-                cmd.arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"));
-            }
+            cmd.arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"));
             // без этого Chromium ходит мимо прокси за своими адресами
             cmd.arg("--proxy-bypass-list=<-loopback>");
-            if app.webrtc_via_proxy {
-                cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
-            }
-            if app.no_http2 {
-                cmd.arg("--disable-http2");
-            }
         }
         _ => {}
-    }
-    for a in &app.args {
-        cmd.arg(a);
     }
 
     #[cfg(windows)]
@@ -241,10 +188,10 @@ mod tests {
     #[test]
     fn человеку_объясняем_способ_до_запуска() {
         let a = App { name: "Cursor".into(), path: "Cursor.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
+                      kind: Kind::Auto, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("socks5"));
         let b = App { name: "Своё".into(), path: "my.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
+                      kind: Kind::Auto, via: String::new() };
         assert!(explain(&b, 18081, 18080).contains("HTTP_PROXY"));
     }
 
@@ -260,36 +207,12 @@ mod tests {
     #[test]
     fn несуществующий_файл_отвергается_с_объяснением() {
         let a = App { name: "Нет".into(), path: "/нет/такого".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
+                      kind: Kind::Auto, via: String::new() };
         let e = start(&a, 18081, 18080).unwrap_err();
         assert!(e.contains("не найден"), "{e}");
     }
 }
 
-#[cfg(test)]
-mod webrtc_tests {
-    use super::*;
-
-    /// Chromium по умолчанию ведёт медиа по UDP мимо прокси. Там, где
-    /// наружу пускает только прокси, из-за этого просто нет видео.
-    #[test]
-    fn webrtc_через_прокси_виден_до_запуска() {
-        let mut a = App { name: "Chrome".into(), path: "chrome.exe".into(),
-                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true, no_http2: false, via: String::new() };
-        assert!(explain(&a, 18081, 18080).contains("WebRTC"),
-                "человек должен видеть это до запуска");
-        a.webrtc_via_proxy = false;
-        assert!(!explain(&a, 18081, 18080).contains("WebRTC"));
-    }
-
-    #[test]
-    fn свои_ключи_показываются() {
-        let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
-                      kind: Kind::Chromium, args: vec!["--incognito".into()],
-                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
-        assert!(explain(&a, 18081, 18080).contains("--incognito"));
-    }
-}
 
 #[cfg(test)]
 mod electron_tests {
@@ -301,54 +224,11 @@ mod electron_tests {
     #[test]
     fn chromium_получает_и_ключ_и_переменные() {
         let a = App { name: "Cursor".into(), path: "cursor.exe".into(),
-                      kind: Kind::Chromium, args: vec![],
-                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
+                      kind: Kind::Chromium, via: String::new() };
         let t = explain(&a, 18081, 18080);
         assert!(t.contains("--proxy-server"), "{t}");
         assert!(t.contains("HTTP_PROXY"), "{t}");
     }
 }
 
-#[cfg(test)]
-mod http2_tests {
-    use super::*;
 
-    /// Корпоративные прокси, разбирающие TLS, часто не переваривают
-    /// HTTP/2 и отвечают отказом. Внутри туннеля мы этого не видим —
-    /// запретить может только сама программа, при запуске.
-    #[test]
-    fn запрет_http2_виден_до_запуска() {
-        let mut a = App { name: "Cursor".into(), path: "cursor.exe".into(),
-                          kind: Kind::Chromium, args: vec![],
-                          webrtc_via_proxy: false, no_http2: true, via: String::new() };
-        assert!(explain(&a, 18081, 18080).contains("HTTP/2"));
-        a.no_http2 = false;
-        assert!(!explain(&a, 18081, 18080).contains("HTTP/2"));
-    }
-}
-
-#[cfg(test)]
-mod webrtc_transport_tests {
-    use super::*;
-
-    /// WebRTC в Chromium через SOCKS не ходит — поддержку для медиа
-    /// оттуда убрали. Запрет ходить мимо прокси без http-входа означает
-    /// «дороги нет вовсе», и видео не идёт.
-    #[test]
-    fn для_видео_отдаём_http_вход() {
-        let a = App { name: "Vivaldi".into(), path: "vivaldi.exe".into(),
-                      kind: Kind::Chromium, args: vec![],
-                      webrtc_via_proxy: true, no_http2: false, via: String::new() };
-        let t = explain(&a, 18081, 18080);
-        assert!(t.contains("http://127.0.0.1:18080"), "{t}");
-        assert!(!t.contains("socks5://"), "{t}");
-    }
-
-    #[test]
-    fn без_видео_остаётся_socks() {
-        let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
-                      kind: Kind::Chromium, args: vec![],
-                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
-        assert!(explain(&a, 18081, 18080).contains("socks5://127.0.0.1:18081"));
-    }
-}
