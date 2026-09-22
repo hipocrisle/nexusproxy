@@ -86,6 +86,14 @@ impl Engine {
         // ⛔ Прежде всего прибираемся за прошлым сеансом: если он ушёл не
         // по-хорошему, системный прокси до сих пор указывает на программу,
         // которой нет, и у человека молча не работает всё подряд.
+        // ⛔ Движок перехвата держит сетевой интерфейс. Если прошлый
+        // запуск ушёл не по-хорошему, он до сих пор заворачивает трафик,
+        // а наше окно закрыто — причины не видно совсем.
+        let orphans = tunnel::kill_orphans(&tunnel_dir(path));
+        if orphans > 0 {
+            logfile::line(&logfile::now_stamp(),
+                &format!("остановлен перехват, оставшийся от прошлого запуска: {orphans}"));
+        }
         let stale = sysproxy::sweep_stale_env();
         if !stale.is_empty() {
             logfile::line(&logfile::now_stamp(),
@@ -488,6 +496,11 @@ impl Engine {
 
     pub fn shutdown(&self) {
         xray::stop();
+        // ⛔ Перехват снимаем ПЕРВЫМ делом: он держит сетевой интерфейс,
+        // и оставить его работающим после выхода — значит оставить
+        // человека без половины сети без всяких объяснений.
+        tunnel::stop_elevated();
+        tunnel::stop();
         self.system_proxy_off();
         for t in self.tasks.lock().unwrap().drain(..) {
             t.abort();
