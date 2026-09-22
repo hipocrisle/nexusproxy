@@ -666,7 +666,16 @@ fn discovery_stop() -> Option<core::report::SessionResult> {
 #[tauri::command]
 fn system_proxy(app: State<App>, on: bool) -> Result<(), String> {
     let e = engine(&app)?;
-    if on { e.system_proxy_on() } else { e.system_proxy_off(); Ok(()) }
+    if on {
+        e.system_proxy_on()
+    } else {
+        // ⛔ «Выключить» должно выключать всё: человек считает, что
+        // программа больше ни на что не влияет. Оставшийся перехват
+        // продолжал бы заворачивать трафик других программ.
+        e.tunnel_off();
+        e.system_proxy_off();
+        Ok(())
+    }
 }
 
 /// Переключатели, которые применяются сразу, без перезапуска движка.
@@ -866,9 +875,15 @@ fn tunnel_state(app: State<App>) -> serde_json::Value {
         Ok(e) => { let c = e.cfg.lock().unwrap(); (c.tunnel_mode, c.apps.len()) }
         Err(_) => (false, 0),
     };
+    let svc = core::tunnel_service::state();
     serde_json::json!({
         "installed": core::tunnel::is_installed(&dir),
-        "running": core::tunnel::is_running(),
+        "service": svc,
+        // ⛔ Показываем, что происходит НА САМОМ ДЕЛЕ, а не сохранённую
+        // настройку: после перезапуска программы галка стояла, а перехват
+        // был снят — человек считал, что всё работает.
+        "running": svc == core::tunnel_service::State::Running
+                   || core::tunnel::is_running(),
         "mode": mode,
         "apps": apps,
         "error": core::tunnel::last_error(),
@@ -922,12 +937,23 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
     { let s = app.state::<App>(); engine(&s)?.apply_and_save()?; }
 
     tokio::task::spawn_blocking(move || {
-        if on {
-            core::tunnel::start_elevated(&dir, &routes, &ups)
-        } else {
+        if !on {
+            let _ = core::tunnel_service::stop();
             core::tunnel::stop_elevated();
             core::tunnel::stop();
-            Ok(())
+            return Ok(());
+        }
+        // Настройки пишем всегда: служба читает их при запуске.
+        core::tunnel::write_config(&dir, &routes, &ups)?;
+        match core::tunnel_service::state() {
+            // Служба уже стоит — просто просим её подняться. Прав не надо.
+            core::tunnel_service::State::Stopped
+            | core::tunnel_service::State::Running => core::tunnel_service::start(),
+            // Первый раз: ставим службу, один запрос прав.
+            core::tunnel_service::State::Absent => {
+                core::tunnel_service::install(&dir)?;
+                core::tunnel_service::start()
+            }
         }
     })
     .await

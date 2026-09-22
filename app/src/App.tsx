@@ -660,52 +660,50 @@ function Apps() {
   };
 
   return (
-    <div className="pane">
-      <div className="card">
+    <div className="panel">
+      <div className="card wide">
         <h3>{editing ? "Изменить приложение" : "Добавить приложение"}</h3>
-        <p className="hint">
-          Весь трафик приложения пойдёт через выбранный прокси — целиком,
-          не разбирая адреса.
-        </p>
+        <p className="hint">Весь трафик приложения идёт через выбранный прокси.</p>
         <div className="row wrap">
           <input value={name} onChange={e => setName(e.target.value)}
-                 placeholder="Название" style={{ width: 170 }} />
-          <input value={path} onChange={e => setPath(e.target.value)}
-                 placeholder="Путь к программе" style={{ flex: 1, minWidth: 240 }} />
+                 placeholder="Название" style={{ width: 180 }} />
+          <input className="field" value={path} onChange={e => setPath(e.target.value)}
+                 placeholder="Путь к программе" style={{ minWidth: 280 }} />
           <button onClick={pick}>Выбрать…</button>
-        </div>
-        <div className="row wrap">
-          <span className="hint">Через:</span>
           <select value={via} onChange={e => setVia(e.target.value)}>
             {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
           </select>
-          <button className="btn primary" onClick={save} disabled={!path.trim()}>
+          <button className="primary" onClick={save} disabled={!path.trim()}>
             {editing ? "Сохранить" : "Добавить"}
           </button>
-          {editing && <button className="btn" onClick={reset}>Отмена</button>}
+          {editing && <button onClick={reset}>Отмена</button>}
         </div>
       </div>
 
       {items.length > 0 && (
-        <div className="card">
+        <div className="card wide">
           <h3>Приложения</h3>
-          <div className="list">
-            {items.map(a => (
-              <div className="item" key={a.path}>
-                <span className="grow">
-                  <b>{a.name}</b>
-                  <br /><span className="hint mono">{a.path}</span>
-                </span>
-                <span className="tag proxy">{a.via}</span>
-                <button className="btn small" onClick={() => launch(a.path)}>Запустить</button>
-                <button className="btn small" onClick={() => edit(a)}>Изменить</button>
-                <button className="btn small" onClick={() => remove(a.path)}>Убрать</button>
-              </div>
-            ))}
-          </div>
-          <p className="hint">
-            Перед запуском закройте программу полностью — иначе откроется
-            новое окно уже работающей копии, без прокси.
+          <table className="list">
+            <tbody>
+              {items.map(a => (
+                <tr key={a.path}>
+                  <td style={{ width: "40%" }}>
+                    <b>{a.name}</b>
+                    <div className="hint mono" style={{ margin: 0 }}>{a.path}</div>
+                  </td>
+                  <td><span className="tag proxy">{a.via}</span></td>
+                  <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                    <button className="small" onClick={() => launch(a.path)}>Запустить</button>{" "}
+                    <button className="small" onClick={() => edit(a)}>Изменить</button>{" "}
+                    <button className="small" onClick={() => remove(a.path)}>Убрать</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="hint" style={{ marginTop: 10, marginBottom: 0 }}>
+            Перед запуском закройте программу полностью. При включённом
+            перехвате запускать отсюда не нужно.
           </p>
           {said && <p className="hint">{said}</p>}
         </div>
@@ -1070,10 +1068,9 @@ function Tunnel() {
     <div className="card">
       <h3>Перехват трафика приложений</h3>
       <p className="hint">
-        Обычно программа сама должна посмотреть в настройки прокси и
-        послушаться. Некоторые — например Cursor — этого не делают и ходят
-        мимо. Перехват забирает их трафик независимо от их желания, и
-        запускать их через кнопку больше не нужно: работают с ярлыка.
+        Забирает трафик приложений из списка, даже если они не умеют
+        работать через прокси. Запускать их отдельно не нужно — работают
+        с обычного ярлыка.
       </p>
 
       {!st.installed ? (
@@ -1081,7 +1078,9 @@ function Tunnel() {
           <button className="btn primary" onClick={install} disabled={!!busy}>
             {busy || "Установить"}
           </button>
-          <p className="hint">Движок весит около 20 МБ, скачивается один раз.</p>
+          <p className="hint">
+            Права администратора запрашиваются один раз, при установке.
+          </p>
         </>
       ) : (
         <>
@@ -1092,13 +1091,10 @@ function Tunnel() {
           </label>
           <p className="hint">
             {st.apps === 0
-              ? "Сначала добавьте приложения во вкладке «Приложения» — перехватывать пока нечего."
-              : `Приложений в списке: ${st.apps}. Остальной трафик идёт напрямую, как обычно.`}
+              ? "Добавьте приложения на вкладке «Приложения»."
+              : `В списке: ${st.apps}. Остальной трафик идёт напрямую.`}
           </p>
-          <p className="hint">
-            ⚠️ При включении система спросит права администратора: перехват
-            создаёт сетевой интерфейс, без прав это невозможно.
-          </p>
+
         </>
       )}
       {err && <p className="note">{err}</p>}
