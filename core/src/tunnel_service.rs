@@ -61,11 +61,14 @@ mod imp {
     /// ⛔ Кавычки обязательны: в путях бывают пробелы («Program Files»,
     /// имя пользователя). Без них задача получит обрезанный путь и молча
     /// не запустится — перехват «не работает», а почему, не видно.
-    pub fn install_command(exe: &Path, config: &Path) -> String {
+    /// ⛔ Задача запускает НАС, а не движок напрямую: сама она окно
+    /// консоли спрятать не умеет, и у человека висело бы чёрное окно с
+    /// журналом. Движок поднимаем мы, уже без окна.
+    pub fn install_command(exe: &Path, dir: &Path) -> String {
         format!(
             "schtasks.exe /create /tn {NAME} /f /sc once /st 00:00 /rl highest \
-             /tr \"\\\"{}\\\" run -c \\\"{}\\\"\"",
-            exe.display(), config.display()
+             /tr \"\\\"{}\\\" --run-tunnel \\\"{}\\\"\"",
+            exe.display(), dir.display()
         )
     }
 
@@ -90,38 +93,40 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
-    use std::process::Command;
 
-    /// Где живёт описание службы. Каталог системный — туда кладут то,
-    /// что должно работать от имени системы и переживать выход из неё.
+    /// ⛔ Системным демоном на macOS может управлять только root. Если
+    /// включать и выключать его через launchctl, пароль спрашивался бы
+    /// каждый раз — ровно то, чего мы избегаем.
+    ///
+    /// Поэтому демон следит за файлом-признаком: файл появился — launchd
+    /// поднял перехват, файл удалён — остановил. Создать и удалить файл
+    /// в своей папке может обычный пользователь, без всяких прав.
+    /// Администратор нужен один раз, чтобы положить описание демона.
+    pub fn flag_path(dir: &Path) -> std::path::PathBuf {
+        dir.join("enabled")
+    }
+
     pub fn plist_path() -> std::path::PathBuf {
         std::path::PathBuf::from(format!("/Library/LaunchDaemons/{NAME}.plist"))
     }
 
-    fn launchctl(args: &[&str]) -> Result<String, String> {
-        let out = Command::new("launchctl").args(args).output()
-            .map_err(|e| format!("не вызвать launchctl: {e}"))?;
-        let text = String::from_utf8_lossy(&out.stdout).to_string()
-            + &String::from_utf8_lossy(&out.stderr);
-        if out.status.success() { Ok(text) } else { Err(text.trim().to_string()) }
-    }
-
-    pub fn state() -> State {
+    pub fn state_in(dir: &Path) -> State {
         if !plist_path().exists() {
             return State::Absent;
         }
-        match launchctl(&["print", &format!("system/{NAME}")]) {
-            Ok(t) if t.contains("state = running") => State::Running,
-            _ => State::Stopped,
-        }
+        if flag_path(dir).exists() { State::Running } else { State::Stopped }
     }
 
-    /// Описание службы для launchd.
+    pub fn state() -> State {
+        if plist_path().exists() { State::Stopped } else { State::Absent }
+    }
+
+    /// Описание демона.
     ///
-    /// ⛔ `RunAtLoad` выключен: перехват включает человек, а не система
-    /// при каждой загрузке. Иначе он поднимался бы сам, и человек не мог
-    /// бы понять, почему трафик куда-то заворачивается.
-    pub fn plist(exe: &Path, config: &Path) -> String {
+    /// ⛔ `RunAtLoad` выключен, а `KeepAlive` привязан к файлу: перехват
+    /// включает человек, а не система при каждой загрузке. Иначе трафик
+    /// начал бы заворачиваться сам, без спросу.
+    pub fn plist(exe: &Path, dir: &Path) -> String {
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -130,59 +135,95 @@ mod imp {
   <key>ProgramArguments</key>
   <array>
     <string>{}</string>
-    <string>run</string>
-    <string>-c</string>
+    <string>--run-tunnel</string>
     <string>{}</string>
   </array>
   <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key><false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict><key>{}</key><true/></dict>
+  </dict>
+  <key>StandardErrorPath</key><string>{}</string>
 </dict>
 </plist>
-"#, exe.display(), config.display())
+"#, exe.display(), dir.display(), flag_path(dir).display(),
+    dir.join("daemon.log").display())
     }
 
-    /// Ставится один раз с правами: положить описание и зарегистрировать.
-    pub fn install_command(exe: &Path, config: &Path) -> String {
+    pub fn install_command(exe: &Path, dir: &Path) -> String {
         let p = plist_path();
-        // Пишем через здесь-документ: в путях бывают пробелы, а кавычки
-        // внутри xml пришлось бы экранировать дважды.
+        // Здесь-документ: в путях бывают пробелы, а кавычки внутри xml
+        // пришлось бы экранировать дважды.
         format!(
             "cat > '{}' <<'NEXUSPROXY_PLIST'\n{}NEXUSPROXY_PLIST\n\
              chown root:wheel '{}' && chmod 644 '{}' && \
-             launchctl bootstrap system '{}'",
-            p.display(), plist(exe, config), p.display(), p.display(), p.display()
+             launchctl bootstrap system '{}' 2>/dev/null; true",
+            p.display(), plist(exe, dir), p.display(), p.display(), p.display()
         )
     }
 
     pub fn uninstall_command() -> String {
         let p = plist_path();
-        format!("launchctl bootout system/{NAME}; rm -f '{}'", p.display())
+        format!("launchctl bootout system/{NAME} 2>/dev/null; rm -f '{}'", p.display())
     }
 
-    pub fn start() -> Result<(), String> {
-        launchctl(&["kickstart", &format!("system/{NAME}")])
-            .map(|_| ())
+    /// Включение и выключение — просто файл. Прав не требует.
+    pub fn start_in(dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
+        std::fs::write(flag_path(dir), b"on")
             .map_err(|e| format!("перехват не включился: {e}"))
     }
 
-    pub fn stop() -> Result<(), String> {
-        launchctl(&["kill", "SIGTERM", &format!("system/{NAME}")])
-            .map(|_| ())
-            .map_err(|e| format!("перехват не выключился: {e}"))
+    pub fn stop_in(dir: &Path) -> Result<(), String> {
+        match std::fs::remove_file(flag_path(dir)) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("перехват не выключился: {e}")),
+        }
     }
+
+    pub fn start() -> Result<(), String> {
+        Err("не указана папка перехвата".into())
+    }
+    pub fn stop() -> Result<(), String> { Ok(()) }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     use super::*;
     pub fn state() -> State { State::Absent }
-    pub fn install_command(_e: &Path, _c: &Path) -> String { String::new() }
+    pub fn install_command(_e: &Path, _d: &Path) -> String { String::new() }
     pub fn uninstall_command() -> String { String::new() }
     pub fn start() -> Result<(), String> { Err("перехват на этой системе не поддерживается".into()) }
     pub fn stop() -> Result<(), String> { Ok(()) }
 }
 
-pub use imp::{install_command, start, state, stop, uninstall_command};
+pub use imp::{install_command, uninstall_command};
+
+/// Что сейчас с перехватом.
+pub fn state_in(dir: &Path) -> State {
+    #[cfg(target_os = "macos")]
+    { imp::state_in(dir) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = dir; imp::state() }
+}
+
+/// Включить. На macOS — создать файл-признак, на Windows — запустить задачу.
+pub fn start_in(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { imp::start_in(dir) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = dir; imp::start() }
+}
+
+/// Выключить.
+pub fn stop_in(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { imp::stop_in(dir) }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = dir; imp::stop() }
+}
 
 // ⛔ Механизма нет на Linux, и проверять там нечего: заглушка отдаёт
 // пустую строку. Тесты идут только там, где перехват работает.
@@ -221,13 +262,13 @@ mod tests {
 /// Дальше перехват включается и выключается без вопросов: службе при
 /// установке выдаётся право на запуск и остановку обычным пользователем.
 pub fn install(dir: &Path) -> Result<(), String> {
-    let exe = crate::tunnel::binary_path(dir);
-    if !exe.is_file() {
+    if !crate::tunnel::binary_path(dir).is_file() {
         return Err("движок перехвата ещё не скачан".into());
     }
-    let cfg = crate::tunnel::config_path(dir);
-    let cmd = install_command(&exe, &cfg);
-    run_elevated(&cmd)
+    // Задача запускает нас же — мы поднимем движок без окна.
+    let me = std::env::current_exe()
+        .map_err(|e| format!("не найти себя: {e}"))?;
+    run_elevated(&install_command(&me, dir))
 }
 
 /// Убрать службу — тоже с запросом прав.

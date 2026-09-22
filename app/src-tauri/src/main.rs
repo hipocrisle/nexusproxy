@@ -11,5 +11,13 @@ fn main() {
         }
         return;
     }
+    // Запуск движка перехвата задачей планировщика: окно прячем мы.
+    if args.len() >= 3 && args[1] == "--run-tunnel" {
+        let dir = std::path::PathBuf::from(&args[2]);
+        if let Err(e) = nexusproxy_core::tunnel::run_foreground(&dir) {
+            eprintln!("{e}");
+        }
+        return;
+    }
     nexusproxy_lib::run()
 }

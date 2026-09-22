@@ -875,7 +875,7 @@ fn tunnel_state(app: State<App>) -> serde_json::Value {
         Ok(e) => { let c = e.cfg.lock().unwrap(); (c.tunnel_mode, c.apps.len()) }
         Err(_) => (false, 0),
     };
-    let svc = core::tunnel_service::state();
+    let svc = core::tunnel_service::state_in(&dir);
     serde_json::json!({
         "installed": core::tunnel::is_installed(&dir),
         "service": svc,
@@ -888,6 +888,13 @@ fn tunnel_state(app: State<App>) -> serde_json::Value {
         "apps": apps,
         "error": core::tunnel::last_error(),
     })
+}
+
+/// Последние строки журнала движка — показываем при неудаче.
+#[tauri::command]
+fn tunnel_log(app: State<App>) -> String {
+    let path = app.path.lock().unwrap().clone();
+    core::tunnel::log_tail(&core::tunnel_dir(&path), 12)
 }
 
 /// Скачать движок перехвата — он не входит в состав программы.
@@ -916,8 +923,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
         let routes: Vec<core::tunnel::Route> = c.apps.iter()
             .filter(|a| !a.via.trim().is_empty())
             .map(|a| core::tunnel::Route {
-                process: std::path::Path::new(&a.path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or(&a.path).to_string(),
+                process: core::launch::process_name(&a.path),
                 via: a.via.clone(),
             })
             .collect();
@@ -938,21 +944,21 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
 
     tokio::task::spawn_blocking(move || {
         if !on {
-            let _ = core::tunnel_service::stop();
+            let _ = core::tunnel_service::stop_in(&dir);
             core::tunnel::stop_elevated();
             core::tunnel::stop();
             return Ok(());
         }
         // Настройки пишем всегда: служба читает их при запуске.
         core::tunnel::write_config(&dir, &routes, &ups)?;
-        match core::tunnel_service::state() {
+        match core::tunnel_service::state_in(&dir) {
             // Служба уже стоит — просто просим её подняться. Прав не надо.
             core::tunnel_service::State::Stopped
-            | core::tunnel_service::State::Running => core::tunnel_service::start(),
+            | core::tunnel_service::State::Running => core::tunnel_service::start_in(&dir),
             // Первый раз: ставим службу, один запрос прав.
             core::tunnel_service::State::Absent => {
                 core::tunnel_service::install(&dir)?;
-                core::tunnel_service::start()
+                core::tunnel_service::start_in(&dir)
             }
         }
     })
@@ -1118,7 +1124,7 @@ pub fn run() {
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
             apps_list, app_save, app_remove, app_explain, app_launch,
-            tunnel_state, tunnel_install, tunnel_set
+            tunnel_state, tunnel_install, tunnel_set, tunnel_log
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

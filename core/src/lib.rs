@@ -491,7 +491,7 @@ impl Engine {
     /// Оба пути нужны: служба могла быть не установлена, а движок
     /// запущен с разовым повышением прав.
     pub fn tunnel_off(&self) {
-        let _ = tunnel_service::stop();
+        let _ = tunnel_service::stop_in(&tunnel_dir(&self.path));
         tunnel::stop_elevated();
         tunnel::stop();
     }

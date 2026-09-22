@@ -540,3 +540,82 @@ pub fn write_config(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Res
 pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("tunnel-config.json")
 }
+
+/// Поднять движок и ждать его — этим занимается наш же файл, запущенный
+/// задачей планировщика.
+///
+/// ⛔ Задача не умеет прятать окно консоли: запусти она движок напрямую,
+/// у человека на экране постоянно висело бы чёрное окно с журналом.
+/// Поэтому запускает нас, а окно прячем мы сами.
+pub fn run_foreground(dir: &Path) -> Result<(), String> {
+    let bin = binary_path(dir);
+    if !bin.is_file() {
+        return Err("движок перехвата не найден".into());
+    }
+    let cfg = config_path(dir);
+    let log = std::fs::File::create(log_path(dir))
+        .map_err(|e| format!("не создать журнал: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| format!("не создать журнал: {e}"))?;
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("run").arg("-c").arg(&cfg)
+       .current_dir(dir)
+       .stdout(log).stderr(log_err);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // без окна
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Последние строки журнала движка — чтобы человек видел причину, а не
+/// пустой экран с невключившимся перехватом.
+pub fn log_tail(dir: &Path, lines: usize) -> String {
+    let mut out = Vec::new();
+    for name in ["tunnel.log", "daemon.log"] {
+        if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
+            out.extend(t.lines().rev().take(lines).map(|s| s.to_string()));
+        }
+    }
+    out.reverse();
+    // Движок красит вывод, в окне программы эти метки — мусор.
+    let clean: Vec<String> = out.into_iter()
+        .map(|l| strip_colors(&l))
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    clean.join("\n")
+}
+
+fn strip_colors(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // пропускаем до буквы, которой заканчивается управляющая метка
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    /// Движок красит вывод управляющими метками — в окне программы это
+    /// нечитаемый мусор вида ←[31mERROR←[0m.
+    #[test]
+    fn метки_цвета_убираются() {
+        assert_eq!(strip_colors("\u{1b}[31mERROR\u{1b}[0m тут"), "ERROR тут");
+        assert_eq!(strip_colors("обычная строка"), "обычная строка");
+    }
+}
