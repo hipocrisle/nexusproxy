@@ -10,6 +10,7 @@ pub mod health;
 pub mod journal;
 pub mod approutes;
 pub mod launch;
+pub mod tunnel;
 pub mod logfile;
 pub mod macproxy;
 pub mod presets;
