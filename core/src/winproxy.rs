@@ -151,19 +151,21 @@ mod imp {
             enable: get_dword(INET, "ProxyEnable"),
             server: get_str(INET, "ProxyServer"),
             over: get_str(INET, "ProxyOverride"),
+            // ⛔ Старые записи подбираем, чтобы прибраться за версиями до
+            // 0.9.16, которые их ставили. Сами больше не пишем.
             env: ENV_VARS.iter().map(|v| (v.to_string(), get_str(ENVK, v))).collect(),
         };
         set_str(INET, "ProxyServer", proxy)?;
         set_str(INET, "ProxyOverride", "<local>")?;
         set_dword(INET, "ProxyEnable", 1)?;
-        let url = format!("http://{proxy}");
-        for v in ENV_VARS {
-            if v == "NO_PROXY" {
-                set_str(ENVK, v, no_proxy)?;
-            } else {
-                set_str(ENVK, v, &url)?;
-            }
-        }
+        // ⛔ Переменные окружения пользователя мы НЕ трогаем. Запись в
+        // HKCU\Environment меняет окружение всем программам, которые
+        // запустятся потом, — включая те, о которых мы не думали. Любой
+        // сбой оставляет это навсегда, и человек получает «интернет
+        // отвалился» без всякой связи с нашей программой. Тем, кого мы
+        // запускаем сами, переменные передаются на процесс (launch.rs) —
+        // это ровно та же польза, но живёт только пока живёт программа.
+        let _ = no_proxy;
         notify();
         Ok(saved)
     }
@@ -190,6 +192,40 @@ mod imp {
         notify();
     }
 
+    /// Убрать переменные окружения, оставшиеся от версий до 0.9.16.
+    ///
+    /// Раньше мы писали их в HKCU\Environment, и после аварийного
+    /// завершения они оставались навсегда: у человека «отваливался
+    /// интернет» в программах, которые читают окружение, причём связи
+    /// с нашей программой не видно никакой. Трогаем только записи,
+    /// указывающие на 127.0.0.1 — чужие настройки не наши.
+    pub fn sweep_stale_env() -> Vec<String> {
+        let mut cleaned = Vec::new();
+        for v in ENV_VARS {
+            if v == "NO_PROXY" {
+                continue;
+            }
+            if let Some(val) = get_str(ENVK, v) {
+                if val.contains("127.0.0.1") {
+                    del(ENVK, v);
+                    cleaned.push(v.to_string());
+                }
+            }
+        }
+        // NO_PROXY снимаем только заодно с остальными: сам по себе он
+        // мог быть у человека и до нас.
+        if !cleaned.is_empty() {
+            if let Some(val) = get_str(ENVK, "NO_PROXY") {
+                if val.contains("127.0.0.1") {
+                    del(ENVK, "NO_PROXY");
+                    cleaned.push("NO_PROXY".into());
+                }
+            }
+            notify();
+        }
+        cleaned
+    }
+
     pub fn current() -> String {
         let on = get_dword(INET, "ProxyEnable").unwrap_or(0) == 1;
         let srv = get_str(INET, "ProxyServer").unwrap_or_default();
@@ -205,9 +241,10 @@ mod imp {
         Err(io::Error::other("переключение системного прокси есть только в версии для Windows"))
     }
     pub fn restore(_s: &Saved) {}
+    pub fn sweep_stale_env() -> Vec<String> { Vec::new() }
     pub fn current() -> String {
         "не поддерживается на этой системе".into()
     }
 }
 
-pub use imp::{apply, current, restore};
+pub use imp::{apply, current, restore, sweep_stale_env};
