@@ -1031,6 +1031,82 @@ function Log() {
   );
 }
 
+
+type TunnelState = {
+  installed: boolean; running: boolean; mode: boolean;
+  apps: number; error: string | null;
+};
+
+/// Перехват: трафик приложений забирается независимо от того, умеют ли
+/// они работать через прокси. Нужен таким, как Cursor, — он ходит мимо
+/// системных настроек, и обычным способом его не поймать.
+function Tunnel() {
+  const [st, setSt] = useState<TunnelState | null>(null);
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+
+  const load = useCallback(() => {
+    invoke<TunnelState>("tunnel_state").then(setSt).catch(() => {});
+  }, []);
+  useEffect(() => { load(); const t = setInterval(load, 3000); return () => clearInterval(t); }, [load]);
+
+  const install = async () => {
+    setErr(""); setBusy("Скачиваю…");
+    try { await invoke("tunnel_install"); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(""); load(); }
+  };
+
+  const toggle = async (on: boolean) => {
+    setErr(""); setBusy(on ? "Включаю…" : "Выключаю…");
+    try { await invoke("tunnel_set", { on }); }
+    catch (e) { setErr(String(e)); }
+    finally { setBusy(""); load(); }
+  };
+
+  if (!st) return null;
+
+  return (
+    <div className="card">
+      <h3>Перехват трафика приложений</h3>
+      <p className="hint">
+        Обычно программа сама должна посмотреть в настройки прокси и
+        послушаться. Некоторые — например Cursor — этого не делают и ходят
+        мимо. Перехват забирает их трафик независимо от их желания, и
+        запускать их через кнопку больше не нужно: работают с ярлыка.
+      </p>
+
+      {!st.installed ? (
+        <>
+          <button className="btn primary" onClick={install} disabled={!!busy}>
+            {busy || "Установить"}
+          </button>
+          <p className="hint">Движок весит около 20 МБ, скачивается один раз.</p>
+        </>
+      ) : (
+        <>
+          <label className="check">
+            <input type="checkbox" checked={st.mode} disabled={!!busy}
+                   onChange={(e) => toggle(e.target.checked)} />
+            Включить перехват{busy && " — " + busy}
+          </label>
+          <p className="hint">
+            {st.apps === 0
+              ? "Сначала добавьте приложения во вкладке «Приложения» — перехватывать пока нечего."
+              : `Приложений в списке: ${st.apps}. Остальной трафик идёт напрямую, как обычно.`}
+          </p>
+          <p className="hint">
+            ⚠️ При включении система спросит права администратора: перехват
+            создаёт сетевой интерфейс, без прав это невозможно.
+          </p>
+        </>
+      )}
+      {err && <p className="note">{err}</p>}
+      {st.error && !err && <p className="hint mono">{st.error}</p>}
+    </div>
+  );
+}
+
 /* ─────────────── Настройки ─────────────── */
 
 function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
@@ -1077,6 +1153,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
       <Upstreams defaultName={st?.default_upstream ?? ""} onSaved={onSaved} />
 
+      <Tunnel />
       <div className="card">
         <h3>Локальные порты</h3>
         <p className="hint">

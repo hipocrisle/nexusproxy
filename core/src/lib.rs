@@ -50,6 +50,14 @@ pub struct Engine {
 pub const NO_PROXY: &str = "localhost,127.0.0.1,::1";
 
 /// Папка, куда кладём скачанный xray и его настройки.
+/// Куда кладём движок перехвата — рядом с настройками, своей папкой.
+pub fn tunnel_dir(config_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(config_path)
+        .parent()
+        .map(|p| p.join("tunnel"))
+        .unwrap_or_else(|| std::path::PathBuf::from("tunnel"))
+}
+
 pub fn xray_dir(config_path: &str) -> std::path::PathBuf {
     std::path::Path::new(config_path)
         .parent()

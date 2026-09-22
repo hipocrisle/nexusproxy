@@ -128,6 +128,14 @@ pub struct Config {
     /// вовсе, поэтому и подбор доменов для них пуст.
     #[serde(default)]
     pub apps: Vec<crate::launch::App>,
+    /// Режим перехвата: трафик выбранных приложений забирается
+    /// независимо от того, умеют ли они работать через прокси.
+    ///
+    /// Нужен для программ вроде Cursor, которые ходят мимо системных
+    /// настроек. Требует прав администратора — создаётся сетевой
+    /// интерфейс.
+    #[serde(default)]
+    pub tunnel_mode: bool,
     /// Подписка со странами. Хранится, чтобы поднимать их при запуске.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
@@ -357,6 +365,7 @@ mod tests {
             groups: vec![],
             through_proxy: through.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
+            tunnel_mode: false,
             auto_reconnect: true,
             minimize_to_tray: true,
             enable_on_start: true,

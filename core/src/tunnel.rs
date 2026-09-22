@@ -436,3 +436,79 @@ pub fn start(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(),
     }
     Ok(())
 }
+
+/// Запустить движок с правами администратора.
+///
+/// ⛔ Сетевой интерфейс без них не создать. Поэтому здесь просим
+/// повышение у системы: человек один раз подтверждает, и перехват
+/// работает. Обычное окно программы правами не обладает и обладать
+/// не должно — иначе их требовал бы каждый её запуск, как у Proxifier.
+#[cfg(windows)]
+pub fn start_elevated(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+
+    if routes.is_empty() {
+        return Err("нет ни одного приложения — перехватывать нечего".into());
+    }
+    let bin = binary_path(dir);
+    if !bin.is_file() {
+        return Err("движок перехвата ещё не скачан".into());
+    }
+
+    let cfg_path = dir.join("tunnel-config.json");
+    std::fs::write(&cfg_path, serde_json::to_vec_pretty(&build_config(routes, upstreams)).unwrap())
+        .map_err(|e| format!("не записать настройки: {e}"))?;
+
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let verb = wide(std::ffi::OsStr::new("runas"));
+    let file = wide(bin.as_os_str());
+    let args = wide(std::ffi::OsStr::new(
+        &format!("run -c \"{}\"", cfg_path.display())));
+    let cwd = wide(dir.as_os_str());
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = args.as_ptr();
+    info.lpDirectory = cwd.as_ptr();
+    info.nShow = 0; // без окна
+
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        // Человек мог нажать «Нет» в окне подтверждения — это не ошибка
+        // программы, и говорить надо именно так.
+        return Err("права администратора не выданы — перехват не включён".into());
+    }
+    *ELEVATED.lock().unwrap() = Some(info.hProcess as isize);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn start_elevated(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(), String> {
+    // На macOS повышение прав устроено иначе; пока запускаем как есть —
+    // если прав не хватит, start() скажет об этом прямо.
+    start(dir, routes, upstreams)
+}
+
+static ELEVATED: Mutex<Option<isize>> = Mutex::new(None);
+
+/// Остановить движок, запущенный с повышением.
+#[cfg(windows)]
+pub fn stop_elevated() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::TerminateProcess;
+    if let Some(h) = ELEVATED.lock().unwrap().take() {
+        unsafe {
+            TerminateProcess(h as *mut std::ffi::c_void, 0);
+            CloseHandle(h as *mut std::ffi::c_void);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn stop_elevated() { stop(); }
