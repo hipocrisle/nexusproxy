@@ -35,6 +35,14 @@ pub struct App {
     /// где запущенная через нас программа всё равно ходит напрямую.
     #[serde(default)]
     pub via: String,
+    /// Запретить программе HTTP/2.
+    ///
+    /// Корпоративные прокси, разбирающие TLS, часто не переваривают
+    /// HTTP/2 и отвечают отказом. Внутри туннеля мы этого не видим —
+    /// там шифрованный поток, — поэтому запрещать приходится самой
+    /// программе, до того как она откроет соединение.
+    #[serde(default)]
+    pub no_http2: bool,
     /// Гнать через прокси и WebRTC — видеозвонки и трансляции.
     ///
     /// Без этого Chromium ведёт медиа по UDP мимо прокси: в обычной
@@ -86,6 +94,9 @@ pub fn explain(app: &App, socks_port: u16, http_port: u16) -> String {
                  ходит и тем, и другим");
             if app.webrtc_via_proxy {
                 t.push_str(", WebRTC тоже через прокси");
+            }
+            if app.no_http2 {
+                t.push_str(", HTTP/2 запрещён");
             }
             if !app.args.is_empty() {
                 t.push_str(&format!(", свои ключи: {}", app.args.join(" ")));
@@ -173,6 +184,9 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
             if app.webrtc_via_proxy {
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
             }
+            if app.no_http2 {
+                cmd.arg("--disable-http2");
+            }
         }
         _ => {}
     }
@@ -213,10 +227,10 @@ mod tests {
     #[test]
     fn человеку_объясняем_способ_до_запуска() {
         let a = App { name: "Cursor".into(), path: "Cursor.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("socks5"));
         let b = App { name: "Своё".into(), path: "my.exe".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
         assert!(explain(&b, 18081, 18080).contains("HTTP_PROXY"));
     }
 
@@ -232,7 +246,7 @@ mod tests {
     #[test]
     fn несуществующий_файл_отвергается_с_объяснением() {
         let a = App { name: "Нет".into(), path: "/нет/такого".into(),
-                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, via: String::new() };
+                      kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false, via: String::new() };
         let e = start(&a, 18081, 18080).unwrap_err();
         assert!(e.contains("не найден"), "{e}");
     }
@@ -247,7 +261,7 @@ mod webrtc_tests {
     #[test]
     fn webrtc_через_прокси_виден_до_запуска() {
         let mut a = App { name: "Chrome".into(), path: "chrome.exe".into(),
-                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true, via: String::new() };
+                          kind: Kind::Chromium, args: vec![], webrtc_via_proxy: true, no_http2: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("WebRTC"),
                 "человек должен видеть это до запуска");
         a.webrtc_via_proxy = false;
@@ -258,7 +272,7 @@ mod webrtc_tests {
     fn свои_ключи_показываются() {
         let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
                       kind: Kind::Chromium, args: vec!["--incognito".into()],
-                      webrtc_via_proxy: false, via: String::new() };
+                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
         assert!(explain(&a, 18081, 18080).contains("--incognito"));
     }
 }
@@ -274,9 +288,27 @@ mod electron_tests {
     fn chromium_получает_и_ключ_и_переменные() {
         let a = App { name: "Cursor".into(), path: "cursor.exe".into(),
                       kind: Kind::Chromium, args: vec![],
-                      webrtc_via_proxy: false, via: String::new() };
+                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
         let t = explain(&a, 18081, 18080);
         assert!(t.contains("--proxy-server"), "{t}");
         assert!(t.contains("HTTP_PROXY"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod http2_tests {
+    use super::*;
+
+    /// Корпоративные прокси, разбирающие TLS, часто не переваривают
+    /// HTTP/2 и отвечают отказом. Внутри туннеля мы этого не видим —
+    /// запретить может только сама программа, при запуске.
+    #[test]
+    fn запрет_http2_виден_до_запуска() {
+        let mut a = App { name: "Cursor".into(), path: "cursor.exe".into(),
+                          kind: Kind::Chromium, args: vec![],
+                          webrtc_via_proxy: false, no_http2: true, via: String::new() };
+        assert!(explain(&a, 18081, 18080).contains("HTTP/2"));
+        a.no_http2 = false;
+        assert!(!explain(&a, 18081, 18080).contains("HTTP/2"));
     }
 }

@@ -628,6 +628,7 @@ function describe(a: LaunchApp): string {
   const kinds = { auto: "способ выберем сами", chromium: "как Chromium", env: "через переменные окружения" };
   const parts = [a.via ? `весь трафик через «${a.via}»` : "по общим правилам", kinds[a.kind]];
   if (a.webrtc_via_proxy) parts.push("видео и звонки тоже через прокси");
+  if (a.no_http2) parts.push("HTTP/2 запрещён");
   if (a.args.length) parts.push("ключи: " + a.args.join(" "));
   return parts.join(" · ");
 }
@@ -650,7 +651,7 @@ const EXE_FILTERS = (() => {
 
 type LaunchApp = {
   name: string; path: string; kind: "auto" | "chromium" | "env";
-  args: string[]; webrtc_via_proxy: boolean; via: string;
+  args: string[]; webrtc_via_proxy: boolean; no_http2: boolean; via: string;
 };
 
 /// Cursor, VS Code и прочий Electron системные настройки прокси не читают —
@@ -663,6 +664,7 @@ function Apps() {
   const [kind, setKind] = useState<LaunchApp["kind"]>("auto");
   const [argsText, setArgsText] = useState("");
   const [webrtc, setWebrtc] = useState(false);
+  const [noH2, setNoH2] = useState(false);
   // Путь записи, которую правим. Пусто — добавляем новую.
   const [editing, setEditing] = useState<string | null>(null);
   const [via, setVia] = useState("");
@@ -681,9 +683,9 @@ function Apps() {
   useEffect(() => {
     if (!path.trim()) { setHint(""); return; }
     invoke<string>("app_explain", {
-      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, via },
+      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, no_http2: noH2, via },
     }).then(setHint).catch(() => setHint(""));
-  }, [path, kind, name, argsText, webrtc, via]);
+  }, [path, kind, name, argsText, webrtc, noH2, via]);
 
   const pick = async () => {
     const picked = await openFile({
@@ -702,7 +704,7 @@ function Apps() {
     if (!path.trim()) return;
     try {
       await invoke("app_save", {
-        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, via },
+        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, no_http2: noH2, via },
       });
       // путь правили — старая запись осталась бы вторым, мёртвым пунктом
       if (editing && editing !== path) await invoke("app_remove", { path: editing });
@@ -712,12 +714,12 @@ function Apps() {
 
   const reset = () => {
     setName(""); setPath(""); setKind("auto");
-    setArgsText(""); setWebrtc(false); setVia(""); setEditing(null);
+    setArgsText(""); setWebrtc(false); setNoH2(false); setVia(""); setEditing(null);
   };
 
   const edit = (a: LaunchApp) => {
     setName(a.name); setPath(a.path); setKind(a.kind);
-    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy); setVia(a.via || "");
+    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy); setNoH2(a.no_http2); setVia(a.via || "");
     setEditing(a.path);
   };
 
@@ -776,12 +778,24 @@ function Apps() {
           <input type="checkbox" checked={webrtc} onChange={e => setWebrtc(e.target.checked)} />
           Видео и звонки тоже через прокси
         </label>
+        <label className="check">
+          <input type="checkbox" checked={noH2} onChange={e => setNoH2(e.target.checked)} />
+          Запретить HTTP/2
+        </label>
       </div>
       <p className="hint">
         Chromium по умолчанию ведёт видеозвонки и трансляции мимо прокси —
         напрямую, по UDP. В обычной сети так быстрее, но там, где наружу
         пускает только прокси, видео просто не появляется. Галка это
         запрещает. Firefox таких ключей не понимает.
+      </p>
+      <p className="hint">
+        «Запретить HTTP/2» ставьте, если программа открывается и частично
+        работает, но часть её функций отвечает отказом. Так ведёт себя
+        корпоративный прокси, который разбирает TLS и не переваривает
+        HTTP/2. Изнутри соединения мы этого не видим — там шифр, — поэтому
+        запрещает сама программа при запуске. Галка своя у каждой
+        программы: кому HTTP/2 нужен, тот его и получит.
       </p>
       {hint && <p className="hint mono">{hint}</p>}
 
