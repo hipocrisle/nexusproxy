@@ -755,6 +755,7 @@ fn default_config() -> core::config::Config {
         defaults_applied: false,
         subscription: None,
         apps: vec![],
+        tunnel_mode: false,
         extra: Default::default(),
     }
 }
@@ -854,6 +855,83 @@ async fn reach_check(app: AppHandle, host: String, port: u16, via: String) -> Re
             .ok_or_else(|| format!("прокси «{name}» не найден"))?
     };
     core::upstream::reach(&up, &host, port).await
+}
+
+/// Что сейчас с перехватом: скачан ли движок, работает ли, почему нет.
+#[tauri::command]
+fn tunnel_state(app: State<App>) -> serde_json::Value {
+    let path = app.path.lock().unwrap().clone();
+    let dir = core::tunnel_dir(&path);
+    let (mode, apps) = match engine(&app) {
+        Ok(e) => { let c = e.cfg.lock().unwrap(); (c.tunnel_mode, c.apps.len()) }
+        Err(_) => (false, 0),
+    };
+    serde_json::json!({
+        "installed": core::tunnel::is_installed(&dir),
+        "running": core::tunnel::is_running(),
+        "mode": mode,
+        "apps": apps,
+        "error": core::tunnel::last_error(),
+    })
+}
+
+/// Скачать движок перехвата — он не входит в состав программы.
+#[tauri::command]
+async fn tunnel_install(app: AppHandle) -> Result<String, String> {
+    let dir = {
+        let s = app.state::<App>();
+        let path = s.path.lock().unwrap().clone();
+        core::tunnel_dir(&path)
+    };
+    tokio::task::spawn_blocking(move || core::tunnel::download(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Включить или выключить перехват.
+#[tauri::command]
+async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
+    let (dir, routes, ups) = {
+        let state = app.state::<App>();
+        let path = state.path.lock().unwrap().clone();
+        let dir = core::tunnel_dir(&path);
+        let e = engine(&state)?;
+        let mut c = e.cfg.lock().unwrap();
+        c.tunnel_mode = on;
+        let routes: Vec<core::tunnel::Route> = c.apps.iter()
+            .filter(|a| !a.via.trim().is_empty())
+            .map(|a| core::tunnel::Route {
+                process: std::path::Path::new(&a.path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(&a.path).to_string(),
+                via: a.via.clone(),
+            })
+            .collect();
+        let ups: Vec<core::tunnel::Upstream> = c.all_upstreams().into_iter()
+            .map(|u| core::tunnel::Upstream {
+                tag: u.name.clone(),
+                kind: match u.kind {
+                    core::upstream::Kind::Socks5 => core::tunnel::Kind::Socks5,
+                    core::upstream::Kind::Http => core::tunnel::Kind::Http,
+                },
+                address: u.address.clone(), port: u.port,
+                user: u.user.clone(), password: u.password.clone(),
+            })
+            .collect();
+        (dir, routes, ups)
+    };
+    { let s = app.state::<App>(); engine(&s)?.apply_and_save()?; }
+
+    tokio::task::spawn_blocking(move || {
+        if on {
+            core::tunnel::start_elevated(&dir, &routes, &ups)
+        } else {
+            core::tunnel::stop_elevated();
+            core::tunnel::stop();
+            Ok(())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1014,7 +1092,7 @@ pub fn run() {
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
             apps_list, app_save, app_remove, app_explain, app_launch,
-            reach_check
+            tunnel_state, tunnel_install, tunnel_set
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
