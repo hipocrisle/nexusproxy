@@ -1052,6 +1052,7 @@ function Tunnel() {
   const [st, setSt] = useState<TunnelState | null>(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
+  const [log, setLog] = useState("");
 
   const load = useCallback(() => {
     invoke<TunnelState>("tunnel_state").then(setSt).catch(() => {});
@@ -1069,7 +1070,11 @@ function Tunnel() {
   const toggle = async (on: boolean) => {
     setErr(""); setBusy(on ? "Включаю…" : "Выключаю…");
     try { await invoke("tunnel_set", { on }); }
-    catch (e) { setErr(String(e)); }
+    catch (e) {
+      setErr(String(e));
+      // при неудаче показываем, на что ругнулся движок
+      invoke<string>("tunnel_log").then(setLog).catch(() => {});
+    }
     finally { setBusy(""); load(); }
   };
 
@@ -1109,7 +1114,7 @@ function Tunnel() {
         </>
       )}
       {err && <p className="note">{err}</p>}
-      {st.error && !err && <p className="hint mono">{st.error}</p>}
+      {log && <pre className="log" style={{ maxHeight: 160 }}>{log}</pre>}
     </div>
   );
 }

@@ -232,3 +232,50 @@ mod electron_tests {
 }
 
 
+
+/// Как процесс этой программы зовётся в системе.
+///
+/// ⛔ На macOS `.app` — это папка, а настоящий исполняемый файл лежит
+/// внутри, в `Contents/MacOS`. Система показывает процесс по его имени
+/// («Cursor»), а не по имени папки («Cursor.app»). Отдав перехвату имя
+/// папки, мы заставляем его искать процесс, которого не существует:
+/// перехват работает, а трафик приложения идёт мимо.
+pub fn process_name(path: &str) -> String {
+    let p = Path::new(path);
+    #[cfg(target_os = "macos")]
+    {
+        if p.extension().map(|e| e == "app").unwrap_or(false) {
+            return real_exe(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    // ⛔ Режем по обоим разделителям, а не средствами системы: настройки
+    // переносят между Windows и macOS, и на Linux путь вида C:\a\b.exe
+    // целиком сошёл бы за имя файла.
+    let _ = p;
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
+}
+
+#[cfg(test)]
+mod process_name_tests {
+    use super::*;
+
+    #[test]
+    fn обычный_файл_берётся_как_есть() {
+        assert_eq!(process_name(r"C:\Program Files\cursor\Cursor.exe"), "Cursor.exe");
+        assert_eq!(process_name("/usr/bin/curl"), "curl");
+    }
+
+    /// ⛔ На macOS процесс зовётся по файлу внутри бандла. Отдав имя
+    /// папки, перехват искал бы несуществующий процесс, и трафик шёл бы
+    /// мимо — перехват «включён», а толку нет.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn у_бандла_берём_имя_внутреннего_файла() {
+        let n = process_name("/Applications/Cursor.app");
+        assert!(!n.ends_with(".app"), "имя папки процессом не бывает: {n}");
+    }
+}
