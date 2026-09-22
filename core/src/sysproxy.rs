@@ -37,6 +37,12 @@ pub fn restore(s: &Saved) {
     }
 }
 
+/// Убрать за версиями до 0.9.16, которые писали переменные окружения
+/// пользователя. Возвращает имена убранных — их стоит записать в журнал.
+pub fn sweep_stale_env() -> Vec<String> {
+    crate::winproxy::sweep_stale_env()
+}
+
 pub fn current() -> String {
     #[cfg(windows)]
     { return crate::winproxy::current(); }
