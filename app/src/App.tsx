@@ -610,11 +610,19 @@ function Apps() {
   const load = useCallback(() => {
     invoke<LaunchApp[]>("apps_list").then(setItems).catch(() => {});
     invoke<{ upstreams: Upstream[] }>("upstreams_list")
-      .then((u) => setUps(u.upstreams)).catch(() => {});
+      .then((u) => {
+        setUps(u.upstreams);
+        // прокси у приложения обязателен: ради него его сюда и добавляют
+        setVia((v) => v || u.upstreams[0]?.name || "");
+      })
+      .catch(() => {});
   }, []);
   useEffect(load, [load]);
 
-  const reset = () => { setName(""); setPath(""); setVia(""); setEditing(null); };
+  const reset = () => {
+    setName(""); setPath(""); setEditing(null);
+    setVia(ups[0]?.name || "");
+  };
 
   const pick = async () => {
     const picked = await openFile({ multiple: false, filters: EXE_FILTERS });
@@ -656,8 +664,8 @@ function Apps() {
       <div className="card">
         <h3>{editing ? "Изменить приложение" : "Добавить приложение"}</h3>
         <p className="hint">
-          Весь трафик приложения пойдёт через выбранный прокси. Правила по
-          доменам к нему не применяются.
+          Весь трафик приложения пойдёт через выбранный прокси — целиком,
+          не разбирая адреса.
         </p>
         <div className="row wrap">
           <input value={name} onChange={e => setName(e.target.value)}
@@ -669,7 +677,6 @@ function Apps() {
         <div className="row wrap">
           <span className="hint">Через:</span>
           <select value={via} onChange={e => setVia(e.target.value)}>
-            <option value="">по правилам доменов</option>
             {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
           </select>
           <button className="btn primary" onClick={save} disabled={!path.trim()}>
@@ -689,9 +696,7 @@ function Apps() {
                   <b>{a.name}</b>
                   <br /><span className="hint mono">{a.path}</span>
                 </span>
-                <span className={"tag " + (a.via ? "proxy" : "direct")}>
-                  {a.via || "по правилам"}
-                </span>
+                <span className="tag proxy">{a.via}</span>
                 <button className="btn small" onClick={() => launch(a.path)}>Запустить</button>
                 <button className="btn small" onClick={() => edit(a)}>Изменить</button>
                 <button className="btn small" onClick={() => remove(a.path)}>Убрать</button>

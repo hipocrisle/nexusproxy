@@ -785,6 +785,13 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<(), String> {
         return Err("не указан путь к программе".into());
     }
     let e = engine(&state)?;
+    // Прокси у приложения обязателен: ради него его сюда и добавляют.
+    // Пустое значение оставляло бы приложение жить по общим правилам —
+    // ровно то, что было бы и без записи в списке.
+    let mut item = item;
+    if item.via.trim().is_empty() {
+        item.via = e.cfg.lock().unwrap().default_upstream.clone();
+    }
     {
         let mut c = e.cfg.lock().unwrap();
         match c.apps.iter_mut().find(|a| a.path == item.path) {
