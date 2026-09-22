@@ -134,7 +134,13 @@ pub async fn dial(routing: &std::sync::RwLock<Routing>, rules: &std::sync::RwLoc
 
     let stream = match route {
         Route::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, "запрещено правилом")),
-        Route::Direct => TcpStream::connect((host, port)).await,
+        Route::Direct => {
+            // без этого мелкие пакеты копятся алгоритмом Нейгла до 200 мс:
+            // для потокового обмена это заметная задержка на ровном месте
+            let s = TcpStream::connect((host, port)).await;
+            if let Ok(s) = &s { s.set_nodelay(true).ok(); }
+            s
+        }
         Route::Proxy(_) => {
             let up = up.as_ref().expect("прокси выбран выше");
             // Прокси может моргнуть — сеть переключилась, он перезапустился.

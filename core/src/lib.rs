@@ -400,7 +400,7 @@ impl Engine {
         // сторож должен сразу проверить изменившийся список прокси
         self.recheck.notify_waiters();
         // рвём то, что теперь должно идти иначе, иначе правка не подействует
-        let dropped = conns::drop_changed(&self.rules);
+        let dropped = conns::drop_changed(&self.rules, &self.apps);
         if dropped > 0 {
             logfile::line(&logfile::now_stamp(),
                           &format!("правила изменены, разорвано соединений: {dropped}"));
