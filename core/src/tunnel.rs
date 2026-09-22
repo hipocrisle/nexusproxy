@@ -528,3 +528,15 @@ pub fn kill_orphans(dir: &Path) -> usize {
     }
     crate::xray::kill_orphans(&bin)
 }
+
+/// Записать настройки для движка. Служба читает их при запуске.
+pub fn write_config(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
+    let cfg = build_config(routes, upstreams);
+    std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
+        .map_err(|e| format!("не записать настройки: {e}"))
+}
+
+pub fn config_path(dir: &Path) -> PathBuf {
+    dir.join("tunnel-config.json")
+}

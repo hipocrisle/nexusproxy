@@ -11,6 +11,7 @@ pub mod journal;
 pub mod approutes;
 pub mod launch;
 pub mod tunnel;
+pub mod tunnel_service;
 pub mod logfile;
 pub mod macproxy;
 pub mod presets;
@@ -483,6 +484,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Выключить перехват — и службой, и напрямую.
+    ///
+    /// Оба пути нужны: служба могла быть не установлена, а движок
+    /// запущен с разовым повышением прав.
+    pub fn tunnel_off(&self) {
+        let _ = tunnel_service::stop();
+        tunnel::stop_elevated();
+        tunnel::stop();
+    }
+
     pub fn system_proxy_off(&self) {
         if let Some(s) = self.saved.lock().unwrap().take() {
             sysproxy::restore(&s);
@@ -496,6 +507,11 @@ impl Engine {
 
     pub fn shutdown(&self) {
         xray::stop();
+        // ⛔ Перехват снимаем первым делом. Он держит сетевой интерфейс:
+        // оставшись работать после выхода, он продолжит заворачивать
+        // трафик, а окно программы закрыто — причину не найти. Страдать
+        // будут все остальные программы, не только наши.
+        self.tunnel_off();
         // ⛔ Перехват снимаем ПЕРВЫМ делом: он держит сетевой интерфейс,
         // и оставить его работающим после выхода — значит оставить
         // человека без половины сети без всяких объяснений.
