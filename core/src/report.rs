@@ -55,7 +55,6 @@ struct Live {
 
 struct Session {
     started: Instant,
-    baseline: BTreeSet<String>,
     seen: BTreeMap<String, (u32, Route, Option<String>)>,
 }
 
@@ -74,7 +73,6 @@ pub fn start_session() {
     if let Some(l) = STATE.lock().unwrap().as_mut() {
         l.session = Some(Session {
             started: Instant::now(),
-            baseline: l.ever.clone(),
             seen: BTreeMap::new(),
         });
     }
@@ -110,7 +108,7 @@ pub fn live_candidates() -> Vec<Candidate> {
     let g = STATE.lock().unwrap();
     let Some(l) = g.as_ref() else { return Vec::new() };
     let Some(s) = l.session.as_ref() else { return Vec::new() };
-    group(s.seen.iter().filter(|(h, (_, r, _))| *r != Route::proxy() && !s.baseline.contains(*h)))
+    group(s.seen.iter().filter(|(_, (_, r, _))| *r != Route::proxy()))
 }
 
 /// Свести имена узлов к доменам.
@@ -152,11 +150,7 @@ pub fn finish_session() -> Option<SessionResult> {
     let mut g = STATE.lock().unwrap();
     let l = g.as_mut()?;
     let s = l.session.take()?;
-    let fresh: BTreeMap<String, (u32, Route, Option<String>)> = s
-        .seen
-        .into_iter()
-        .filter(|(h, _)| !s.baseline.contains(h))
-        .collect();
+    let fresh: BTreeMap<String, (u32, Route, Option<String>)> = s.seen.into_iter().collect();
     let candidates = group(fresh.iter().filter(|(_, (_, r, _))| *r != Route::proxy()));
     let already = group(fresh.iter().filter(|(_, (_, r, _))| *r == Route::proxy()));
     Some(SessionResult {
@@ -177,35 +171,36 @@ mod tests {
         g
     }
 
+    /// ⛔ Раньше в подбор попадали только имена, не встречавшиеся ДО его
+    /// включения. Браузер ходит по одним и тем же адресам, поэтому список
+    /// был пуст всегда. Теперь показываем всё, что ушло мимо прокси — в
+    /// том числе то, что видели и раньше.
     #[test]
-    fn background_is_filtered_out() {
+    fn показываем_всё_что_ушло_мимо_прокси() {
         let _guard = reset();
-        // фон до начала подбора: мониторинг и реклама
-        note("monitoring.corp.example", &Route::Direct);
-        note("mc.yandex.ru", &Route::Direct);
+        note("seen.example", &Route::Direct); // видели до начала подбора
 
         start_session();
-        note("monitoring.corp.example", &Route::Direct); // снова фон
+        note("seen.example", &Route::Direct);
         note("chatgpt.com", &Route::proxy());
-        note("oaistatic.com", &Route::Direct);           // новое, рядом с прокси
+        note("oaistatic.com", &Route::Direct);
 
         let r = finish_session().unwrap();
-        let hosts: Vec<_> = r.candidates.iter().map(|c| c.domain.as_str()).collect();
-        assert_eq!(hosts, vec!["oaistatic.com"], "фон должен отсеяться");
-        assert_eq!(r.candidates[0].triggered_by.as_deref(), Some("chatgpt.com"));
-        assert_eq!(r.already_proxied.len(), 1);
+        let mut hosts: Vec<_> = r.candidates.iter().map(|c| c.domain.clone()).collect();
+        hosts.sort();
+        assert_eq!(hosts, vec!["oaistatic.com", "seen.example"],
+                   "виденное раньше тоже должно предлагаться");
+        assert_eq!(r.already_proxied.len(), 1, "ушедшее через прокси — отдельно");
     }
 
     #[test]
-    fn live_list_updates_during_session() {
+    fn список_наполняется_по_ходу() {
         let _guard = reset();
-        note("bg.example", &Route::Direct);
         start_session();
         note("chatgpt.com", &Route::proxy());
         note("oaistatic.com", &Route::Direct);
-        note("bg.example", &Route::Direct);
         let live = live_candidates();
-        assert_eq!(live.len(), 1, "фон и уже-проксируемые в список не идут");
+        assert_eq!(live.len(), 1, "ушедшее через прокси в подбор не идёт");
         assert_eq!(live[0].domain, "oaistatic.com");
         assert_eq!(live[0].triggered_by.as_deref(), Some("chatgpt.com"));
         assert!(session_active(), "подбор не должен прерываться");
@@ -228,14 +223,17 @@ mod tests {
         assert_eq!(live[0].triggered_by.as_deref(), Some("youtube.com"));
     }
 
+    /// Пустой список означает ровно одно: за время наблюдения мимо
+    /// прокси не ушло ничего. Если человек видит пустоту — значит
+    /// добавлять нечего, а не «подбор сломался».
     #[test]
-    fn nothing_new_gives_empty_list() {
+    fn без_обращений_мимо_прокси_список_пуст() {
         let _guard = reset();
-        note("a.example", &Route::Direct);
         start_session();
-        note("a.example", &Route::Direct);
+        note("a.example", &Route::proxy());
         let r = finish_session().unwrap();
-        assert!(r.candidates.is_empty());
+        assert!(r.candidates.is_empty(), "всё ушло через прокси — предлагать нечего");
+        assert_eq!(r.already_proxied.len(), 1);
     }
 
     #[test]

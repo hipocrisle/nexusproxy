@@ -185,7 +185,7 @@ export default function App() {
       <Alerts st={st} onChange={refresh} />
 
       <div className="tabs">
-        {([["rules", "Правила"], ["apps", "Программы"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
+        {([["rules", "Правила"], ["apps", "Приложения"], ["discover", "Подбор доменов"], ["conns", "Соединения"],
            ["log", "Журнал"], ["settings", "Настройки"]] as const)
           .map(([k, label]) => (
             <button key={k} className={"tab" + (tab === k ? " sel" : "")} onClick={() => setTab(k)}>
@@ -332,11 +332,6 @@ function Rules({ onChange }: { onChange: () => void }) {
   const [result, setResult] = useState<Bulk | null>(null);
   const [probe, setProbe] = useState("");
   const [verdicts, setVerdicts] = useState<{ host: string; route: string }[]>([]);
-  const [reachHost, setReachHost] = useState("");
-  const [reachPort, setReachPort] = useState("443");
-  const [reachVia, setReachVia] = useSticky("reach.via", "");
-  const [reachSaid, setReachSaid] = useState("");
-  const [reaching, setReaching] = useState(false);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [filter, setFilter] = useSticky("rules.filter", "");
   const [editing, setEditing] = useState<string | null>(null);
@@ -385,16 +380,6 @@ function Rules({ onChange }: { onChange: () => void }) {
   };
 
 
-  // Настоящее соединение через прокси: отличает «не пускает» от «молчит».
-  const doReach = async () => {
-    setReaching(true); setReachSaid("");
-    try {
-      setReachSaid(await invoke<string>("reach_check", {
-        host: reachHost.trim(), port: Number(reachPort) || 443, via: reachVia,
-      }));
-    } catch (e) { setReachSaid(String(e)); }
-    finally { setReaching(false); }
-  };
   const plain = items.filter((i) => !i.pattern.startsWith("_"));
   const shown = plain.filter((i) => !filter || i.pattern.toLowerCase().includes(filter.toLowerCase()));
   const copyAll = () => navigator.clipboard.writeText(shown.map((i) => i.pattern).join("\n"));
@@ -533,32 +518,7 @@ function Rules({ onChange }: { onChange: () => void }) {
         )}
       </div>
 
-      <div className="card">
-        <h3>Пускает ли прокси на этот адрес</h3>
-        <p className="hint">
-          Настоящее соединение, а не разбор правил. У корпоративных прокси
-          свой список разрешённого, и «не работает» может значить как
-          «прокси туда не пускает», так и «сам адрес молчит» — лечится это
-          по-разному.
-        </p>
-        <div className="row">
-          <input className="field" value={reachHost} placeholder="turn-fra-1.dolby.io"
-            onChange={(e) => setReachHost(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && doReach()} />
-          <input className="field" value={reachPort} style={{ maxWidth: 80 }}
-            onChange={(e) => setReachPort(e.target.value)} />
-          <select value={reachVia} onChange={(e) => setReachVia(e.target.value)}>
-            <option value="">по умолчанию</option>
-            {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
-          </select>
-          <button className="btn" onClick={doReach} disabled={reaching || !reachHost.trim()}>
-            {reaching ? "Проверяю…" : "Проверить"}
-          </button>
-        </div>
-        {reachSaid && <p className="hint" style={{ marginTop: 8 }}>{reachSaid}</p>}
-      </div>
-
-      <div className="card wide">
+            <div className="card wide">
         <div className="row" style={{ marginBottom: 8 }}>
           <h3 style={{ margin: 0 }}>В списке — {plain.length}</h3>
           {ups.length > 1 && <span className="meta">колонка справа — назначенный прокси</span>}
@@ -623,25 +583,6 @@ function Rules({ onChange }: { onChange: () => void }) {
 
 // На Windows отбираем .exe, на macOS — бандлы .app; в Linux
 // исполняемые файлы расширения не имеют, поэтому не фильтруем вовсе.
-// Что именно сделает запись — видно в списке, без захода в правку.
-function describe(a: LaunchApp): string {
-  const kinds = { auto: "способ выберем сами", chromium: "как Chromium", env: "через переменные окружения" };
-  const parts = [a.via ? `весь трафик через «${a.via}»` : "по общим правилам", kinds[a.kind]];
-  if (a.webrtc_via_proxy) parts.push("видео и звонки тоже через прокси");
-  if (a.no_http2) parts.push("HTTP/2 запрещён");
-  if (a.args.length) parts.push("ключи: " + a.args.join(" "));
-  return parts.join(" · ");
-}
-
-// Ключи вводят строкой, как в ярлыке: делим по пробелам, кавычки бережём.
-function splitArgs(text: string): string[] {
-  const out: string[] = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
-  return out;
-}
-
 const EXE_FILTERS = (() => {
   const ua = navigator.userAgent;
   if (ua.includes("Windows")) return [{ name: "Программа", extensions: ["exe"] }];
@@ -659,17 +600,11 @@ type LaunchApp = {
 /// Здесь мы запускаем такую программу сами, передав ей адрес прокси напрямую.
 function Apps() {
   const [items, setItems] = useState<LaunchApp[]>([]);
+  const [ups, setUps] = useState<Upstream[]>([]);
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
-  const [kind, setKind] = useState<LaunchApp["kind"]>("auto");
-  const [argsText, setArgsText] = useState("");
-  const [webrtc, setWebrtc] = useState(false);
-  const [noH2, setNoH2] = useState(false);
-  // Путь записи, которую правим. Пусто — добавляем новую.
-  const [editing, setEditing] = useState<string | null>(null);
   const [via, setVia] = useState("");
-  const [ups, setUps] = useState<Upstream[]>([]);
-  const [hint, setHint] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
   const [said, setSaid] = useState("");
 
   const load = useCallback(() => {
@@ -679,19 +614,10 @@ function Apps() {
   }, []);
   useEffect(load, [load]);
 
-  // Показываем ключ запуска ДО того, как человек нажмёт «Запустить».
-  useEffect(() => {
-    if (!path.trim()) { setHint(""); return; }
-    invoke<string>("app_explain", {
-      item: { name: name || "программа", path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, no_http2: noH2, via },
-    }).then(setHint).catch(() => setHint(""));
-  }, [path, kind, name, argsText, webrtc, noH2, via]);
+  const reset = () => { setName(""); setPath(""); setVia(""); setEditing(null); };
 
   const pick = async () => {
-    const picked = await openFile({
-      multiple: false,
-      filters: EXE_FILTERS,
-    });
+    const picked = await openFile({ multiple: false, filters: EXE_FILTERS });
     if (typeof picked !== "string") return;
     setPath(picked);
     if (!name.trim()) {
@@ -704,23 +630,16 @@ function Apps() {
     if (!path.trim()) return;
     try {
       await invoke("app_save", {
-        item: { name: name.trim() || path, path, kind, args: splitArgs(argsText), webrtc_via_proxy: webrtc, no_http2: noH2, via },
+        item: { name: name.trim() || path, path, kind: "auto", args: [],
+                webrtc_via_proxy: false, no_http2: false, via },
       });
-      // путь правили — старая запись осталась бы вторым, мёртвым пунктом
       if (editing && editing !== path) await invoke("app_remove", { path: editing });
       reset(); load();
     } catch (e) { alert(String(e)); }
   };
 
-  const reset = () => {
-    setName(""); setPath(""); setKind("auto");
-    setArgsText(""); setWebrtc(false); setNoH2(false); setVia(""); setEditing(null);
-  };
-
   const edit = (a: LaunchApp) => {
-    setName(a.name); setPath(a.path); setKind(a.kind);
-    setArgsText(a.args.join(" ")); setWebrtc(a.webrtc_via_proxy); setNoH2(a.no_http2); setVia(a.via || "");
-    setEditing(a.path);
+    setName(a.name); setPath(a.path); setVia(a.via || ""); setEditing(a.path);
   };
 
   const launch = async (p: string) => {
@@ -735,92 +654,58 @@ function Apps() {
 
   return (
     <div className="pane">
-      <p className="hint">
-        Некоторые программы — Cursor, VS Code, часть консольных —
-        не смотрят в системные настройки прокси. Добавьте их сюда и
-        запускайте отсюда: адрес прокси мы передадим им напрямую.
-      </p>
-      <p className="hint">
-        ⚠️ Перед запуском закройте программу полностью. Иначе она просто
-        откроет новое окно уже работающей копии — без прокси.
-      </p>
-
-      <div className="row wrap">
-        <input value={name} onChange={e => setName(e.target.value)}
-               placeholder="Название" style={{ width: 160 }} />
-        <input value={path} onChange={e => setPath(e.target.value)}
-               placeholder="Путь к программе" style={{ flex: 1, minWidth: 220 }} />
-        <button onClick={pick}>Выбрать…</button>
-        <select value={kind} onChange={e => setKind(e.target.value as LaunchApp["kind"])}>
-          <option value="auto">Определить самим</option>
-          <option value="chromium">Как Chromium</option>
-          <option value="env">Через переменные окружения</option>
-        </select>
-        <button className="primary" onClick={save} disabled={!path.trim()}>Добавить</button>
+      <div className="card">
+        <h3>{editing ? "Изменить приложение" : "Добавить приложение"}</h3>
+        <p className="hint">
+          Весь трафик приложения пойдёт через выбранный прокси. Правила по
+          доменам к нему не применяются.
+        </p>
+        <div className="row wrap">
+          <input value={name} onChange={e => setName(e.target.value)}
+                 placeholder="Название" style={{ width: 170 }} />
+          <input value={path} onChange={e => setPath(e.target.value)}
+                 placeholder="Путь к программе" style={{ flex: 1, minWidth: 240 }} />
+          <button onClick={pick}>Выбрать…</button>
+        </div>
+        <div className="row wrap">
+          <span className="hint">Через:</span>
+          <select value={via} onChange={e => setVia(e.target.value)}>
+            <option value="">по правилам доменов</option>
+            {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
+          </select>
+          <button className="btn primary" onClick={save} disabled={!path.trim()}>
+            {editing ? "Сохранить" : "Добавить"}
+          </button>
+          {editing && <button className="btn" onClick={reset}>Отмена</button>}
+        </div>
       </div>
-      <div className="row wrap">
-        <span className="hint">Весь трафик программы вести через:</span>
-        <select value={via} onChange={e => setVia(e.target.value)}>
-          <option value="">по правилам, как обычно</option>
-          {ups.map((u) => <option key={u.name} value={u.name}>{u.name}</option>)}
-        </select>
-      </div>
-      <p className="hint">
-        Выбрав прокси, вы отправляете туда <b>всё</b>, что делает программа,
-        и доменные правила к ней больше не применяются — так работает
-        Proxifier. «По правилам» оставляет программу жить общей жизнью:
-        через прокси уйдёт только то, что совпало с правилом.
-      </p>
-      <div className="row wrap">
-        <input value={argsText} onChange={e => setArgsText(e.target.value)}
-               placeholder="Свои ключи запуска, через пробел" style={{ flex: 1, minWidth: 260 }} />
-        <label className="check">
-          <input type="checkbox" checked={webrtc} onChange={e => setWebrtc(e.target.checked)} />
-          Видео и звонки тоже через прокси
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={noH2} onChange={e => setNoH2(e.target.checked)} />
-          Запретить HTTP/2
-        </label>
-      </div>
-      <p className="hint">
-        Chromium по умолчанию ведёт видеозвонки и трансляции мимо прокси —
-        напрямую, по UDP. В обычной сети так быстрее, но там, где наружу
-        пускает только прокси, видео просто не появляется. Галка это
-        запрещает. Firefox таких ключей не понимает.
-      </p>
-      <p className="hint">
-        «Запретить HTTP/2» ставьте, если программа открывается и частично
-        работает, но часть её функций отвечает отказом. Так ведёт себя
-        корпоративный прокси, который разбирает TLS и не переваривает
-        HTTP/2. Изнутри соединения мы этого не видим — там шифр, — поэтому
-        запрещает сама программа при запуске. Галка своя у каждой
-        программы: кому HTTP/2 нужен, тот его и получит.
-      </p>
-      {hint && <p className="hint mono">{hint}</p>}
 
-      {items.length === 0
-        ? <p className="hint">Пока ничего не добавлено.</p>
-        : <table className="list">
-            <tbody>
-              {items.map(a => (
-                <tr key={a.path}>
-                  <td>
-                    <b>{a.name}</b><br />
-                    <span className="hint mono">{a.path}</span><br />
-                    <span className="hint">{describe(a)}</span>
-                  </td>
-                  <td style={{ whiteSpace: "nowrap" }}>
-                    <button className="primary" onClick={() => launch(a.path)}>Запустить через прокси</button>
-                    <button onClick={() => edit(a)}>Изменить</button>
-                    <button onClick={() => remove(a.path)}>Убрать</button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>}
-
-      {said && <p className="hint">{said}</p>}
+      {items.length > 0 && (
+        <div className="card">
+          <h3>Приложения</h3>
+          <div className="list">
+            {items.map(a => (
+              <div className="item" key={a.path}>
+                <span className="grow">
+                  <b>{a.name}</b>
+                  <br /><span className="hint mono">{a.path}</span>
+                </span>
+                <span className={"tag " + (a.via ? "proxy" : "direct")}>
+                  {a.via || "по правилам"}
+                </span>
+                <button className="btn small" onClick={() => launch(a.path)}>Запустить</button>
+                <button className="btn small" onClick={() => edit(a)}>Изменить</button>
+                <button className="btn small" onClick={() => remove(a.path)}>Убрать</button>
+              </div>
+            ))}
+          </div>
+          <p className="hint">
+            Перед запуском закройте программу полностью — иначе откроется
+            новое окно уже работающей копии, без прокси.
+          </p>
+          {said && <p className="hint">{said}</p>}
+        </div>
+      )}
     </div>
   );
 }
