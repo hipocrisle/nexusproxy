@@ -105,13 +105,23 @@ pub fn drop_changed_all(_rules: &std::sync::RwLock<crate::rules::Rules>) -> usiz
 ///
 /// Без этого правка правил не действует на уже открытые соединения:
 /// браузеры держат их подолгу, и человек видит «настройка не работает».
-pub fn drop_changed(rules: &std::sync::RwLock<crate::rules::Rules>) -> usize {
+pub fn drop_changed(rules: &std::sync::RwLock<crate::rules::Rules>,
+                    apps: &std::sync::RwLock<crate::approutes::AppRoutes>) -> usize {
     let g = S.lock().unwrap();
     let Some(s) = g.as_ref() else { return 0 };
     let r = rules.read().unwrap();
+    let a = apps.read().unwrap();
     let mut n = 0;
     for c in s.live.values() {
-        let now = r.decide(&c.host);
+        // ⛔ Считать путь только по доменам нельзя: у программы может быть
+        // свой прокси, и он сильнее. Иначе такое соединение выглядит как
+        // «должно идти напрямую», и его рвёт на каждом сохранении настроек.
+        // HTTP/1.1 это переживает незаметно, а HTTP/2 держит одно долгое
+        // соединение — для него обрыв означает обрыв работы.
+        let now = match a.route_for(&c.app) {
+            Some(via) => crate::rules::Route::Proxy(via.to_string()),
+            None => r.decide(&c.host),
+        };
         let same_route = now.tag() == c.route;
         let same_via = match &now {
             crate::rules::Route::Proxy(name) => name.is_empty() || *name == c.via,
@@ -235,7 +245,34 @@ mod tests {
         r.add("domain:moves.example", Route::proxy()).unwrap();
         let lock = std::sync::RwLock::new(r);
 
-        assert_eq!(drop_changed(&lock), 1, "рвётся только то, у чего путь изменился");
+        let no_apps = std::sync::RwLock::new(crate::approutes::AppRoutes::default());
+        assert_eq!(drop_changed(&lock, &no_apps), 1, "рвётся только то, у чего путь изменился");
+    }
+
+    /// У программы свой прокси — её соединения рвать нельзя, даже если по
+    /// доменным правилам они «должны идти напрямую». Иначе каждое
+    /// сохранение настроек обрывает работу: HTTP/2 держит одно долгое
+    /// соединение и обрыва не прощает.
+    #[test]
+    fn соединения_программы_со_своим_прокси_не_рвутся() {
+        use crate::launch::{App, Kind};
+        use crate::rules::{Route, Rules};
+        let _g = fresh();
+        let who = crate::proc::AppInfo {
+            name: "cursor.exe".into(), path: r"C:\Cursor\cursor.exe".into(), pid: 7,
+        };
+        let (_, _, _) = open("api2.cursor.sh", 443, "proxy", "основной", &who);
+
+        // доменных правил для него нет — по ним вышло бы «напрямую»
+        let lock = std::sync::RwLock::new(Rules::new(Route::Direct));
+        let apps = std::sync::RwLock::new(crate::approutes::AppRoutes::build(&[App {
+            name: "Cursor".into(), path: r"C:\Cursor\cursor.exe".into(),
+            kind: Kind::Auto, args: vec![], webrtc_via_proxy: false,
+            via: "основной".into(),
+        }]));
+
+        assert_eq!(drop_changed(&lock, &apps), 0,
+                   "программе назначен тот же прокси — рвать нечего");
     }
 
     #[test]
