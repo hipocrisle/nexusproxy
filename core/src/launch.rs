@@ -272,10 +272,21 @@ mod process_name_tests {
     /// ⛔ На macOS процесс зовётся по файлу внутри бандла. Отдав имя
     /// папки, перехват искал бы несуществующий процесс, и трафик шёл бы
     /// мимо — перехват «включён», а толку нет.
+    ///
+    /// Бандл собираем свой: на сборочной машине чужих программ нет, а
+    /// проверять надо разбор, а не наличие Cursor.
     #[cfg(target_os = "macos")]
     #[test]
     fn у_бандла_берём_имя_внутреннего_файла() {
-        let n = process_name("/Applications/Cursor.app");
-        assert!(!n.ends_with(".app"), "имя папки процессом не бывает: {n}");
+        let root = std::env::temp_dir()
+            .join(format!("np-bundle-{}", std::process::id()))
+            .join("Пример.app");
+        let inner = root.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("Пример"), b"").unwrap();
+
+        let n = process_name(root.to_str().unwrap());
+        assert_eq!(n, "Пример", "нужно имя файла внутри бандла, а не папки");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 }
