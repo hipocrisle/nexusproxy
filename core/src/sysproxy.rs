@@ -147,3 +147,77 @@ mod tests {
         assert!(!memo.exists(), "мусор должен убираться");
     }
 }
+
+/// Сторож: возвращает системные настройки, когда программа исчезла.
+///
+/// ⛔ Полагаться на её собственный выход нельзя. Обновление, падение,
+/// снятие через диспетчер, выключение питания — любой из этих путей
+/// оставляет системный прокси указывать на программу, которой больше
+/// нет, и человек остаётся без сети, не понимая почему. Записка на
+/// диске чинит это при следующем запуске, но до него может пройти день.
+///
+/// Поэтому рядом с программой живёт отдельный маленький процесс. Он
+/// ничего не делает, только ждёт её завершения. Ушла по-хорошему —
+/// записки уже нет, и сторож молча выходит. Ушла иначе — записка на
+/// месте, и он возвращает настройки сам.
+pub fn guard(parent_pid: u32, config_path: &str) {
+    wait_for_exit(parent_pid);
+    // Записка осталась — значит прибраться за собой она не успела.
+    if restore_leftovers(config_path) {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            "системные настройки прокси возвращены сторожем: программа завершилась неожиданно");
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_exit(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::WAIT_FAILED;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+    };
+    let _ = WAIT_FAILED;
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return; // процесса уже нет — проверим записку и выйдем
+        }
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_exit(pid: u32) {
+    // Ждём, пока процесс не перестанет отвечать на проверку существования.
+    loop {
+        let alive = std::process::Command::new("kill")
+            .arg("-0").arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !alive {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Запустить сторожа рядом с собой.
+pub fn spawn_guard(config_path: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--restore-guard")
+       .arg(std::process::id().to_string())
+       .arg(config_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // без чёрного окна и отдельной группой, чтобы пережить нас
+        cmd.creation_flags(0x0800_0000 | 0x0000_0200);
+    }
+    let _ = cmd.spawn();
+}
