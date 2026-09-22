@@ -4,7 +4,7 @@
 
 /// Что было до нас — чтобы вернуть как было.
 #[cfg_attr(not(windows), allow(dead_code))]
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Saved {
     pub enable: Option<u32>,
     pub server: Option<String>,

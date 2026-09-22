@@ -6,12 +6,12 @@
 //! чтобы вернуть как было.
 
 /// Что было до нас — по одной записи на сетевую службу.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Saved {
     pub services: Vec<ServiceState>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ServiceState {
     pub name: String,
     pub web_on: bool,
