@@ -267,7 +267,7 @@ mod tests {
         let lock = std::sync::RwLock::new(Rules::new(Route::Direct));
         let apps = std::sync::RwLock::new(crate::approutes::AppRoutes::build(&[App {
             name: "Cursor".into(), path: r"C:\Cursor\cursor.exe".into(),
-            kind: Kind::Auto, args: vec![], webrtc_via_proxy: false, no_http2: false,
+            kind: Kind::Auto,
             via: "основной".into(),
         }]));
 

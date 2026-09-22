@@ -592,7 +592,7 @@ const EXE_FILTERS = (() => {
 
 type LaunchApp = {
   name: string; path: string; kind: "auto" | "chromium" | "env";
-  args: string[]; webrtc_via_proxy: boolean; no_http2: boolean; via: string;
+  via: string;
 };
 
 /// Cursor, VS Code и прочий Electron системные настройки прокси не читают —
@@ -630,8 +630,7 @@ function Apps() {
     if (!path.trim()) return;
     try {
       await invoke("app_save", {
-        item: { name: name.trim() || path, path, kind: "auto", args: [],
-                webrtc_via_proxy: false, no_http2: false, via },
+        item: { name: name.trim() || path, path, kind: "auto", via },
       });
       if (editing && editing !== path) await invoke("app_remove", { path: editing });
       reset(); load();
