@@ -88,12 +88,16 @@ pub fn detect(path: &str) -> Kind {
 pub fn explain(app: &App, socks_port: u16, http_port: u16) -> String {
     match if app.kind == Kind::Auto { detect(&app.path) } else { app.kind } {
         Kind::Chromium => {
+            let via = if app.webrtc_via_proxy {
+                format!("http://127.0.0.1:{http_port}")
+            } else {
+                format!("socks5://127.0.0.1:{socks_port}")
+            };
             let mut t = format!(
-                "ключ --proxy-server=socks5://127.0.0.1:{socks_port} и переменные \
-                 HTTP_PROXY/HTTPS_PROXY на 127.0.0.1:{http_port} — Electron \
-                 ходит и тем, и другим");
+                "ключ --proxy-server={via} и переменные HTTP_PROXY/HTTPS_PROXY \
+                 на 127.0.0.1:{http_port} — Electron ходит и тем, и другим");
             if app.webrtc_via_proxy {
-                t.push_str(", WebRTC тоже через прокси");
+                t.push_str(", WebRTC тоже через прокси (ему нужен именно http-вход)");
             }
             if app.no_http2 {
                 t.push_str(", HTTP/2 запрещён");
@@ -175,10 +179,20 @@ pub fn start(app: &App, socks_port: u16, http_port: u16) -> Result<u32, String> 
 
     match kind {
         Kind::Chromium => {
-            // ⛔ Именно socks5, а не http: Chromium через http-прокси
-            // не пускает WebSocket, а на нём держится половина
+            // ⛔ WebRTC в Chromium через SOCKS не ходит — поддержку для
+            // медиа оттуда убрали, остался только HTTP-прокси методом
+            // CONNECT. Поэтому при «видео и звонки тоже через прокси»
+            // отдаём http-вход: иначе запрет ходить мимо прокси есть, а
+            // дороги через прокси у медиа нет, и видео просто не идёт.
+            //
+            // В остальных случаях socks5: через http-прокси Chromium
+            // капризничает с WebSocket, на котором держится половина
             // современных приложений.
-            cmd.arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"));
+            if app.webrtc_via_proxy {
+                cmd.arg(format!("--proxy-server=http://127.0.0.1:{http_port}"));
+            } else {
+                cmd.arg(format!("--proxy-server=socks5://127.0.0.1:{socks_port}"));
+            }
             // без этого Chromium ходит мимо прокси за своими адресами
             cmd.arg("--proxy-bypass-list=<-loopback>");
             if app.webrtc_via_proxy {
@@ -310,5 +324,31 @@ mod http2_tests {
         assert!(explain(&a, 18081, 18080).contains("HTTP/2"));
         a.no_http2 = false;
         assert!(!explain(&a, 18081, 18080).contains("HTTP/2"));
+    }
+}
+
+#[cfg(test)]
+mod webrtc_transport_tests {
+    use super::*;
+
+    /// WebRTC в Chromium через SOCKS не ходит — поддержку для медиа
+    /// оттуда убрали. Запрет ходить мимо прокси без http-входа означает
+    /// «дороги нет вовсе», и видео не идёт.
+    #[test]
+    fn для_видео_отдаём_http_вход() {
+        let a = App { name: "Vivaldi".into(), path: "vivaldi.exe".into(),
+                      kind: Kind::Chromium, args: vec![],
+                      webrtc_via_proxy: true, no_http2: false, via: String::new() };
+        let t = explain(&a, 18081, 18080);
+        assert!(t.contains("http://127.0.0.1:18080"), "{t}");
+        assert!(!t.contains("socks5://"), "{t}");
+    }
+
+    #[test]
+    fn без_видео_остаётся_socks() {
+        let a = App { name: "Chrome".into(), path: "chrome.exe".into(),
+                      kind: Kind::Chromium, args: vec![],
+                      webrtc_via_proxy: false, no_http2: false, via: String::new() };
+        assert!(explain(&a, 18081, 18080).contains("socks5://127.0.0.1:18081"));
     }
 }
