@@ -480,6 +480,8 @@ impl Engine {
             .map_err(|e| e.to_string())?;
         // на диск — чтобы прибраться, даже если уйдём не по-хорошему
         sysproxy::remember(&self.path, &s);
+        // и сторож рядом: он вернёт настройки, даже если нас снимут
+        sysproxy::spawn_guard(&self.path);
         *self.saved.lock().unwrap() = Some(s);
         Ok(())
     }

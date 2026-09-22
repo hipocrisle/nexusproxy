@@ -29,66 +29,59 @@ mod imp {
     use super::*;
     use std::process::Command;
 
-    /// Права на службу: система и администраторы — полностью, вошедший
-    /// пользователь — запуск, остановка и чтение состояния.
+    /// ⛔ Службой Windows может быть только программа, умеющая отчитаться
+    /// диспетчеру о запуске. sing-box этого не умеет и не должен:
+    /// диспетчер ждёт ответа и снимает её с ошибкой 1053.
     ///
-    /// ⛔ Без последней части включение перехвата снова требовало бы
-    /// администратора, и вся затея теряла бы смысл.
-    const RIGHTS: &str = concat!(
-        "D:",
-        "(A;;CCLCSWRPWPDTLOCRRC;;;SY)",
-        "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)",
-        "(A;;CCLCSWRPWPLORC;;;IU)",
-    );
-
-    fn sc(args: &[&str]) -> Result<String, String> {
-        let out = Command::new("sc.exe").args(args).output()
-            .map_err(|e| format!("не вызвать sc: {e}"))?;
+    /// Поэтому берём задачу планировщика с повышенными правами: ставится
+    /// один раз с подтверждением, запускается потом без него — ровно то,
+    /// что нужно, администратор спрашивается единожды.
+    fn schtasks(args: &[&str]) -> Result<String, String> {
+        use std::os::windows::process::CommandExt;
+        let out = Command::new("schtasks.exe")
+            .args(args)
+            // ⛔ Без этого флага при каждой проверке состояния мигает
+            // чёрное окно консоли — а состояние мы спрашиваем постоянно.
+            .creation_flags(0x0800_0000)
+            .output()
+            .map_err(|e| format!("не вызвать планировщик: {e}"))?;
         let text = String::from_utf8_lossy(&out.stdout).to_string()
             + &String::from_utf8_lossy(&out.stderr);
         if out.status.success() { Ok(text) } else { Err(text.trim().to_string()) }
     }
 
     pub fn state() -> State {
-        match sc(&["query", NAME]) {
+        match schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
             Err(_) => State::Absent,
-            Ok(t) if t.contains("RUNNING") => State::Running,
+            Ok(t) if t.contains("Running") || t.contains("Выполняется") => State::Running,
             Ok(_) => State::Stopped,
         }
     }
 
-    /// Команда установки — выполняется один раз с повышением прав.
-    ///
     /// ⛔ Кавычки обязательны: в путях бывают пробелы («Program Files»,
-    /// имя пользователя). Без них служба получит обрезанный путь и молча
+    /// имя пользователя). Без них задача получит обрезанный путь и молча
     /// не запустится — перехват «не работает», а почему, не видно.
     pub fn install_command(exe: &Path, config: &Path) -> String {
         format!(
-            "sc.exe create {NAME} binPath= \"\\\"{}\\\" run -c \\\"{}\\\"\" start= demand \
-             DisplayName= \"NexusProxy: перехват трафика\" && \
-             sc.exe sdset {NAME} \"{RIGHTS}\"",
+            "schtasks.exe /create /tn {NAME} /f /sc once /st 00:00 /rl highest \
+             /tr \"\\\"{}\\\" run -c \\\"{}\\\"\"",
             exe.display(), config.display()
         )
     }
 
     pub fn uninstall_command() -> String {
-        format!("sc.exe stop {NAME} & sc.exe delete {NAME}")
+        format!("schtasks.exe /end /tn {NAME} & schtasks.exe /delete /tn {NAME} /f")
     }
 
     pub fn start() -> Result<(), String> {
-        match sc(&["start", NAME]) {
-            Ok(_) => Ok(()),
-            // 1056 — уже работает, это не беда
-            Err(e) if e.contains("1056") => Ok(()),
-            Err(e) => Err(format!("перехват не включился: {e}")),
-        }
+        schtasks(&["/run", "/tn", NAME]).map(|_| ())
+            .map_err(|e| format!("перехват не включился: {e}"))
     }
 
     pub fn stop() -> Result<(), String> {
-        match sc(&["stop", NAME]) {
+        match schtasks(&["/end", "/tn", NAME]) {
             Ok(_) => Ok(()),
-            // 1062 — и так не запущена
-            Err(e) if e.contains("1062") => Ok(()),
+            Err(e) if e.contains("267011") || e.to_lowercase().contains("not running") => Ok(()),
             Err(e) => Err(format!("перехват не выключился: {e}")),
         }
     }
@@ -215,7 +208,7 @@ mod tests {
     fn сама_по_себе_служба_не_поднимается() {
         let c = install_command(Path::new("a"), Path::new("b"));
         #[cfg(windows)]
-        assert!(c.contains("start= demand"), "{c}");
+        assert!(c.contains("/sc once"), "задача не должна запускаться сама: {c}");
         #[cfg(target_os = "macos")]
         assert!(c.contains("<key>RunAtLoad</key><false/>"), "{c}");
         let _ = c;

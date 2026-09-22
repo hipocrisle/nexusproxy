@@ -606,9 +606,14 @@ function Apps() {
   const [via, setVia] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [said, setSaid] = useState("");
+  // При включённом перехвате приложения работают с обычного ярлыка,
+  // и кнопка запуска здесь только сбивает с толку.
+  const [intercepting, setIntercepting] = useState(false);
 
   const load = useCallback(() => {
     invoke<LaunchApp[]>("apps_list").then(setItems).catch(() => {});
+    invoke<{ running: boolean }>("tunnel_state")
+      .then((t) => setIntercepting(!!t.running)).catch(() => {});
     invoke<{ upstreams: Upstream[] }>("upstreams_list")
       .then((u) => {
         setUps(u.upstreams);
@@ -693,7 +698,11 @@ function Apps() {
                   </td>
                   <td><span className="tag proxy">{a.via}</span></td>
                   <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                    <button className="small" onClick={() => launch(a.path)}>Запустить</button>{" "}
+                    {!intercepting && (
+                      <>
+                        <button className="small" onClick={() => launch(a.path)}>Запустить</button>{" "}
+                      </>
+                    )}
                     <button className="small" onClick={() => edit(a)}>Изменить</button>{" "}
                     <button className="small" onClick={() => remove(a.path)}>Убрать</button>
                   </td>
@@ -702,8 +711,9 @@ function Apps() {
             </tbody>
           </table>
           <p className="hint" style={{ marginTop: 10, marginBottom: 0 }}>
-            Перед запуском закройте программу полностью. При включённом
-            перехвате запускать отсюда не нужно.
+            {intercepting
+              ? "Перехват включён — запускайте приложения обычным ярлыком."
+              : "Перед запуском закройте программу полностью."}
           </p>
           {said && <p className="hint">{said}</p>}
         </div>
@@ -1046,7 +1056,8 @@ function Tunnel() {
   const load = useCallback(() => {
     invoke<TunnelState>("tunnel_state").then(setSt).catch(() => {});
   }, []);
-  useEffect(() => { load(); const t = setInterval(load, 3000); return () => clearInterval(t); }, [load]);
+  // Состояние спрашиваем редко: каждый опрос — обращение к системе.
+  useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [load]);
 
   const install = async () => {
     setErr(""); setBusy("Скачиваю…");
