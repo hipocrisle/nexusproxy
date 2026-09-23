@@ -152,6 +152,7 @@ pub fn build_config_with(
     domains: &[DomainRule],
     upstreams: &[Upstream],
 ) -> serde_json::Value {
+    let resolvers = system_resolvers();
     let mut outbounds: Vec<serde_json::Value> = vec![
         serde_json::json!({ "type": "direct", "tag": "direct" }),
     ];
@@ -285,7 +286,14 @@ pub fn build_config_with(
         // управления доменом, хотя по адресам всё доступно. Наше дело —
         // вести трафик, а не подменять разрешение имён.
         "dns": {
-            "servers": [{ "type": "local", "tag": "system" }],
+            // ⛔ Явные адреса, снятые ДО включения туннеля. Указание
+            // «спросить у системы» здесь не годится: система к этому
+            // моменту уже указывает на туннель, и запрос идёт по кругу.
+            "servers": resolvers.iter().enumerate().map(|(i, ip)| serde_json::json!({
+                "type": "udp",
+                "tag": format!("сервер-{i}"),
+                "server": ip
+            })).collect::<Vec<_>>(),
             "strategy": "prefer_ipv4"
         },
         // ⛔ Уровень «info», а не «warn»: при «warn» движок молчит, и
@@ -1327,8 +1335,16 @@ mod dns_tests {
                 && r["outbound"] == "direct"
         });
         assert!(hit, "запросы имён обязаны идти напрямую");
-        assert_eq!(c["dns"]["servers"][0]["type"], "local",
-                   "имена разрешает система, а не мы");
+        // ⛔ Адреса серверов имён снимаются с системы ДО включения
+        // туннеля и задаются явно: «спросить у системы» после запуска
+        // означало бы спросить у самого туннеля — запрос ушёл бы по
+        // кругу, и внутренние имена перестали бы разрешаться.
+        let servers = c["dns"]["servers"].as_array().unwrap();
+        assert!(servers.iter().all(|s| s["type"] == "udp"),
+                "серверы имён задаются явными адресами: {servers:?}");
+        assert!(servers.iter().all(|s| {
+            !s["server"].as_str().unwrap_or("").starts_with("172.19.0.")
+        }), "адрес туннеля среди серверов имён — это петля");
     }
 }
 
@@ -1384,5 +1400,63 @@ mod mtu_tests {
     fn строгий_режим_выключен() {
         let c = build_config(&[], &[]);
         assert_eq!(c["inbounds"][0]["strict_route"], false);
+    }
+}
+
+/// Настоящие серверы имён — те, что были в системе до нас.
+///
+/// ⛔ Спрашивать «у системы» нельзя: включив туннель, движок прописывает
+/// себя её сервером имён, и указание «local» заворачивает запросы обратно
+/// в него же. У пользователя `nslookup` показывал адрес туннеля вместо
+/// корпоративного сервера, и внутренние имена разрешались неверно.
+/// Поэтому спрашиваем ДО включения и передаём явными адресами.
+pub fn system_resolvers() -> Vec<String> {
+    let out = if cfg!(windows) {
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command",
+                   "Get-DnsClientServerAddress -AddressFamily IPv4 | \
+                    Select-Object -ExpandProperty ServerAddresses"])
+            .output()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("scutil").arg("--dns").output()
+    } else {
+        std::process::Command::new("cat").arg("/etc/resolv.conf").output()
+    };
+    let text = match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return Vec::new(),
+    };
+
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let candidate = line
+            .split_whitespace()
+            .find(|w| w.parse::<std::net::Ipv4Addr>().is_ok())
+            .map(|w| w.to_string());
+        if let Some(ip) = candidate {
+            // ⛔ Свой же адрес в список не берём: это и есть петля.
+            if ip.starts_with("172.19.0.") || ip == "0.0.0.0" {
+                continue;
+            }
+            if !found.contains(&ip) {
+                found.push(ip);
+            }
+        }
+    }
+    found.truncate(4);
+    found
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    /// Адрес самого туннеля в список попасть не должен — это петля:
+    /// запрос имени уходит в туннель, который спрашивает туннель.
+    #[test]
+    fn свой_адрес_не_берём() {
+        let r = system_resolvers();
+        assert!(!r.iter().any(|ip| ip.starts_with("172.19.0.")),
+                "адрес туннеля в серверах имён — петля: {r:?}");
     }
 }
