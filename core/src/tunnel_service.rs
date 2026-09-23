@@ -344,13 +344,14 @@ mod tests {
 
     /// ⛔ В путях бывают пробелы — и в «Program Files», и в имени
     /// пользователя. Потеряв часть пути, служба молча не запустится.
+    /// ⛔ В путях бывают пробелы — и в «Program Files», и в имени
+    /// пользователя. Потеряв часть пути, служба молча не запустится.
     #[test]
     fn путь_с_пробелами_не_теряется() {
         let c = install_command(
-            Path::new("/Applications/Nexus Proxy/sing-box"),
-            Path::new("/Users/Иван Петров/cfg.json"),
+            Path::new("/Applications/Nexus Proxy/NexusProxy"),
+            Path::new("/Users/Иван Петров/перехват"),
         );
-        assert!(c.contains("Nexus Proxy"), "{c}");
         assert!(c.contains("Иван Петров"), "{c}");
     }
 
@@ -364,7 +365,13 @@ mod tests {
         #[cfg(windows)]
         assert!(c.contains("/sc once"), "задача не должна запускаться сама: {c}");
         #[cfg(target_os = "macos")]
-        assert!(c.contains("--run-tunnel"), "демон обязан быть наблюдателем: {c}");
+        {
+            // демон поднимает наблюдателя, а тот запускает движок только
+            // при наличии признака — сам по себе перехват не включается
+            assert!(c.contains("watch.sh"), "демон обязан запускать наблюдателя: {c}");
+            assert!(c.contains("[ -f \"$FLAG\" ]"),
+                    "наблюдатель обязан смотреть на признак: {c}");
+        }
         let _ = c;
     }
 }
