@@ -1056,6 +1056,7 @@ function Tunnel() {
 
   const load = useCallback(() => {
     invoke<TunnelState>("tunnel_state").then(setSt).catch(() => {});
+    invoke<string>("tunnel_log").then(setLog).catch(() => {});
   }, []);
   // Состояние спрашиваем редко: каждый опрос — обращение к системе.
   useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [load]);
@@ -1114,7 +1115,12 @@ function Tunnel() {
         </>
       )}
       {err && <p className="note">{err}</p>}
-      {log && <pre className="log" style={{ maxHeight: 160 }}>{log}</pre>}
+      {log && (
+        <>
+          <p className="hint" style={{ marginBottom: 4 }}>Что происходит:</p>
+          <pre className="log" style={{ maxHeight: 200 }}>{log}</pre>
+        </>
+      )}
     </div>
   );
 }

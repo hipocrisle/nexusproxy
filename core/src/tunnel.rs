@@ -534,7 +534,14 @@ pub fn write_config(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Res
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
     let cfg = build_config(routes, upstreams);
     std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
-        .map_err(|e| format!("не записать настройки: {e}"))
+        .map_err(|e| format!("не записать настройки: {e}"))?;
+    // Какие именно процессы ловим — самое важное для разбора: если имя
+    // не совпадёт с настоящим, перехват работает, а трафик идёт мимо.
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: ловим процессы [{}]",
+                 routes.iter().map(|r| format!("{} → {}", r.process, r.via))
+                       .collect::<Vec<_>>().join(", ")));
+    Ok(())
 }
 
 pub fn config_path(dir: &Path) -> PathBuf {
@@ -548,9 +555,12 @@ pub fn config_path(dir: &Path) -> PathBuf {
 /// у человека на экране постоянно висело бы чёрное окно с журналом.
 /// Поэтому запускает нас, а окно прячем мы сами.
 pub fn run_foreground(dir: &Path) -> Result<(), String> {
+    crate::logfile::open(dir.join("runner.log")).ok();
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: запускаю движок из {}", dir.display()));
     let bin = binary_path(dir);
     if !bin.is_file() {
-        return Err("движок перехвата не найден".into());
+        return Err(format!("движок перехвата не найден: {}", bin.display()));
     }
     let cfg = config_path(dir);
     let log = std::fs::File::create(log_path(dir))
@@ -567,7 +577,9 @@ pub fn run_foreground(dir: &Path) -> Result<(), String> {
         cmd.creation_flags(0x0800_0000); // без окна
     }
     let mut child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
-    let _ = child.wait();
+    let code = child.wait();
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: движок завершился ({code:?})"));
     Ok(())
 }
 
@@ -575,7 +587,9 @@ pub fn run_foreground(dir: &Path) -> Result<(), String> {
 /// пустой экран с невключившимся перехватом.
 pub fn log_tail(dir: &Path, lines: usize) -> String {
     let mut out = Vec::new();
-    for name in ["tunnel.log", "daemon.log"] {
+    // Собираем все следы: что делали мы, что ответила система, что сказал
+    // сам движок. Разбирать «не работает» по одному из них невозможно.
+    for name in ["runner.log", "tunnel.log", "daemon.log"] {
         if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
             out.extend(t.lines().rev().take(lines).map(|s| s.to_string()));
         }
