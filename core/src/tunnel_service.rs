@@ -182,6 +182,11 @@ LOG="{log}"
 echo "$(date '+%F %T') наблюдатель запущен" >> "$LOG"
 while true; do
   if [ -f "$FLAG" ] && [ -x "$BIN" ]; then
+    # ⛔ Журнал движка чистим при каждом запуске. Дописываясь без конца,
+    # он смешивает вчерашние отказы с сегодняшними: старые FATAL выглядят
+    # как свежие, а список опознанных программ — как будто из этого
+    # сеанса. Разбирать по такому журналу нельзя.
+    : > "{enginelog}"
     echo "$(date '+%F %T') поднимаю движок" >> "$LOG"
     "$BIN" run -c "$CFG" >> "$LOG" 2>&1 &
     PID=$!
@@ -205,7 +210,8 @@ done
             bin = crate::tunnel::binary_path(dir).display(),
             cfg = crate::tunnel::config_path(dir).display(),
             flag = flag_path(dir).display(),
-            log = dir.join("daemon.log").display())
+            log = dir.join("daemon.log").display(),
+            enginelog = crate::tunnel::engine_log_path(dir).display())
     }
 
     pub fn plist(exe: &Path, dir: &Path) -> String {
