@@ -630,27 +630,52 @@ fn install_info(app: tauri::AppHandle) -> Install {
     }
 }
 
+/// Показать папку человеку — своим проводником на каждой системе.
+///
+/// ⛔ Раньше на macOS здесь была пустая ветка: кнопка нажималась и не
+/// делала ничего. Молчаливое бездействие хуже отказа — человек считает,
+/// что сломалась программа, а не кнопка.
+fn reveal(dir: &std::path::Path) -> Result<(), String> {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("не открыть папку: {e}"))
+}
+
 /// Открыть папку, куда установщик кладёт программу.
 #[tauri::command]
 fn open_installed(_app: tauri::AppHandle) -> Result<(), String> {
-    let dir = std::env::var("LOCALAPPDATA")
-        .map(|d| format!("{d}\\NexusProxy"))
-        .map_err(|_| "не удалось определить папку профиля")?;
-    #[cfg(windows)]
-    { std::process::Command::new("explorer").arg(&dir).spawn().map_err(|e| e.to_string())?; }
-    Ok(())
+    let dir: std::path::PathBuf = if cfg!(windows) {
+        std::env::var("LOCALAPPDATA")
+            .map(|d| std::path::PathBuf::from(d).join("NexusProxy"))
+            .map_err(|_| "не удалось определить папку профиля")?
+    } else {
+        // на macOS программа лежит в бандле — показываем его самого
+        std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .ancestors()
+            .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())))
+            .ok_or("папка не найдена")?
+    };
+    reveal(&dir)
 }
 
-/// Открыть папку с настройками и журналом в проводнике.
+/// Открыть папку с настройками и журналом.
 #[tauri::command]
 fn open_folder(app: State<App>) -> Result<(), String> {
     let p = app.path.lock().unwrap().clone();
     let dir = std::path::Path::new(&p).parent().ok_or("папка не найдена")?;
-    #[cfg(windows)]
-    { std::process::Command::new("explorer").arg(dir).spawn().map_err(|e| e.to_string())?; }
-    #[cfg(not(windows))]
-    { let _ = dir; }
-    Ok(())
+    reveal(dir)
 }
 
 #[tauri::command]
@@ -848,13 +873,6 @@ fn ports(state: &State<App>) -> (u16, u16) {
     }
 }
 
-/// Чем именно передадим прокси — показываем ДО запуска, чтобы не гадать.
-#[tauri::command]
-fn app_explain(state: State<App>, item: core::launch::App) -> String {
-    let (socks, http) = ports(&state);
-    core::launch::explain(&item, socks, http)
-}
-
 #[tauri::command]
 fn app_launch(state: State<App>, path: String) -> Result<String, String> {
     let item = {
@@ -866,25 +884,6 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
     let pid = core::launch::start(&item, socks, http)?;
     Ok(format!("{} запущен через прокси ({}), процесс {pid}",
                item.name, core::launch::explain(&item, socks, http)))
-}
-
-/// Пускает ли выбранный прокси на этот хост и порт — чтобы отличать
-/// «прокси туда не пускает» от «хост сам молчит».
-#[tauri::command]
-async fn reach_check(app: AppHandle, host: String, port: u16, via: String) -> Result<String, String> {
-    let host = host.trim().to_string();
-    if host.is_empty() {
-        return Err("не указан адрес".into());
-    }
-    let up = {
-        let state = app.state::<App>();
-        let e = engine(&state)?;
-        let c = e.cfg.lock().unwrap();
-        let name = if via.trim().is_empty() { c.default_upstream.clone() } else { via };
-        c.all_upstreams().into_iter().find(|u| u.name == name)
-            .ok_or_else(|| format!("прокси «{name}» не найден"))?
-    };
-    core::upstream::reach(&up, &host, port).await
 }
 
 /// Что сейчас с перехватом: скачан ли движок, работает ли, почему нет.
@@ -1168,7 +1167,7 @@ pub fn run() {
             sub_state, sub_install, sub_load, sub_apply, sub_disable,
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
-            apps_list, app_save, app_remove, app_explain, app_launch,
+            apps_list, app_save, app_remove, app_launch,
             tunnel_state, tunnel_install, tunnel_set, tunnel_log
         ])
         .on_window_event(|window, event| {
