@@ -1081,6 +1081,38 @@ pub fn diagnosis(dir: &Path) -> String {
             std::path::PathBuf::from("/Library/LaunchDaemons/NexusProxyTunnel.plist"));
     }
 
+    // ⛔ Что именно мы ловим — половина разбора. Если в журнале движка
+    // нет нужного процесса, надо сразу видеть, по какому образцу его
+    // искали: имя могло не совпасть с настоящим.
+    out.push_str("\n── кого ловим ──\n");
+    match std::fs::read_to_string(config_path(dir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    {
+        Some(cfg) => {
+            let empty = Vec::new();
+            let rules = cfg["route"]["rules"].as_array().unwrap_or(&empty);
+            for r in rules {
+                let to = r["outbound"].as_str().unwrap_or("?");
+                if let Some(names) = r["process_name"].as_array() {
+                    out.push_str(&format!("по имени: {} → {to}\n",
+                        names.iter().filter_map(|n| n.as_str())
+                             .collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(paths) = r["process_path_regex"].as_array() {
+                    for p in paths.iter().filter_map(|p| p.as_str()) {
+                        out.push_str(&format!("по пути: {p} → {to}\n"));
+                    }
+                }
+            }
+            let doms = rules.iter()
+                .filter_map(|r| r["domain_suffix"].as_array().map(|a| a.len()))
+                .sum::<usize>();
+            out.push_str(&format!("правил по доменам: {doms}\n"));
+        }
+        None => out.push_str("настройки не читаются\n"),
+    }
+
     out.push_str("\n── состояние ──\n");
     out.push_str(&format!("служба: {:?}\n", crate::tunnel_service::state_in(dir)));
     out.push_str(&format!("движок в списке процессов: {}\n",
