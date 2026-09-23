@@ -915,7 +915,7 @@ fn tunnel_state(app: State<App>) -> serde_json::Value {
 #[tauri::command]
 fn tunnel_log(app: State<App>) -> String {
     let path = app.path.lock().unwrap().clone();
-    core::tunnel::log_tail(&core::tunnel_dir(&path), 12)
+    core::tunnel::diagnosis(&core::tunnel_dir(&path))
 }
 
 /// Скачать движок перехвата — он не входит в состав программы.

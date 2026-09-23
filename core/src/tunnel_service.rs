@@ -160,6 +160,54 @@ mod imp {
     /// Сам по себе демон трафик не заворачивает: без признака обёртка
     /// движок не поднимает. Так что «работает постоянно» — это про
     /// наблюдателя, а не про перехват.
+    /// Путь к сценарию-наблюдателю.
+    pub fn watcher_path(dir: &Path) -> std::path::PathBuf {
+        dir.join("watch.sh")
+    }
+
+    /// ⛔ Демон запускает обычный сценарий оболочки, а не наш файл из
+    /// бандла. macOS не даёт системному демону запускать программу,
+    /// подписанную самоподписанным сертификатом, — демон молча не
+    /// стартует, и в журнале нет ни строчки. Сценарий таких ограничений
+    /// не имеет.
+    pub fn watcher(dir: &Path) -> String {
+        format!(r#"#!/bin/sh
+# Наблюдатель перехвата NexusProxy.
+# Есть признак — движок работает, нет — стоит.
+BIN="{bin}"
+CFG="{cfg}"
+FLAG="{flag}"
+LOG="{log}"
+
+echo "$(date '+%F %T') наблюдатель запущен" >> "$LOG"
+while true; do
+  if [ -f "$FLAG" ] && [ -x "$BIN" ]; then
+    echo "$(date '+%F %T') поднимаю движок" >> "$LOG"
+    "$BIN" run -c "$CFG" >> "$LOG" 2>&1 &
+    PID=$!
+    # держим, пока признак на месте и настройки не изменились
+    STAMP=$(stat -f %m "$CFG" 2>/dev/null)
+    while [ -f "$FLAG" ] && kill -0 "$PID" 2>/dev/null; do
+      NOW=$(stat -f %m "$CFG" 2>/dev/null)
+      if [ "$NOW" != "$STAMP" ]; then
+        echo "$(date '+%F %T') настройки изменились, перезапускаю" >> "$LOG"
+        break
+      fi
+      sleep 1
+    done
+    kill "$PID" 2>/dev/null
+    wait "$PID" 2>/dev/null
+    echo "$(date '+%F %T') движок остановлен" >> "$LOG"
+  fi
+  sleep 1
+done
+"#,
+            bin = crate::tunnel::binary_path(dir).display(),
+            cfg = crate::tunnel::config_path(dir).display(),
+            flag = flag_path(dir).display(),
+            log = dir.join("daemon.log").display())
+    }
+
     pub fn plist(exe: &Path, dir: &Path) -> String {
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -168,8 +216,7 @@ mod imp {
   <key>Label</key><string>{NAME}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{}</string>
-    <string>--run-tunnel</string>
+    <string>/bin/sh</string>
     <string>{}</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -177,19 +224,28 @@ mod imp {
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
 </plist>
-"#, exe.display(), dir.display(), dir.join("daemon.log").display())
+"#, watcher_path(dir).display(), dir.join("daemon.log").display())
     }
 
+    /// ⛔ Ошибки здесь НЕ подавляем. Раньше стояло `2>/dev/null; true`,
+    /// и когда launchd отказывался поднимать демона, мы этого не видели
+    /// вовсе: установка «успешна», а обёртка не запускается никогда.
     pub fn install_command(exe: &Path, dir: &Path) -> String {
+        let _ = exe;
         let p = plist_path();
+        let w = watcher_path(dir);
         // Здесь-документ: в путях бывают пробелы, а кавычки внутри xml
         // пришлось бы экранировать дважды.
         format!(
-            "cat > '{}' <<'NEXUSPROXY_PLIST'\n{}NEXUSPROXY_PLIST\n\
-             chown root:wheel '{}' && chmod 644 '{}' && \
-             launchctl bootout system/{NAME} 2>/dev/null; \
-             launchctl bootstrap system '{}' 2>/dev/null; true",
-            p.display(), plist(exe, dir), p.display(), p.display(), p.display()
+            "cat > '{w}' <<'NEXUSPROXY_WATCH'\n{watch}NEXUSPROXY_WATCH\n\
+             chmod 755 '{w}' && \
+             cat > '{p}' <<'NEXUSPROXY_PLIST'\n{plist}NEXUSPROXY_PLIST\n\
+             chown root:wheel '{p}' && chmod 644 '{p}' && \
+             launchctl bootout system/{NAME} 2>&1; \
+             launchctl bootstrap system '{p}' 2>&1 && \
+             launchctl print system/{NAME} 2>&1 | head -12",
+            w = w.display(), watch = watcher(dir),
+            p = p.display(), plist = plist(exe, dir)
         )
     }
 
@@ -403,6 +459,8 @@ fn run_elevated(cmd: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn run_elevated(cmd: &str) -> Result<(), String> {
+    // Что ответила система — в журнал целиком: без этого «не работает»
+    // невозможно разобрать, а гадать мы уже пробовали.
     // ⛔ Кавычки внутри скрипта нужно удвоить: osascript отдаёт строку
     // оболочке, и одиночная кавычка оборвала бы команду на середине.
     let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
@@ -413,14 +471,17 @@ fn run_elevated(cmd: &str) -> Result<(), String> {
         .arg("-e").arg(&script)
         .output()
         .map_err(|e| format!("не вызвать osascript: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stdout).to_string()
+        + &String::from_utf8_lossy(&out.stderr);
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: система ответила: {}", said.trim()));
     if out.status.success() {
         Ok(())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("-128") {
+        if said.contains("-128") {
             Err("права администратора не выданы".into())
         } else {
-            Err(format!("не поставить службу перехвата: {}", err.trim()))
+            Err(format!("не поставить службу перехвата: {}", said.trim()))
         }
     }
 }
