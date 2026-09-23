@@ -934,7 +934,7 @@ async fn tunnel_install(app: AppHandle) -> Result<String, String> {
 /// Включить или выключить перехват.
 #[tauri::command]
 async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
-    let (dir, routes, ups) = {
+    let (dir, routes, domains, ups) = {
         let state = app.state::<App>();
         let path = state.path.lock().unwrap().clone();
         let dir = core::tunnel_dir(&path);
@@ -960,7 +960,24 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
                 user: u.user.clone(), password: u.password.clone(),
             })
             .collect();
-        (dir, routes, ups)
+        // ⛔ Правила по доменам обязаны попасть в туннель: системные
+        // настройки при нём не трогаются, и без них всё, кроме
+        // приложений, пойдёт напрямую.
+        let domains: Vec<core::tunnel::DomainRule> = c.through_proxy.iter()
+            .map(|p| core::tunnel::DomainRule { pattern: p.clone(), via: String::new() })
+            .chain(c.groups.iter().filter(|g| g.enabled).flat_map(|g| {
+                g.patterns.iter().map(move |p| core::tunnel::DomainRule {
+                    pattern: p.clone(), via: g.via.clone(),
+                })
+            }))
+            .map(|mut d| {
+                if d.via.trim().is_empty() {
+                    d.via = c.default_upstream.clone();
+                }
+                d
+            })
+            .collect();
+        (dir, routes, domains, ups)
     };
     { let s = app.state::<App>(); engine(&s)?.apply_and_save()?; }
 
@@ -972,7 +989,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
             return Ok(());
         }
         // Настройки пишем всегда: служба читает их при запуске.
-        core::tunnel::write_config(&dir, &routes, &ups)?;
+        core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
         // ⛔ Проверяем не только наличие, но и чем служба поставлена:
         // после обновления программы старая запись продолжает работать
         // по-старому, и человек не видит никаких изменений.

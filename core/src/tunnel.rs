@@ -123,7 +123,29 @@ pub enum Kind {
 /// самого прокси. Без первого перехват заберёт обращения к локальной
 /// сети, без второго — обращения к прокси, и получится петля: чтобы
 /// дойти до прокси, надо пройти через прокси.
+/// Правило по адресам: какие домены и подсети куда ведём.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DomainRule {
+    /// Образец: домен или подсеть.
+    pub pattern: String,
+    /// Тег прокси.
+    pub via: String,
+}
+
 pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Value {
+    build_config_with(routes, &[], upstreams)
+}
+
+/// ⛔ TUN режим заменяет режим прокси целиком, а не дополняет его.
+/// Системные настройки при нём не трогаются, поэтому всё, что раньше
+/// шло через прокси по правилам доменов, пойдёт напрямую — если не
+/// перенести эти правила сюда. У пользователя так разом отвалилось всё,
+/// кроме приложений из списка.
+pub fn build_config_with(
+    routes: &[Route],
+    domains: &[DomainRule],
+    upstreams: &[Upstream],
+) -> serde_json::Value {
     let mut outbounds: Vec<serde_json::Value> = vec![
         serde_json::json!({ "type": "direct", "tag": "direct" }),
     ];
@@ -175,6 +197,34 @@ pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Val
             e.1.push(path_regex(&prefix));
         }
     }
+    // правила по доменам и подсетям — то же, что в режиме прокси
+    let mut dom_by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
+    for d in domains {
+        let e = dom_by_via.entry(d.via.as_str()).or_default();
+        let p = d.pattern.trim();
+        if let Some(rest) = p.strip_prefix("domain:") {
+            e.0.push(rest.to_string());
+        } else if p.contains('/') && p.chars().next().map_or(false, |c| c.is_ascii_digit() || c == ':') {
+            e.1.push(p.to_string());
+        } else if p.parse::<std::net::IpAddr>().is_ok() {
+            e.1.push(format!("{p}/32"));
+        } else if !p.is_empty() && !p.starts_with('_') {
+            e.0.push(p.to_string());
+        }
+    }
+    for (via, (doms, nets)) in dom_by_via {
+        let mut rule = serde_json::json!({ "action": "route", "outbound": via });
+        if !doms.is_empty() {
+            rule["domain_suffix"] = serde_json::json!(doms);
+        }
+        if !nets.is_empty() {
+            rule["ip_cidr"] = serde_json::json!(nets);
+        }
+        if rule.get("domain_suffix").is_some() || rule.get("ip_cidr").is_some() {
+            rules.push(rule);
+        }
+    }
+
     for (via, (procs, paths)) in by_via {
         let mut rule = serde_json::json!({
             "process_name": procs,
@@ -584,17 +634,19 @@ pub fn kill_orphans(dir: &Path) -> usize {
 }
 
 /// Записать настройки для движка. Служба читает их при запуске.
-pub fn write_config(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(), String> {
+pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
+                    upstreams: &[Upstream]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-    let cfg = build_config(routes, upstreams);
+    let cfg = build_config_with(routes, domains, upstreams);
     std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
     // Какие именно процессы ловим — самое важное для разбора: если имя
     // не совпадёт с настоящим, перехват работает, а трафик идёт мимо.
     crate::logfile::line(&crate::logfile::now_stamp(),
-        &format!("перехват: ловим процессы [{}]",
+        &format!("перехват: ловим процессы [{}], правил по адресам: {}",
                  routes.iter().map(|r| format!("{} → {}", r.process, r.via))
-                       .collect::<Vec<_>>().join(", ")));
+                       .collect::<Vec<_>>().join(", "),
+                 domains.len()));
     Ok(())
 }
 
@@ -608,6 +660,101 @@ pub fn config_path(dir: &Path) -> PathBuf {
 /// ⛔ Задача не умеет прятать окно консоли: запусти она движок напрямую,
 /// у человека на экране постоянно висело бы чёрное окно с журналом.
 /// Поэтому запускает нас, а окно прячем мы сами.
+/// Следить за признаком включения и держать движок, пока он есть.
+///
+/// ⛔ На macOS демон поднимается системой один раз и дальше живёт сам.
+/// Полагаться на то, что launchd заметит появление файла и перезапустит
+/// его, нельзя: у пользователя движок так и работал с настройками
+/// часовой давности, а в журнале не было ни одной записи о запуске.
+/// Поэтому следим сами: есть признак — движок работает и перечитывает
+/// настройки при каждом изменении, нет — стоит.
+pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
+    crate::logfile::open(dir.join("runner.log")).ok();
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: слежу за признаком {}", flag.display()));
+
+    let mut running: Option<std::process::Child> = None;
+    let mut cfg_stamp = config_stamp(dir);
+    loop {
+        let want = flag.exists();
+        let fresh = config_stamp(dir);
+        let changed = fresh != cfg_stamp;
+
+        match (&mut running, want) {
+            // просят работать, а движка нет — поднимаем
+            (None, true) => {
+                cfg_stamp = fresh;
+                match spawn_engine(dir) {
+                    Ok(c) => {
+                        crate::logfile::line(&crate::logfile::now_stamp(), "перехват: движок поднят");
+                        running = Some(c);
+                    }
+                    Err(e) => {
+                        crate::logfile::line(&crate::logfile::now_stamp(),
+                            &format!("перехват: движок не поднялся: {e}"));
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+            }
+            // просят остановиться
+            (Some(c), false) => {
+                let _ = c.kill();
+                let _ = c.wait();
+                running = None;
+                crate::logfile::line(&crate::logfile::now_stamp(), "перехват: движок остановлен");
+            }
+            // настройки поменялись — движок обязан их перечитать
+            (Some(c), true) if changed => {
+                cfg_stamp = fresh;
+                let _ = c.kill();
+                let _ = c.wait();
+                running = None;
+                crate::logfile::line(&crate::logfile::now_stamp(),
+                    "перехват: настройки изменились, перезапускаю движок");
+            }
+            // движок упал сам — поднимем на следующем круге
+            (Some(c), true) => {
+                if matches!(c.try_wait(), Ok(Some(_))) {
+                    crate::logfile::line(&crate::logfile::now_stamp(),
+                        "перехват: движок завершился, поднимаю заново");
+                    running = None;
+                }
+            }
+            (None, false) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// Отпечаток настроек — по нему видно, что их изменили.
+fn config_stamp(dir: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(config_path(dir)).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+fn spawn_engine(dir: &Path) -> Result<std::process::Child, String> {
+    let bin = binary_path(dir);
+    if !bin.is_file() {
+        return Err(format!("движок не найден: {}", bin.display()));
+    }
+    let log = std::fs::File::create(log_path(dir))
+        .map_err(|e| format!("не создать журнал: {e}"))?;
+    let log_err = log.try_clone().map_err(|e| format!("не создать журнал: {e}"))?;
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("run").arg("-c").arg(config_path(dir))
+       .current_dir(dir)
+       .stdout(log).stderr(log_err);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
+    #[cfg(windows)]
+    crate::xray::assign_to_job(&child);
+    Ok(child)
+}
+
 pub fn run_foreground(dir: &Path) -> Result<(), String> {
     crate::logfile::open(dir.join("runner.log")).ok();
     crate::logfile::line(&crate::logfile::now_stamp(),
@@ -822,5 +969,66 @@ mod order_tests {
         assert!(v[0].contains("первое"), "{v:?}");
         assert!(v[1].contains("второе"), "{v:?}");
         assert!(v[2].contains("продолжение"), "строки без метки идут последними");
+    }
+}
+
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+
+    fn corp() -> Upstream {
+        Upstream {
+            tag: "основной".into(), kind: Kind::Socks5,
+            address: "172.31.211.1".into(), port: 1081,
+            user: None, password: None,
+        }
+    }
+
+    fn rules_of(v: &serde_json::Value) -> &Vec<serde_json::Value> {
+        v["route"]["rules"].as_array().unwrap()
+    }
+
+    /// ⛔ TUN режим заменяет режим прокси целиком: системные настройки
+    /// при нём не трогаются. Не перенеся сюда правила по доменам, мы
+    /// отправляем напрямую всё, что раньше шло через прокси — у
+    /// пользователя так разом отвалилось всё, кроме приложений.
+    #[test]
+    fn правила_доменов_переходят_в_туннель() {
+        let c = build_config_with(
+            &[],
+            &[DomainRule { pattern: "domain:grid.gg".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let hit = rules_of(&c).iter().any(|r| {
+            r["domain_suffix"].as_array().map_or(false, |a| a.iter().any(|x| x == "grid.gg"))
+                && r["outbound"] == "основной"
+        });
+        assert!(hit, "домен из правил обязан идти через прокси и в туннеле");
+    }
+
+    #[test]
+    fn подсети_тоже_переходят() {
+        let c = build_config_with(
+            &[],
+            &[DomainRule { pattern: "10.0.0.0/8".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let hit = rules_of(&c).iter().any(|r| {
+            r["ip_cidr"].as_array().map_or(false, |a| a.iter().any(|x| x == "10.0.0.0/8"))
+                && r["outbound"] == "основной"
+        });
+        assert!(hit, "подсеть из правил обязана сохраниться");
+    }
+
+    /// Служебные записи списка (группы) адресами не являются.
+    #[test]
+    fn служебные_записи_не_попадают() {
+        let c = build_config_with(
+            &[],
+            &[DomainRule { pattern: "_Группа".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let has = rules_of(&c).iter().any(|r| r.get("domain_suffix").is_some());
+        assert!(!has, "служебной записи в настройках движка не место");
     }
 }
