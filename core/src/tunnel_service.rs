@@ -47,6 +47,12 @@ mod imp {
             .map_err(|e| format!("не вызвать планировщик: {e}"))?;
         let text = String::from_utf8_lossy(&out.stdout).to_string()
             + &String::from_utf8_lossy(&out.stderr);
+        // ⛔ Пишем всё: без этого «не работает» невозможно разобрать —
+        // видно только, что ничего не произошло.
+        if !args.first().map_or(false, |a| *a == "/query") {
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                &format!("перехват: schtasks {} → {}", args.join(" "), text.trim()));
+        }
         if out.status.success() { Ok(text) } else { Err(text.trim().to_string()) }
     }
 
@@ -172,7 +178,10 @@ mod imp {
     pub fn start_in(dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
         std::fs::write(flag_path(dir), b"on")
-            .map_err(|e| format!("перехват не включился: {e}"))
+            .map_err(|e| format!("перехват не включился: {e}"))?;
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: признак включения создан ({})", flag_path(dir).display()));
+        Ok(())
     }
 
     pub fn stop_in(dir: &Path) -> Result<(), String> {
@@ -261,6 +270,28 @@ mod tests {
 /// ⛔ Это единственное место, где программа просит администратора.
 /// Дальше перехват включается и выключается без вопросов: службе при
 /// установке выдаётся право на запуск и остановку обычным пользователем.
+/// Чем именно сейчас установлена служба. Пусто — не установлена или
+/// поставлена версией, которая этого не записывала.
+fn signature_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("service-signature")
+}
+
+/// ⛔ Задача планировщика и демон создаются один раз и сами не
+/// обновляются. После обновления программы они продолжают делать
+/// по-старому — человек ставит новую версию и не видит НИКАКИХ
+/// изменений, потому что работает старая запись. Поэтому храним, чем
+/// именно она поставлена, и переустанавливаем при расхождении.
+pub fn needs_reinstall(dir: &Path) -> bool {
+    let want = match std::env::current_exe() {
+        Ok(me) => install_command(&me, dir),
+        Err(_) => return false,
+    };
+    match std::fs::read_to_string(signature_path(dir)) {
+        Ok(have) => have.trim() != want.trim(),
+        Err(_) => true,
+    }
+}
+
 pub fn install(dir: &Path) -> Result<(), String> {
     if !crate::tunnel::binary_path(dir).is_file() {
         return Err("движок перехвата ещё не скачан".into());
@@ -268,7 +299,16 @@ pub fn install(dir: &Path) -> Result<(), String> {
     // Задача запускает нас же — мы поднимем движок без окна.
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;
-    run_elevated(&install_command(&me, dir))
+    let cmd = install_command(&me, dir);
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: ставлю службу заново\n  {cmd}"));
+    // Старую убираем сразу: иначе на Windows останется задача с прежним
+    // способом запуска, и человек увидит поведение старой версии.
+    let full = format!("{}\n{cmd}", uninstall_command());
+    run_elevated(&full)?;
+    let _ = std::fs::write(signature_path(dir), &cmd);
+    crate::logfile::line(&crate::logfile::now_stamp(), "перехват: служба установлена");
+    Ok(())
 }
 
 /// Убрать службу — тоже с запросом прав.

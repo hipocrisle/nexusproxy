@@ -951,11 +951,17 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
         }
         // Настройки пишем всегда: служба читает их при запуске.
         core::tunnel::write_config(&dir, &routes, &ups)?;
+        // ⛔ Проверяем не только наличие, но и чем служба поставлена:
+        // после обновления программы старая запись продолжает работать
+        // по-старому, и человек не видит никаких изменений.
+        let stale = core::tunnel_service::needs_reinstall(&dir);
         match core::tunnel_service::state_in(&dir) {
-            // Служба уже стоит — просто просим её подняться. Прав не надо.
+            _ if stale => {
+                core::tunnel_service::install(&dir)?;
+                core::tunnel_service::start_in(&dir)
+            }
             core::tunnel_service::State::Stopped
             | core::tunnel_service::State::Running => core::tunnel_service::start_in(&dir),
-            // Первый раз: ставим службу, один запрос прав.
             core::tunnel_service::State::Absent => {
                 core::tunnel_service::install(&dir)?;
                 core::tunnel_service::start_in(&dir)

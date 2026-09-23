@@ -87,13 +87,38 @@ impl Engine {
         // ⛔ Прежде всего прибираемся за прошлым сеансом: если он ушёл не
         // по-хорошему, системный прокси до сих пор указывает на программу,
         // которой нет, и у человека молча не работает всё подряд.
-        // ⛔ Движок перехвата держит сетевой интерфейс. Если прошлый
-        // запуск ушёл не по-хорошему, он до сих пор заворачивает трафик,
-        // а наше окно закрыто — причины не видно совсем.
-        let orphans = tunnel::kill_orphans(&tunnel_dir(path));
-        if orphans > 0 {
-            logfile::line(&logfile::now_stamp(),
-                &format!("остановлен перехват, оставшийся от прошлого запуска: {orphans}"));
+        // ⛔ Перехват должен ПЕРЕЖИВАТЬ перезапуск программы: человек
+        // закрыл и открыл окно — трафик всё это время идёт как настроено.
+        // Раньше здесь его безусловно убивали как «оставшийся от прошлого
+        // раза», и приходилось каждый раз дёргать галку вручную.
+        //
+        // Поэтому смотрим на настройку: перехват включён — поднимаем его
+        // обратно (служба сделает это без всяких прав); выключен — убираем
+        // то, что осталось, иначе оно продолжит заворачивать трафик.
+        let tdir = tunnel_dir(path);
+        if cfg.tunnel_mode {
+            match tunnel_service::state_in(&tdir) {
+                tunnel_service::State::Running => {
+                    logfile::line(&logfile::now_stamp(), "перехват: уже работает");
+                }
+                tunnel_service::State::Stopped => {
+                    match tunnel_service::start_in(&tdir) {
+                        Ok(_) => logfile::line(&logfile::now_stamp(), "перехват: поднят при запуске"),
+                        Err(e) => logfile::line(&logfile::now_stamp(),
+                            &format!("перехват при запуске не поднялся: {e}")),
+                    }
+                }
+                tunnel_service::State::Absent => {
+                    logfile::line(&logfile::now_stamp(),
+                        "перехват включён в настройках, но служба не установлена");
+                }
+            }
+        } else {
+            let orphans = tunnel::kill_orphans(&tdir);
+            if orphans > 0 {
+                logfile::line(&logfile::now_stamp(),
+                    &format!("остановлен перехват, оставшийся от прошлого запуска: {orphans}"));
+            }
         }
         let stale = sysproxy::sweep_stale_env();
         if !stale.is_empty() {
