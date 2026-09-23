@@ -1121,10 +1121,12 @@ function Tunnel() {
 
       {err && <p className="note">{err}</p>}
       {log && (
-        <>
-          <p className="hint" style={{ marginBottom: 4 }}>Что происходит:</p>
-          <pre className="log" style={{ maxHeight: 200 }}>{log}</pre>
-        </>
+        <details style={{ marginTop: 8 }}>
+          <summary className="hint" style={{ cursor: "pointer" }}>
+            Подробности работы
+          </summary>
+          <pre className="log" style={{ maxHeight: 280, marginTop: 6 }}>{log}</pre>
+        </details>
       )}
     </div>
   );

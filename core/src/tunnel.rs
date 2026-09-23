@@ -1032,3 +1032,90 @@ mod domain_tests {
         assert!(!has, "служебной записи в настройках движка не место");
     }
 }
+
+/// Полная картина: что есть на диске, что работает, что в журналах.
+///
+/// ⛔ Без этого разбор сводится к догадкам: «перехват включён, а не
+/// работает» не говорит ничего. Здесь видно, дошло ли дело до файлов,
+/// поднялся ли наблюдатель, что ответила система.
+pub fn diagnosis(dir: &Path) -> String {
+    let mut out = String::new();
+    let say = |o: &mut String, name: &str, p: std::path::PathBuf| {
+        let mark = if p.exists() {
+            match std::fs::metadata(&p) {
+                Ok(m) => format!("есть, {} Б", m.len()),
+                Err(_) => "есть".into(),
+            }
+        } else {
+            "НЕТ".into()
+        };
+        o.push_str(&format!("{name}: {mark}\n  {}\n", p.display()));
+    };
+
+    out.push_str("── файлы ──\n");
+    say(&mut out, "движок", binary_path(dir));
+    say(&mut out, "настройки", config_path(dir));
+    say(&mut out, "признак включения", dir.join("enabled"));
+    #[cfg(target_os = "macos")]
+    {
+        say(&mut out, "наблюдатель", dir.join("watch.sh"));
+        say(&mut out, "описание демона",
+            std::path::PathBuf::from("/Library/LaunchDaemons/NexusProxyTunnel.plist"));
+    }
+
+    out.push_str("\n── состояние ──\n");
+    out.push_str(&format!("служба: {:?}\n", crate::tunnel_service::state_in(dir)));
+    out.push_str(&format!("движок в списке процессов: {}\n",
+        if engine_running(dir) { "да" } else { "нет" }));
+
+    out.push_str("\n── журнал ──\n");
+    out.push_str(&log_tail(dir, 25));
+    out
+}
+
+/// Работает ли движок прямо сейчас — смотрим в списке процессов, а не
+/// по своим записям: он мог уйти сам.
+pub fn engine_running(dir: &Path) -> bool {
+    let bin = binary_path(dir);
+    if !bin.is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        crate::proc::path_of_pid(std::process::id()); // прогреваем доступ
+        count_processes(&bin) > 0
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("pgrep")
+            .arg("-f").arg(bin.to_string_lossy().as_ref())
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(windows)]
+fn count_processes(bin: &Path) -> usize {
+    use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
+    let want = bin.to_string_lossy().to_lowercase();
+    let mut pids = vec![0u32; 4096];
+    let mut needed = 0u32;
+    let mut n = 0;
+    unsafe {
+        if EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) == 0 {
+            return 0;
+        }
+        for &pid in pids.iter().take(needed as usize / 4) {
+            if pid == 0 {
+                continue;
+            }
+            if let Some(p) = crate::proc::path_of_pid(pid) {
+                if p.to_lowercase() == want {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
