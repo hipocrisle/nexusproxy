@@ -1195,6 +1195,29 @@ pub fn diagnosis(dir: &Path) -> String {
     out.push_str(&format!("движок в списке процессов: {}\n",
         if engine_running(dir) { "да" } else { "нет" }));
 
+    // ⛔ Какие процессы движок РЕАЛЬНО увидел. Если приложения тут нет,
+    // значит система не отдала ему путь — и никакое правило по процессу
+    // не сработает, сколько его ни правь.
+    out.push_str("\n── чьи соединения движок опознал ──\n");
+    match std::fs::read_to_string(engine_log_path(dir)) {
+        Ok(t) => {
+            let mut seen: Vec<String> = t.lines()
+                .filter_map(|l| l.split("found process path: ").nth(1))
+                .map(|rest| rest.split(", user:").next().unwrap_or(rest).to_string())
+                .collect();
+            seen.sort();
+            seen.dedup();
+            if seen.is_empty() {
+                out.push_str("ни одного — система не отдаёт пути процессов\n");
+            } else {
+                for p in seen.iter().take(20) {
+                    out.push_str(&format!("{p}\n"));
+                }
+            }
+        }
+        Err(_) => out.push_str("журнал движка не читается\n"),
+    }
+
     out.push_str("\n── журнал ──\n");
     out.push_str(&log_tail(dir, 40));
     out
