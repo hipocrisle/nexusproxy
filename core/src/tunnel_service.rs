@@ -150,9 +150,16 @@ mod imp {
 
     /// Описание демона.
     ///
-    /// ⛔ `RunAtLoad` выключен, а `KeepAlive` привязан к файлу: перехват
-    /// включает человек, а не система при каждой загрузке. Иначе трафик
-    /// начал бы заворачиваться сам, без спросу.
+    /// ⛔ Демон работает ПОСТОЯННО, а перехват включает и выключает
+    /// признак-файл, за которым следит наша обёртка.
+    ///
+    /// Раньше было наоборот: демон поднимался по появлению файла. На
+    /// это launchd не реагировал — демон не стартовал ни разу, и в
+    /// журнале за день не было ни одной записи о запуске движка.
+    ///
+    /// Сам по себе демон трафик не заворачивает: без признака обёртка
+    /// движок не поднимает. Так что «работает постоянно» — это про
+    /// наблюдателя, а не про перехват.
     pub fn plist(exe: &Path, dir: &Path) -> String {
         format!(r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -165,17 +172,12 @@ mod imp {
     <string>--run-tunnel</string>
     <string>{}</string>
   </array>
-  <key>RunAtLoad</key><false/>
-  <key>KeepAlive</key>
-  <dict>
-    <key>PathState</key>
-    <dict><key>{}</key><true/></dict>
-  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>{}</string>
 </dict>
 </plist>
-"#, exe.display(), dir.display(), flag_path(dir).display(),
-    dir.join("daemon.log").display())
+"#, exe.display(), dir.display(), dir.join("daemon.log").display())
     }
 
     pub fn install_command(exe: &Path, dir: &Path) -> String {
@@ -185,6 +187,7 @@ mod imp {
         format!(
             "cat > '{}' <<'NEXUSPROXY_PLIST'\n{}NEXUSPROXY_PLIST\n\
              chown root:wheel '{}' && chmod 644 '{}' && \
+             launchctl bootout system/{NAME} 2>/dev/null; \
              launchctl bootstrap system '{}' 2>/dev/null; true",
             p.display(), plist(exe, dir), p.display(), p.display(), p.display()
         )
@@ -295,15 +298,17 @@ mod tests {
         assert!(c.contains("Иван Петров"), "{c}");
     }
 
-    /// Перехват включает человек, а не система при загрузке: иначе
-    /// трафик начал бы заворачиваться сам, без спросу.
+    /// ⛔ Перехват включает человек, а не система при загрузке. На
+    /// Windows это ручной запуск задачи; на macOS демон-наблюдатель
+    /// работает постоянно, но движок поднимает только при появлении
+    /// признака — иначе трафик заворачивался бы сам, без спросу.
     #[test]
-    fn сама_по_себе_служба_не_поднимается() {
+    fn перехват_не_включается_сам() {
         let c = install_command(Path::new("a"), Path::new("b"));
         #[cfg(windows)]
         assert!(c.contains("/sc once"), "задача не должна запускаться сама: {c}");
         #[cfg(target_os = "macos")]
-        assert!(c.contains("<key>RunAtLoad</key><false/>"), "{c}");
+        assert!(c.contains("--run-tunnel"), "демон обязан быть наблюдателем: {c}");
         let _ = c;
     }
 }
