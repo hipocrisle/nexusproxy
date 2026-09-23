@@ -944,8 +944,13 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
         .collect();
     drop(c);
     core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
-    // движок перечитает настройки: на macOS через признак, на Windows
-    // перезапуском задачи
+    // ⛔ Служба тоже могла устареть: наблюдатель и способ запуска
+    // меняются вместе с программой, а ставится он один раз. Без этой
+    // проверки после обновления продолжает работать прежний — со
+    // старыми повадками и без новых починок.
+    if core::tunnel_service::needs_reinstall(&dir) {
+        core::tunnel_service::install(&dir)?;
+    }
     core::tunnel_service::start_in(&dir)
 }
 
