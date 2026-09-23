@@ -640,6 +640,11 @@ pub fn run_foreground(dir: &Path) -> Result<(), String> {
         cmd.creation_flags(0x0800_0000); // без окна
     }
     let mut child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
+    // ⛔ Иначе движок переживает того, кто его запустил: задачу сняли, а
+    // он продолжает держать сетевой интерфейс и заворачивать трафик.
+    // Человек закрыл программу — и не понимает, почему всё ещё работает.
+    #[cfg(windows)]
+    crate::xray::assign_to_job(&child);
     let code = child.wait();
     crate::logfile::line(&crate::logfile::now_stamp(),
         &format!("перехват: движок завершился ({code:?})"));

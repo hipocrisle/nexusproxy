@@ -54,7 +54,17 @@ fn status(app: State<App>) -> Status {
                     .unwrap_or_else(|| "прокси не задан".into()),
                 http_port: c.listen.http,
                 socks_port: c.listen.socks,
-                system_on: e.system_proxy_is_ours(),
+                // ⛔ «Включено» зависит от выбранного способа. В TUN
+                // режиме системные настройки не трогаются вовсе, и по
+                // ним программа выглядела вечно выключенной: человек
+                // жал «Включить» и не видел никакой реакции.
+                system_on: if c.tunnel_mode {
+                    core::tunnel_service::state_in(
+                        &core::tunnel_dir(&app.path.lock().unwrap().clone())
+                    ) == core::tunnel_service::State::Running
+                } else {
+                    e.system_proxy_is_ours()
+                },
                 discovering: core::report::session_active(),
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,

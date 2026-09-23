@@ -241,7 +241,7 @@ pub fn start(dir: &Path, profiles: &[Profile]) -> Result<(), String> {
 /// падает с «Only one usage of each socket address». Привязка к заданию
 /// с KILL_ON_JOB_CLOSE решает это в корне.
 #[cfg(windows)]
-fn assign_to_job(child: &Child) {
+pub fn assign_to_job(child: &Child) {
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
