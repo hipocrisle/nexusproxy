@@ -666,12 +666,23 @@ fn discovery_stop() -> Option<core::report::SessionResult> {
 #[tauri::command]
 fn system_proxy(app: State<App>, on: bool) -> Result<(), String> {
     let e = engine(&app)?;
+    // ⛔ Одна кнопка на всё. Способ выбран в настройках, здесь только
+    // «работает / не работает»: два независимых выключателя человеку не
+    // объяснить, и перехват однажды остался включённым при выключенной
+    // программе.
+    let tunnel = e.cfg.lock().unwrap().tunnel_mode;
     if on {
-        e.system_proxy_on()
+        if tunnel {
+            let path = app.path.lock().unwrap().clone();
+            let dir = core::tunnel_dir(&path);
+            // системные настройки перехвату не нужны и только мешают
+            e.system_proxy_off();
+            core::tunnel_service::start_in(&dir)
+        } else {
+            e.tunnel_off();
+            e.system_proxy_on()
+        }
     } else {
-        // ⛔ «Выключить» должно выключать всё: человек считает, что
-        // программа больше ни на что не влияет. Оставшийся перехват
-        // продолжал бы заворачивать трафик других программ.
         e.tunnel_off();
         e.system_proxy_off();
         Ok(())

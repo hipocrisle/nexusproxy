@@ -1068,8 +1068,10 @@ function Tunnel() {
     finally { setBusy(""); load(); }
   };
 
-  const toggle = async (on: boolean) => {
-    setErr(""); setBusy(on ? "Включаю…" : "Выключаю…");
+  // Выбор способа, а не второй выключатель: включает и выключает
+  // программу одна кнопка в шапке.
+  const setMode = async (on: boolean) => {
+    setErr(""); setBusy("Переключаю…");
     try { await invoke("tunnel_set", { on }); }
     catch (e) {
       setErr(String(e));
@@ -1083,37 +1085,40 @@ function Tunnel() {
 
   return (
     <div className="card">
-      <h3>Перехват трафика приложений</h3>
+      <h3>Способ работы</h3>
       <p className="hint">
-        Забирает трафик приложений из списка, даже если они не умеют
-        работать через прокси. Запускать их отдельно не нужно — работают
-        с обычного ярлыка.
+        Перехват забирает трафик приложений из списка, даже если они не
+        умеют работать через прокси. Работают с обычного ярлыка.
       </p>
 
-      {!st.installed ? (
-        <>
-          <button className="btn primary" onClick={install} disabled={!!busy}>
-            {busy || "Установить"}
-          </button>
-          <p className="hint">
-            Права администратора запрашиваются один раз, при установке.
-          </p>
-        </>
-      ) : (
-        <>
-          <label className="check">
-            <input type="checkbox" checked={st.mode} disabled={!!busy}
-                   onChange={(e) => toggle(e.target.checked)} />
-            Включить перехват{busy && " — " + busy}
-          </label>
-          <p className="hint">
-            {st.apps === 0
-              ? "Добавьте приложения на вкладке «Приложения»."
-              : `В списке: ${st.apps}. Остальной трафик идёт напрямую.`}
-          </p>
+      <div className="row wrap" style={{ marginBottom: 8 }}>
+        <label className="check">
+          <input type="radio" name="tmode" checked={!st.mode} disabled={!!busy}
+                 onChange={() => setMode(false)} />
+          Через системные настройки
+        </label>
+        <label className="check">
+          <input type="radio" name="tmode" checked={st.mode} disabled={!!busy}
+                 onChange={() => setMode(true)} />
+          Перехват
+        </label>
+        {busy && <span className="hint">{busy}</span>}
+      </div>
 
-        </>
+      <p className="hint">
+        {st.mode
+          ? (st.installed
+              ? `Приложений в списке: ${st.apps}. Остальное идёт напрямую.`
+              : "Нужно установить движок — права запросятся один раз.")
+          : "Работает с программами, которые читают настройки прокси."}
+      </p>
+
+      {st.mode && !st.installed && (
+        <button className="primary" onClick={install} disabled={!!busy}>
+          {busy || "Установить"}
+        </button>
       )}
+
       {err && <p className="note">{err}</p>}
       {log && (
         <>
@@ -1233,8 +1238,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           Сворачивать в трей вместо закрытия
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
-Выход — через меню значка. При выходе системные настройки прокси
-          возвращаются к прежним.
+Выход — через меню значка.
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.enable_on_start ?? true}
@@ -1242,9 +1246,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           Сразу включать при запуске
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
-          То же, что нажать «Включить» в шапке: программа прописывается
-          в системные настройки прокси, и приложения начинают ходить через неё.
-          Без галки после запуска нужно включать вручную.
+          Без неё после запуска нужно включать вручную.
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
@@ -1252,11 +1254,10 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
           Переподключаться, если прокси оборвался
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
-Повтор при обрыве, проверка доступности каждые 15 секунд.
+Проверка доступности каждые 15 секунд.
         </p>
         <p className="hint" style={{ marginTop: 8 }}>
-Настройки и журнал в одной папке. Журнал ротируется при 4 МБ,
-          предыдущий файл — <code>nexusproxy.log.1</code>.
+Журнал обрезается при 4 МБ, предыдущий — nexusproxy.log.1.
         </p>
         <button className="btn" onClick={() => invoke("open_folder")}>Открыть папку с журналом</button>
       </div>
