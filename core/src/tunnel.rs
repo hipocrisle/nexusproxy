@@ -152,7 +152,12 @@ pub fn build_config_with(
     domains: &[DomainRule],
     upstreams: &[Upstream],
 ) -> serde_json::Value {
-    let resolvers = system_resolvers();
+    let mut resolvers = system_resolvers();
+    if resolvers.is_empty() {
+        // ⛔ Пустой список означает, что движок не запустится вовсе.
+        // Лучше общеизвестный сервер, чем неработающий перехват.
+        resolvers.push("1.1.1.1".to_string());
+    }
     let mut outbounds: Vec<serde_json::Value> = vec![
         serde_json::json!({ "type": "direct", "tag": "direct" }),
     ];
@@ -328,6 +333,14 @@ pub fn build_config_with(
         }],
         "outbounds": outbounds,
         "route": {
+            // ⛔ Движок обязан знать, каким сервером имён пользоваться
+            // при своих собственных обращениях. Без этого он отказывается
+            // запускаться вовсе: «missing route.default_domain_resolver».
+            // Наблюдатель поднимал его заново каждые две секунды, а в
+            // окне это выглядело как «перехват включён, но не работает».
+            "default_domain_resolver": resolvers.first()
+                .map(|_| "сервер-0".to_string())
+                .unwrap_or_else(|| "сервер-0".to_string()),
             "rules": rules,
             // ⛔ Всё, что не перечислено, идёт НАПРЯМУЮ. Завернуть всё —
             // значит оборвать почту и внутренние ресурсы, которые через
@@ -727,6 +740,17 @@ pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
     let cfg = build_config_with(dir, routes, domains, upstreams);
     std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
+
+    // ⛔ Проверяем настройки самим движком, прежде чем он на них
+    // запустится. Иначе негодные настройки означают бесконечный круг:
+    // движок падает, наблюдатель поднимает его снова, и так каждые две
+    // секунды — а в окне это выглядит как «перехват включён, но не
+    // работает», без единого намёка на причину.
+    if let Err(why) = check_config(dir) {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: настройки негодны — {why}"));
+        return Err(format!("движок не принял настройки: {why}"));
+    }
     // Какие именно процессы ловим — самое важное для разбора: если имя
     // не совпадёт с настоящим, перехват работает, а трафик идёт мимо.
     crate::logfile::line(&crate::logfile::now_stamp(),
@@ -1458,5 +1482,59 @@ mod resolver_tests {
         let r = system_resolvers();
         assert!(!r.iter().any(|ip| ip.starts_with("172.19.0.")),
                 "адрес туннеля в серверах имён — петля: {r:?}");
+    }
+}
+
+/// Спросить у движка, годятся ли настройки.
+fn check_config(dir: &Path) -> Result<(), String> {
+    let bin = binary_path(dir);
+    if !bin.is_file() {
+        return Ok(()); // движка ещё нет — проверять нечем
+    }
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("check").arg("-c").arg(config_path(dir)).current_dir(dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stdout).to_string()
+                + &String::from_utf8_lossy(&o.stderr);
+            Err(said.lines().rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("причина неизвестна")
+                .to_string())
+        }
+        // Сам вызов не удался — не повод ломать включение.
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod resolver_setting_tests {
+    use super::*;
+
+    /// ⛔ Без указания сервера имён по умолчанию движок отказывается
+    /// запускаться вовсе. Наблюдатель поднимал его каждые две секунды,
+    /// а человек видел «перехват включён» и неработающую сеть.
+    #[test]
+    fn сервер_имён_по_умолчанию_задан() {
+        let c = build_config(&[], &[]);
+        let name = c["route"]["default_domain_resolver"].as_str().unwrap_or("");
+        assert!(!name.is_empty(), "движок не запустится без этого");
+        let servers = c["dns"]["servers"].as_array().unwrap();
+        assert!(servers.iter().any(|s| s["tag"] == name),
+                "названный сервер должен существовать: {servers:?}");
+    }
+
+    /// Даже если у системы не спросить адреса, настройки обязаны
+    /// остаться рабочими: пустой список означал бы отказ запуска.
+    #[test]
+    fn серверов_имён_всегда_хотя_бы_один() {
+        let c = build_config(&[], &[]);
+        assert!(!c["dns"]["servers"].as_array().unwrap().is_empty());
     }
 }
