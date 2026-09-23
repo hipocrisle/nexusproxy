@@ -339,12 +339,15 @@ mod tests {
     #[test]
     fn приложение_идёт_в_свой_прокси() {
         let c = build_config(
-            &[Route { process: "Cursor.exe".into(), path: format!("/Apps/{}", "Cursor.exe"), via: "основной".into() }],
+            &[Route { process: "Cursor.exe".into(),
+                      path: "/Apps/Cursor.exe".into(),
+                      via: "основной".into() }],
             &[corp()],
         );
-        let last = rules_of(&c).last().unwrap();
-        assert_eq!(last["process_name"][0], "Cursor.exe");
-        assert_eq!(last["outbound"], "основной");
+        let by_name = rules_of(&c).iter()
+            .find(|r| r["process_name"][0] == "Cursor.exe")
+            .expect("правило по имени должно быть");
+        assert_eq!(by_name["outbound"], "основной");
     }
 
     /// ⛔ Без этого правила перехват заберёт и обращения к самому прокси:
