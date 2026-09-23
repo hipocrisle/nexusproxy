@@ -198,10 +198,24 @@ mod imp {
     /// Включение и выключение — просто файл. Прав не требует.
     pub fn start_in(dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-        std::fs::write(flag_path(dir), b"on")
+        let flag = flag_path(dir);
+        let was_on = flag.exists();
+        std::fs::write(&flag, b"on")
             .map_err(|e| format!("перехват не включился: {e}"))?;
-        crate::logfile::line(&crate::logfile::now_stamp(),
-            &format!("перехват: признак включения создан ({})", flag_path(dir).display()));
+
+        // ⛔ Движок читает настройки при запуске. Если он уже работает,
+        // признак не меняется, launchd ничего не перезапускает — и
+        // движок продолжает жить со старым списком приложений. Человек
+        // добавил Cursor, а трафик идёт мимо: перехват «включён», а
+        // ловит он то, что было раньше.
+        if was_on {
+            let killed = crate::tunnel::kill_orphans(dir);
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                &format!("перехват: перезапускаю движок с новыми настройками (снято: {killed})"));
+        } else {
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                &format!("перехват: признак включения создан ({})", flag.display()));
+        }
         Ok(())
     }
 
