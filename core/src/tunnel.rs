@@ -848,6 +848,9 @@ fn spawn_engine(dir: &Path) -> Result<std::process::Child, String> {
     if !bin.is_file() {
         return Err(format!("движок не найден: {}", bin.display()));
     }
+    // ⛔ Журнал движка начинаем заново: иначе вчерашние отказы
+    // выглядят как сегодняшние и уводят разбор в сторону.
+    let _ = std::fs::write(engine_log_path(dir), b"");
     let log = std::fs::File::create(log_path(dir))
         .map_err(|e| format!("не создать журнал: {e}"))?;
     let log_err = log.try_clone().map_err(|e| format!("не создать журнал: {e}"))?;
