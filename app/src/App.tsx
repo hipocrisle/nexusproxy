@@ -1087,20 +1087,20 @@ function Tunnel() {
     <div className="card">
       <h3>Способ работы</h3>
       <p className="hint">
-        Перехват забирает трафик приложений из списка, даже если они не
-        умеют работать через прокси. Работают с обычного ярлыка.
+        TUN режим забирает трафик приложений из списка, даже если они не
+        умеют работать через прокси.
       </p>
 
       <div className="row wrap" style={{ marginBottom: 8 }}>
         <label className="check">
           <input type="radio" name="tmode" checked={!st.mode} disabled={!!busy}
                  onChange={() => setMode(false)} />
-          Через системные настройки
+          Режим прокси
         </label>
         <label className="check">
           <input type="radio" name="tmode" checked={st.mode} disabled={!!busy}
                  onChange={() => setMode(true)} />
-          Перехват
+          TUN режим
         </label>
         {busy && <span className="hint">{busy}</span>}
       </div>
@@ -1110,7 +1110,7 @@ function Tunnel() {
           ? (st.installed
               ? `Приложений в списке: ${st.apps}. Остальное идёт напрямую.`
               : "Нужно установить движок — права запросятся один раз.")
-          : "Работает с программами, которые читают настройки прокси."}
+          : "Только для программ, которые читают настройки прокси."}
       </p>
 
       {st.mode && !st.installed && (
