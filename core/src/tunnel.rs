@@ -256,16 +256,26 @@ pub fn build_config_with(
         }
     }
 
+    // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
+    // требует совпадения всех условий сразу, а у приложения процессы
+    // зовутся по-разному: главный «Cursor», рабочий «Cursor Helper
+    // (Plugin)». Путь подходит, имя — нет, и правило не срабатывает
+    // никогда. Именно поэтому перехват приложений не работал вовсе.
     for (via, (procs, paths)) in by_via {
-        let mut rule = serde_json::json!({
-            "process_name": procs,
-            "action": "route",
-            "outbound": via
-        });
-        if !paths.is_empty() {
-            rule["process_path_regex"] = serde_json::json!(paths);
+        if !procs.is_empty() {
+            rules.push(serde_json::json!({
+                "process_name": procs,
+                "action": "route",
+                "outbound": via
+            }));
         }
-        rules.push(rule);
+        if !paths.is_empty() {
+            rules.push(serde_json::json!({
+                "process_path_regex": paths,
+                "action": "route",
+                "outbound": via
+            }));
+        }
     }
 
     serde_json::json!({
@@ -1283,5 +1293,37 @@ mod dns_tests {
         assert!(hit, "запросы имён обязаны идти напрямую");
         assert_eq!(c["dns"]["servers"][0]["type"], "local",
                    "имена разрешает система, а не мы");
+    }
+}
+
+#[cfg(test)]
+mod and_tests {
+    use super::*;
+
+    /// ⛔ Внутри одного правила движок требует совпадения ВСЕХ условий.
+    /// Имя и путь вместе — условие, которое не выполняется никогда:
+    /// главный процесс зовётся «Cursor», а работает «Cursor Helper
+    /// (Plugin)» — путь подходит, имя нет. Перехват приложений из-за
+    /// этого не работал вовсе.
+    #[test]
+    fn имя_и_путь_разными_правилами() {
+        let c = build_config(
+            &[Route { process: "Cursor".into(),
+                      path: "/Applications/Cursor.app".into(),
+                      via: "основной".into() }],
+            &[Upstream { tag: "основной".into(), kind: Kind::Socks5,
+                         address: "172.31.211.1".into(), port: 1081,
+                         user: None, password: None }],
+        );
+        let rules = c["route"]["rules"].as_array().unwrap();
+        let both = rules.iter().any(|r| {
+            r.get("process_name").is_some() && r.get("process_path_regex").is_some()
+        });
+        assert!(!both, "имя и путь в одном правиле не сработают никогда");
+
+        assert!(rules.iter().any(|r| r.get("process_name").is_some()),
+                "правило по имени должно быть");
+        assert!(rules.iter().any(|r| r.get("process_path_regex").is_some()),
+                "правило по пути должно быть");
     }
 }
