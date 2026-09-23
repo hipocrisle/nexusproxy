@@ -152,6 +152,21 @@ pub fn build_config_with(
     domains: &[DomainRule],
     upstreams: &[Upstream],
 ) -> serde_json::Value {
+    build_config_full(dir_hint, routes, domains, upstreams, false)
+}
+
+/// `everything` — вести через прокси весь трафик, кроме исключений.
+///
+/// ⛔ Без этого способа перехват на macOS бесполезен: движок не может
+/// определить, какой программе принадлежит соединение браузера, и
+/// правила по приложениям не срабатывают никогда.
+pub fn build_config_full(
+    dir_hint: &Path,
+    routes: &[Route],
+    domains: &[DomainRule],
+    upstreams: &[Upstream],
+    everything: bool,
+) -> serde_json::Value {
     let mut resolvers = system_resolvers();
     if resolvers.is_empty() {
         // ⛔ Пустой список означает, что движок не запустится вовсе.
@@ -342,10 +357,15 @@ pub fn build_config_with(
                 .map(|_| "сервер-0".to_string())
                 .unwrap_or_else(|| "сервер-0".to_string()),
             "rules": rules,
-            // ⛔ Всё, что не перечислено, идёт НАПРЯМУЮ. Завернуть всё —
-            // значит оборвать почту и внутренние ресурсы, которые через
-            // корпоративный прокси не ходят.
-            "final": "direct",
+            // Что делать с тем, что не совпало ни с одним правилом.
+            // По умолчанию — напрямую: завернуть всё значит оборвать
+            // внутренние ресурсы. Но когда программу по соединению не
+            // опознать, другого способа вести её трафик нет.
+            "final": if everything {
+                upstreams.first().map(|u| u.tag.clone()).unwrap_or_else(|| "direct".into())
+            } else {
+                "direct".to_string()
+            },
             "auto_detect_interface": true
         }
     })
@@ -736,8 +756,13 @@ pub fn kill_orphans(dir: &Path) -> usize {
 /// Записать настройки для движка. Служба читает их при запуске.
 pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
                     upstreams: &[Upstream]) -> Result<(), String> {
+    write_config_full(dir, routes, domains, upstreams, false)
+}
+
+pub fn write_config_full(dir: &Path, routes: &[Route], domains: &[DomainRule],
+                         upstreams: &[Upstream], everything: bool) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-    let cfg = build_config_with(dir, routes, domains, upstreams);
+    let cfg = build_config_full(dir, routes, domains, upstreams, everything);
     std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
 
@@ -1539,5 +1564,46 @@ mod resolver_setting_tests {
     fn серверов_имён_всегда_хотя_бы_один() {
         let c = build_config(&[], &[]);
         assert!(!c["dns"]["servers"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod everything_tests {
+    use super::*;
+
+    fn corp() -> Upstream {
+        Upstream { tag: "основной".into(), kind: Kind::Socks5,
+                   address: "172.31.211.1".into(), port: 1081,
+                   user: None, password: None }
+    }
+
+    /// ⛔ Когда программу по соединению не опознать — а на macOS движок
+    /// не опознаёт браузеры, — единственный способ вести их трафик —
+    /// вести всё, что не попало в исключения.
+    #[test]
+    fn всё_неизвестное_идёт_через_прокси() {
+        let c = build_config_full(Path::new("."), &[], &[], &[corp()], true);
+        assert_eq!(c["route"]["final"], "основной");
+    }
+
+    /// Обычный порядок не меняется: неизвестное идёт напрямую, иначе
+    /// оборвутся внутренние ресурсы.
+    #[test]
+    fn по_умолчанию_неизвестное_идёт_напрямую() {
+        let c = build_config_full(Path::new("."), &[], &[], &[corp()], false);
+        assert_eq!(c["route"]["final"], "direct");
+    }
+
+    /// ⛔ Своя сеть и адрес прокси остаются напрямую даже когда ведём
+    /// всё: иначе петля и отвалившиеся внутренние ресурсы.
+    #[test]
+    fn своё_остаётся_напрямую_и_в_этом_режиме() {
+        let c = build_config_full(Path::new("."), &[], &[], &[corp()], true);
+        let rules = c["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["ip_is_private"] == true && r["outbound"] == "direct"));
+        assert!(rules.iter().any(|r| {
+            r["ip_cidr"].as_array().map_or(false, |a| a.iter().any(|x| x == "172.31.211.1/32"))
+                && r["outbound"] == "direct"
+        }));
     }
 }

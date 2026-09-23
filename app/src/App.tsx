@@ -1042,7 +1042,7 @@ function Log() {
 
 type TunnelState = {
   installed: boolean; running: boolean; mode: boolean;
-  apps: number; error: string | null;
+  all: boolean; apps: number; error: string | null;
 };
 
 /// Перехват: трафик приложений забирается независимо от того, умеют ли
@@ -1109,10 +1109,30 @@ function Tunnel() {
       <p className="hint">
         {st.mode
           ? (st.installed
-              ? `Приложений в списке: ${st.apps}. Остальное идёт напрямую.`
+              ? (st.all
+                  ? "Через прокси идёт весь трафик, кроме правил-исключений."
+                  : `Приложений в списке: ${st.apps}. Остальное идёт напрямую.`)
               : "Нужно установить движок — права запросятся один раз.")
           : "Только для программ, которые читают настройки прокси."}
       </p>
+
+      {st.mode && st.installed && (
+        <>
+          <label className="check">
+            <input type="checkbox" checked={st.all} disabled={!!busy}
+                   onChange={(e) => {
+                     invoke("set_flag", { name: "tunnel_all", value: e.target.checked })
+                       .then(() => setMode(true))
+                       .catch((x) => setErr(String(x)));
+                   }} />
+            Вести через прокси весь трафик
+          </label>
+          <p className="hint">
+            Нужно там, где приложение по соединению не опознать — на macOS
+            так с браузерами. Своя сеть остаётся напрямую.
+          </p>
+        </>
+      )}
 
       {st.mode && !st.installed && (
         <button className="primary" onClick={install} disabled={!!busy}>
