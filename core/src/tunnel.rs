@@ -172,6 +172,11 @@ pub fn build_config_with(
     }
 
     let mut rules: Vec<serde_json::Value> = vec![
+        // ⛔ Без этого правила движок видит только адреса, а домены —
+        // нет: в туннеле нет ни запроса, ни имени, только пакеты. Тогда
+        // правила вида «grid.gg через прокси» не срабатывают вовсе, и
+        // работает лишь то, что совпало по адресу.
+        serde_json::json!({ "action": "sniff" }),
         // свои адреса — мимо перехвата
         serde_json::json!({
             "ip_is_private": true,
@@ -203,6 +208,17 @@ pub fn build_config_with(
             e.1.push(path_regex(&prefix));
         }
     }
+    // ⛔ QUIC закрываем наглухо. Это HTTP/2 и HTTP/3 поверх UDP, а через
+    // SOCKS5 протокол UDP не проходит вовсе: соединение просто виснет.
+    // Программа при этом не сообщает об ошибке — она молча не работает,
+    // хотя на обычном TCP всё в порядке. Закрыв QUIC, мы заставляем её
+    // откатиться на TCP, который через прокси проходит.
+    rules.push(serde_json::json!({
+        "network": "udp",
+        "port": [443, 80],
+        "action": "reject"
+    }));
+
     // правила по доменам и подсетям — то же, что в режиме прокси
     let mut dom_by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
     for d in domains {
@@ -312,11 +328,15 @@ mod tests {
         assert!(has, "адрес прокси обязан идти напрямую");
     }
 
+    /// Своя сеть мимо перехвата: прокси до неё не достанет, а обращения
+    /// к самому себе он и вовсе завернёт в петлю.
     #[test]
     fn свои_адреса_идут_напрямую() {
         let c = build_config(&[], &[corp()]);
-        assert_eq!(rules_of(&c)[0]["ip_is_private"], true);
-        assert_eq!(rules_of(&c)[0]["outbound"], "direct");
+        let hit = rules_of(&c).iter().any(|r| {
+            r["ip_is_private"] == true && r["outbound"] == "direct"
+        });
+        assert!(hit, "локальная сеть обязана идти напрямую");
     }
 
     /// ⛔ Всё лишнее должно идти напрямую: завернув весь трафик, мы
@@ -1171,4 +1191,45 @@ fn count_processes(bin: &Path) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod quic_tests {
+    use super::*;
+
+    /// ⛔ QUIC — это HTTP поверх UDP, а SOCKS5 протокол UDP не пропускает.
+    /// Соединение виснет молча: программа не сообщает об ошибке, просто
+    /// не работает. Закрываем, чтобы она откатилась на TCP.
+    #[test]
+    fn quic_закрыт() {
+        let c = build_config(
+            &[Route { process: "Cursor".into(), path: "/Applications/Cursor.app".into(),
+                      via: "основной".into() }],
+            &[Upstream { tag: "основной".into(), kind: Kind::Socks5,
+                         address: "172.31.211.1".into(), port: 1081,
+                         user: None, password: None }],
+        );
+        let blocked = c["route"]["rules"].as_array().unwrap().iter().any(|r| {
+            r["network"] == "udp"
+                && r["action"] == "reject"
+                && r["port"].as_array().map_or(false, |p| p.iter().any(|x| x == 443))
+        });
+        assert!(blocked, "QUIC обязан быть закрыт, иначе программа виснет молча");
+    }
+}
+
+#[cfg(test)]
+mod sniff_tests {
+    use super::*;
+
+    /// ⛔ В туннеле движок видит пакеты, а не запросы: имя узла ему
+    /// неоткуда взять. Без распознавания домены не определяются, и
+    /// правила по ним не работают — остаются только адреса.
+    #[test]
+    fn домены_распознаются() {
+        let c = build_config(&[], &[]);
+        let first = c["route"]["rules"].as_array().unwrap().first().unwrap();
+        assert_eq!(first["action"], "sniff",
+                   "распознавание должно стоять первым, до всех решений");
+    }
 }
