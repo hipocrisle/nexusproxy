@@ -213,6 +213,15 @@ pub fn build_config_with(
     // Программа при этом не сообщает об ошибке — она молча не работает,
     // хотя на обычном TCP всё в порядке. Закрыв QUIC, мы заставляем её
     // откатиться на TCP, который через прокси проходит.
+    // ⛔ Запросы имён — мимо прокси и без вмешательства: внутренние
+    // зоны за корпоративным прокси не видны, а отвечать за систему мы
+    // не беремся.
+    rules.push(serde_json::json!({
+        "port": [53],
+        "action": "route",
+        "outbound": "direct"
+    }));
+
     rules.push(serde_json::json!({
         "network": "udp",
         "port": [443, 80],
@@ -260,12 +269,25 @@ pub fn build_config_with(
     }
 
     serde_json::json!({
+        // ⛔ DNS оставляем системе. Туннель по умолчанию отвечает на
+        // запросы сам, и внутренние имена — контроллеры домена, файловые
+        // ресурсы — перестают разрешаться: у человека виснет оснастка
+        // управления доменом, хотя по адресам всё доступно. Наше дело —
+        // вести трафик, а не подменять разрешение имён.
+        "dns": {
+            "servers": [{ "type": "local", "tag": "system" }],
+            "strategy": "prefer_ipv4"
+        },
         // ⛔ Уровень «info», а не «warn»: при «warn» движок молчит, и
         // когда перехват не работает, мы не видим даже того, создался ли
         // сетевой интерфейс. Журнал пишется в свой файл, чтобы не
         // теряться среди записей наблюдателя.
         "log": {
-            "level": "info",
+            // ⛔ «debug», а не «info»: на «info» не видно, какое правило
+            // сработало и куда ушло соединение — только что оно было.
+            // Разбирать «идёт через туннель, но не работает» на этом
+            // уровне невозможно.
+            "level": "debug",
             "timestamp": true,
             "output": engine_log_path(dir_hint).display().to_string()
         },
@@ -848,6 +870,15 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
                 .filter(|l| !l.contains("outbound/direct"))
                 .filter(|l| !l.contains("NexusProxy.app") && !l.contains("nexusproxy.exe"))
                 .filter(|l| !l.contains("inbound connection from"))
+                // на подробном уровне движок сыплет служебным; оставляем
+                // то, по чему видно судьбу соединения
+                .filter(|l| {
+                    !l.contains("DEBUG")
+                        || l.contains("match")
+                        || l.contains("outbound")
+                        || l.contains("rejected")
+                        || l.contains("sniff")
+                })
                 .take(lines)
                 .map(|s| s.to_string()));
         }
@@ -1231,5 +1262,26 @@ mod sniff_tests {
         let first = c["route"]["rules"].as_array().unwrap().first().unwrap();
         assert_eq!(first["action"], "sniff",
                    "распознавание должно стоять первым, до всех решений");
+    }
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use super::*;
+
+    /// ⛔ Туннель не должен отвечать за разрешение имён: внутренние
+    /// адреса — контроллеры домена, файловые ресурсы — за корпоративным
+    /// прокси не видны. У пользователя из-за этого повисла оснастка
+    /// управления доменом, хотя по адресам всё было доступно.
+    #[test]
+    fn запросы_имён_идут_мимо_нас() {
+        let c = build_config(&[], &[]);
+        let hit = c["route"]["rules"].as_array().unwrap().iter().any(|r| {
+            r["port"].as_array().map_or(false, |p| p.iter().any(|x| x == 53))
+                && r["outbound"] == "direct"
+        });
+        assert!(hit, "запросы имён обязаны идти напрямую");
+        assert_eq!(c["dns"]["servers"][0]["type"], "local",
+                   "имена разрешает система, а не мы");
     }
 }

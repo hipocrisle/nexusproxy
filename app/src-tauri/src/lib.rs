@@ -148,7 +148,7 @@ fn rules_set_via(app: State<App>, patterns: Vec<String>, via: String) -> Result<
             }
         }
     }
-    e.apply_and_save()
+    { e.apply_and_save()?; let _ = refresh_tunnel(&app); Ok(()) }
 }
 
 /// Перевести правило на другой прокси. Пустое имя — вернуть на основной.
@@ -206,6 +206,7 @@ fn rule_add(
         r
     };
     e.apply_and_save()?;
+    let _ = refresh_tunnel(&app);
     Ok(r)
 }
 
@@ -219,6 +220,7 @@ fn rule_edit(app: State<App>, old: String, new: String) -> Result<core::config::
         c.add_many(&new)
     };
     e.apply_and_save()?;
+    let _ = refresh_tunnel(&app);
     Ok(r)
 }
 
@@ -230,6 +232,7 @@ fn rule_add_from_file(app: State<App>, path: String) -> Result<core::config::Bul
     let e = engine(&app)?;
     let r = { e.cfg.lock().unwrap().add_many(&text) };
     e.apply_and_save()?;
+    let _ = refresh_tunnel(&app);
     Ok(r)
 }
 
@@ -256,6 +259,7 @@ fn rule_remove(app: State<App>, pattern: String) -> Result<bool, String> {
     let removed = { e.cfg.lock().unwrap().remove_proxy(&pattern) };
     if removed {
         e.apply_and_save()?;
+    let _ = refresh_tunnel(&app);
     }
     Ok(removed)
 }
@@ -855,14 +859,18 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<(), String> {
             None => c.apps.push(item),
         }
     }
-    e.apply_and_save()
+    e.apply_and_save()?;
+    // ⛔ Иначе движок останется со старым списком: приложение в окне
+    // есть, а трафик его идёт мимо.
+    refresh_tunnel(&state)
 }
 
 #[tauri::command]
 fn app_remove(state: State<App>, path: String) -> Result<(), String> {
     let e = engine(&state)?;
     e.cfg.lock().unwrap().apps.retain(|a| a.path != path);
-    e.apply_and_save()
+    e.apply_and_save()?;
+    refresh_tunnel(&state)
 }
 
 /// На каких портах мы слушаем — берём из живого движка.
@@ -884,6 +892,61 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
     let pid = core::launch::start(&item, socks, http)?;
     Ok(format!("{} запущен через прокси ({}), процесс {pid}",
                item.name, core::launch::explain(&item, socks, http)))
+}
+
+/// Переписать настройки туннеля по текущему состоянию программы.
+///
+/// ⛔ Вызывать при ЛЮБОМ изменении списка приложений и правил. Движок
+/// читает настройки при запуске: не обновив их, мы оставляем его со
+/// старым списком — человек добавляет приложение, видит его в окне, а
+/// трафик идёт мимо. Так и было: добавленный браузер в туннель не
+/// попадал вовсе.
+fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
+    let path = app.path.lock().unwrap().clone();
+    let dir = core::tunnel_dir(&path);
+    let e = engine(app)?;
+    let c = e.cfg.lock().unwrap();
+    if !c.tunnel_mode {
+        return Ok(());
+    }
+    let routes: Vec<core::tunnel::Route> = c.apps.iter()
+        .filter(|a| !a.via.trim().is_empty())
+        .map(|a| core::tunnel::Route {
+            process: core::launch::process_name(&a.path),
+            path: a.path.clone(),
+            via: a.via.clone(),
+        })
+        .collect();
+    let domains: Vec<core::tunnel::DomainRule> = c.through_proxy.iter()
+        .map(|p| core::tunnel::DomainRule { pattern: p.clone(), via: String::new() })
+        .chain(c.groups.iter().filter(|g| g.enabled).flat_map(|g| {
+            g.patterns.iter().map(move |p| core::tunnel::DomainRule {
+                pattern: p.clone(), via: g.via.clone(),
+            })
+        }))
+        .map(|mut d| {
+            if d.via.trim().is_empty() {
+                d.via = c.default_upstream.clone();
+            }
+            d
+        })
+        .collect();
+    let ups: Vec<core::tunnel::Upstream> = c.all_upstreams().into_iter()
+        .map(|u| core::tunnel::Upstream {
+            tag: u.name.clone(),
+            kind: match u.kind {
+                core::upstream::Kind::Socks5 => core::tunnel::Kind::Socks5,
+                core::upstream::Kind::Http => core::tunnel::Kind::Http,
+            },
+            address: u.address.clone(), port: u.port,
+            user: u.user.clone(), password: u.password.clone(),
+        })
+        .collect();
+    drop(c);
+    core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
+    // движок перечитает настройки: на macOS через признак, на Windows
+    // перезапуском задачи
+    core::tunnel_service::start_in(&dir)
 }
 
 /// Что сейчас с перехватом: скачан ли движок, работает ли, почему нет.
@@ -1115,7 +1178,14 @@ pub fn run() {
             *state.path.lock().unwrap() = path_s.clone();
             let rt = tokio::runtime::Runtime::new()?;
             match rt.block_on(core::Engine::start(cfg, &path_s)) {
-                Ok(e) => *state.engine.lock().unwrap() = Some(e),
+                Ok(e) => {
+                    *state.engine.lock().unwrap() = Some(e);
+                    // ⛔ Настройки туннеля обновляем при каждом запуске:
+                    // иначе движок работает с тем списком, что был при
+                    // последнем переключении режима, а всё добавленное
+                    // после него в туннель не попадает.
+                    let _ = refresh_tunnel(&state);
+                }
                 Err(err) => {
                     eprintln!("движок не запустился: {err}");
                     *state.start_error.lock().unwrap() = Some(err);
