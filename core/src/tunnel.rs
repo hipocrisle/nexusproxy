@@ -612,6 +612,15 @@ pub fn run_foreground(dir: &Path) -> Result<(), String> {
     crate::logfile::open(dir.join("runner.log")).ok();
     crate::logfile::line(&crate::logfile::now_stamp(),
         &format!("перехват: запускаю движок из {}", dir.display()));
+    // ⛔ Движок от прошлого запуска держит сетевой интерфейс, и новый
+    // падает с «The object already exists». Снимаем старый и ждём, пока
+    // система уберёт интерфейс: иначе тот же отказ, только позже.
+    let left = kill_orphans(dir);
+    if left > 0 {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: снят прежний движок ({left})"));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+    }
     let bin = binary_path(dir);
     if !bin.is_file() {
         return Err(format!("движок перехвата не найден: {}", bin.display()));
@@ -676,13 +685,34 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
                 .map(|s| s.to_string()));
         }
     }
-    out.reverse();
-    // Движок красит вывод, в окне программы эти метки — мусор.
-    let clean: Vec<String> = out.into_iter()
+    // ⛔ Строки идут из разных файлов, и часть повторяется. Без
+    // упорядочивания и отсева человек читает мешанину, в которой
+    // последовательность событий не видна.
+    let mut clean: Vec<String> = out.into_iter()
         .map(|l| strip_colors(&l))
         .filter(|l| !l.trim().is_empty())
         .collect();
-    clean.join("\n")
+    clean.sort_by(|a, b| stamp_of(a).cmp(&stamp_of(b)));
+    clean.dedup();
+    let from = clean.len().saturating_sub(lines);
+    clean[from..].join("\n")
+}
+
+/// Метка времени в начале строки — по ней раскладываем события по
+/// порядку. Строки без метки идут последними: это продолжение вывода.
+fn stamp_of(line: &str) -> String {
+    // «2026-09-23 10:48:35 …» или «+0300 2026-09-23 10:48:35 …»
+    let start = if line.starts_with('+') {
+        line.find(' ').map(|i| i + 1).unwrap_or(0)
+    } else {
+        0
+    };
+    let rest = &line[start.min(line.len())..];
+    if rest.len() >= 19 && rest.starts_with(|c: char| c.is_ascii_digit()) {
+        rest[..19].to_string()
+    } else {
+        "9999".to_string()
+    }
 }
 
 fn strip_colors(s: &str) -> String {
@@ -766,5 +796,26 @@ mod path_tests {
         let re = path_regex(r"C:\Program Files\Cursor.app");
         assert!(re.contains(r"Cursor\.app"), "точка должна быть экранирована: {re}");
         assert!(!re.contains(r"\P"), "обратная косая не должна попасть как есть: {re}");
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// ⛔ Журнал собирается из разных файлов, и без упорядочивания
+    /// человек читает мешанину, в которой не видно последовательности
+    /// событий — а ради неё журнал и сделан.
+    #[test]
+    fn строки_раскладываются_по_времени() {
+        let mut v = vec![
+            "2026-09-23 11:44:38 второе".to_string(),
+            "+0300 2026-09-23 10:48:35 первое".to_string(),
+            "продолжение без метки".to_string(),
+        ];
+        v.sort_by(|a, b| stamp_of(a).cmp(&stamp_of(b)));
+        assert!(v[0].contains("первое"), "{v:?}");
+        assert!(v[1].contains("второе"), "{v:?}");
+        assert!(v[2].contains("продолжение"), "строки без метки идут последними");
     }
 }
