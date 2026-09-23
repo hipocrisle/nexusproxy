@@ -50,10 +50,54 @@ fn asset_suffix() -> Option<&'static str> {
 /// Какое приложение через какой прокси ведём.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
-    /// Имя исполняемого файла — по нему sing-box узнаёт процесс.
+    /// Имя исполняемого файла — по нему движок узнаёт процесс.
     pub process: String,
+    /// Полный путь, как его указал человек.
+    ///
+    /// ⛔ Нужен, потому что одно приложение — это несколько процессов.
+    /// У Cursor запросы к моделям делает отдельный вспомогательный
+    /// процесс с другим именем; ловя только главный, мы пропускаем как
+    /// раз то, ради чего всё затевалось. По пути ловятся все.
+    pub path: String,
     /// Тег прокси, через который идёт трафик.
     pub via: String,
+}
+
+/// Во что превращается путь приложения для отбора по нему.
+///
+/// На macOS `.app` — папка со всем хозяйством приложения, и её путь
+/// годится целиком. На Windows процессы приложения лежат в своей папке,
+/// поэтому берём её.
+fn path_prefix(path: &str) -> Option<String> {
+    let p = path.trim_end_matches(['/', '\\']);
+    if p.is_empty() {
+        return None;
+    }
+    if p.to_lowercase().ends_with(".app") {
+        return Some(p.to_string());
+    }
+    let cut = p.rfind(['/', '\\'])?;
+    Some(p[..cut].to_string())
+}
+
+/// Отбор по пути: экранируем всё, что значимо для выражения, иначе
+/// точка в «Cursor.app» совпадёт с любым знаком, а обратная косая
+/// в путях Windows — испортит выражение целиком.
+fn path_regex(prefix: &str) -> String {
+    let mut out = String::from("^");
+    for c in prefix.chars() {
+        match c {
+            '\\' => out.push_str("[\\\\/]"),
+            '/' => out.push_str("[\\\\/]"),
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push_str("[\\\\/]");
+    out
 }
 
 /// Вышестоящий прокси в том виде, в каком его понимает движок.
@@ -121,16 +165,26 @@ pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Val
     }
 
     // приложения — каждое в свой прокси
-    let mut by_via: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    let mut by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
     for r in routes {
-        by_via.entry(r.via.as_str()).or_default().push(r.process.as_str());
+        let e = by_via.entry(r.via.as_str()).or_default();
+        e.0.push(r.process.clone());
+        // ⛔ Ловим и по пути: приложение — это несколько процессов, и
+        // нужный нам может зваться иначе, чем главный.
+        if let Some(prefix) = path_prefix(&r.path) {
+            e.1.push(path_regex(&prefix));
+        }
     }
-    for (via, procs) in by_via {
-        rules.push(serde_json::json!({
+    for (via, (procs, paths)) in by_via {
+        let mut rule = serde_json::json!({
             "process_name": procs,
             "action": "route",
             "outbound": via
-        }));
+        });
+        if !paths.is_empty() {
+            rule["process_path_regex"] = serde_json::json!(paths);
+        }
+        rules.push(rule);
     }
 
     serde_json::json!({
@@ -173,7 +227,7 @@ mod tests {
     #[test]
     fn приложение_идёт_в_свой_прокси() {
         let c = build_config(
-            &[Route { process: "Cursor.exe".into(), via: "основной".into() }],
+            &[Route { process: "Cursor.exe".into(), path: format!("/Apps/{}", "Cursor.exe"), via: "основной".into() }],
             &[corp()],
         );
         let last = rules_of(&c).last().unwrap();
@@ -206,7 +260,7 @@ mod tests {
     #[test]
     fn остальное_не_заворачиваем() {
         let c = build_config(
-            &[Route { process: "Cursor.exe".into(), via: "основной".into() }],
+            &[Route { process: "Cursor.exe".into(), path: format!("/Apps/{}", "Cursor.exe"), via: "основной".into() }],
             &[corp()],
         );
         assert_eq!(c["route"]["final"], "direct");
@@ -216,8 +270,8 @@ mod tests {
     fn приложения_одного_прокси_идут_одним_правилом() {
         let c = build_config(
             &[
-                Route { process: "a.exe".into(), via: "основной".into() },
-                Route { process: "b.exe".into(), via: "основной".into() },
+                Route { process: "a.exe".into(), path: format!("/Apps/{}", "a.exe"), via: "основной".into() },
+                Route { process: "b.exe".into(), path: format!("/Apps/{}", "b.exe"), via: "основной".into() },
             ],
             &[corp()],
         );
@@ -591,7 +645,35 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
     // сам движок. Разбирать «не работает» по одному из них невозможно.
     for name in ["runner.log", "tunnel.log", "daemon.log"] {
         if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
-            out.extend(t.lines().rev().take(lines).map(|s| s.to_string()));
+            out.extend(t.lines().rev()
+                // ⛔ Не наши беды в журнал не тащим: соединения, ушедшие
+                // напрямую и не дошедшие, — это сеть, а не перехват. Они
+                // забивают журнал и мешают увидеть настоящую причину.
+                .filter(|l| !l.contains("outbound/direct"))
+                .take(lines)
+                .map(|s| s.to_string()));
+        }
+    }
+    // ⛔ Главное — что делала сама программа: какие команды выполняла и
+    // что ответила система. Эти записи идут в общий журнал, и без них в
+    // окне была пустота вместо причины.
+    if let Some(parent) = dir.parent() {
+        if let Ok(t) = std::fs::read_to_string(parent.join("nexusproxy.log")) {
+            out.extend(t.lines().rev()
+                .filter(|l| l.contains("перехват"))
+                .take(lines)
+                .map(|s| s.to_string()));
+        }
+    }
+    // ⛔ Главное — что делала сама программа: какие команды выполняла и
+    // что ответила система. Эти записи идут в общий журнал, и без них в
+    // окне была пустота вместо причины.
+    if let Some(parent) = dir.parent() {
+        if let Ok(t) = std::fs::read_to_string(parent.join("nexusproxy.log")) {
+            out.extend(t.lines().rev()
+                .filter(|l| l.contains("перехват"))
+                .take(lines)
+                .map(|s| s.to_string()));
         }
     }
     out.reverse();
@@ -631,5 +713,58 @@ mod log_tests {
     fn метки_цвета_убираются() {
         assert_eq!(strip_colors("\u{1b}[31mERROR\u{1b}[0m тут"), "ERROR тут");
         assert_eq!(strip_colors("обычная строка"), "обычная строка");
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn corp() -> Upstream {
+        Upstream {
+            tag: "основной".into(), kind: Kind::Socks5,
+            address: "172.31.211.1".into(), port: 1081,
+            user: None, password: None,
+        }
+    }
+
+    /// ⛔ Одно приложение — это несколько процессов. У Cursor запросы к
+    /// моделям делает отдельный вспомогательный процесс с другим именем;
+    /// ловя только главный, мы пропускаем как раз то, ради чего всё
+    /// затевалось. На macOS это и было причиной «перехват включён, а
+    /// Cursor не работает».
+    #[test]
+    fn ловим_все_процессы_приложения_по_пути() {
+        let c = build_config(
+            &[Route {
+                process: "Cursor".into(),
+                path: "/Applications/Cursor.app".into(),
+                via: "основной".into(),
+            }],
+            &[corp()],
+        );
+        let last = c["route"]["rules"].as_array().unwrap().last().unwrap();
+        let re = last["process_path_regex"][0].as_str().unwrap();
+        assert!(re.contains("Cursor"), "{re}");
+        assert!(re.starts_with('^'), "отбор должен быть от начала пути: {re}");
+    }
+
+    /// На Windows процессы приложения лежат в своей папке — берём её,
+    /// а не сам файл, иначе вспомогательные процессы снова пройдут мимо.
+    #[test]
+    fn у_обычного_файла_берём_его_папку() {
+        let p = path_prefix(r"C:\Users\i\AppData\Local\Programs\cursor\Cursor.exe").unwrap();
+        assert!(p.ends_with("cursor"), "{p}");
+        assert!(!p.ends_with(".exe"), "{p}");
+    }
+
+    /// ⛔ Точка в выражении совпадает с любым знаком, а обратная косая
+    /// его ломает. Без экранирования отбор по пути ловил бы лишнее или
+    /// не работал вовсе.
+    #[test]
+    fn особые_знаки_пути_экранируются() {
+        let re = path_regex(r"C:\Program Files\Cursor.app");
+        assert!(re.contains(r"Cursor\.app"), "точка должна быть экранирована: {re}");
+        assert!(!re.contains(r"\P"), "обратная косая не должна попасть как есть: {re}");
     }
 }

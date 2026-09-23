@@ -924,6 +924,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
             .filter(|a| !a.via.trim().is_empty())
             .map(|a| core::tunnel::Route {
                 process: core::launch::process_name(&a.path),
+                path: a.path.clone(),
                 via: a.via.clone(),
             })
             .collect();
