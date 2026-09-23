@@ -183,6 +183,8 @@ pub fn build_config_with(
         // правила вида «grid.gg через прокси» не срабатывают вовсе, и
         // работает лишь то, что совпало по адресу.
         serde_json::json!({ "action": "sniff" }),
+        // дальше — правила по приложениям, см. ниже: они должны стоять
+        // как можно раньше, пока соединение ещё живо
         // свои адреса — мимо перехвата
         serde_json::json!({
             "ip_is_private": true,
@@ -214,6 +216,28 @@ pub fn build_config_with(
             e.1.push(path_regex(&prefix));
         }
     }
+    // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
+    // требует совпадения всех условий сразу, а у приложения процессы
+    // зовутся по-разному: главный «Cursor», рабочий «Cursor Helper
+    // (Plugin)». Путь подходит, имя — нет, и правило не срабатывает
+    // никогда. Именно поэтому перехват приложений не работал вовсе.
+    for (via, (procs, paths)) in by_via {
+        if !procs.is_empty() {
+            rules.push(serde_json::json!({
+                "process_name": procs,
+                "action": "route",
+                "outbound": via
+            }));
+        }
+        if !paths.is_empty() {
+            rules.push(serde_json::json!({
+                "process_path_regex": paths,
+                "action": "route",
+                "outbound": via
+            }));
+        }
+    }
+
     // ⛔ QUIC закрываем наглухо. Это HTTP/2 и HTTP/3 поверх UDP, а через
     // SOCKS5 протокол UDP не проходит вовсе: соединение просто виснет.
     // Программа при этом не сообщает об ошибке — она молча не работает,
@@ -259,28 +283,6 @@ pub fn build_config_with(
         }
         if rule.get("domain_suffix").is_some() || rule.get("ip_cidr").is_some() {
             rules.push(rule);
-        }
-    }
-
-    // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
-    // требует совпадения всех условий сразу, а у приложения процессы
-    // зовутся по-разному: главный «Cursor», рабочий «Cursor Helper
-    // (Plugin)». Путь подходит, имя — нет, и правило не срабатывает
-    // никогда. Именно поэтому перехват приложений не работал вовсе.
-    for (via, (procs, paths)) in by_via {
-        if !procs.is_empty() {
-            rules.push(serde_json::json!({
-                "process_name": procs,
-                "action": "route",
-                "outbound": via
-            }));
-        }
-        if !paths.is_empty() {
-            rules.push(serde_json::json!({
-                "process_path_regex": paths,
-                "action": "route",
-                "outbound": via
-            }));
         }
     }
 
@@ -1051,8 +1053,10 @@ mod path_tests {
             }],
             &[corp()],
         );
-        let last = c["route"]["rules"].as_array().unwrap().last().unwrap();
-        let re = last["process_path_regex"][0].as_str().unwrap();
+        let by_path = c["route"]["rules"].as_array().unwrap().iter()
+            .find(|r| r.get("process_path_regex").is_some())
+            .expect("правило по пути должно быть");
+        let re = by_path["process_path_regex"][0].as_str().unwrap();
         assert!(re.contains("Cursor"), "{re}");
         assert!(re.starts_with('^'), "отбор должен быть от начала пути: {re}");
     }
@@ -1539,5 +1543,33 @@ mod resolver_setting_tests {
     fn серверов_имён_всегда_хотя_бы_один() {
         let c = build_config(&[], &[]);
         assert!(!c["dns"]["servers"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod order_of_rules_tests {
+    use super::*;
+
+    /// ⛔ Правила по приложениям должны стоять как можно раньше. Движок
+    /// спрашивает у системы, чей это процесс, когда до правила доходит
+    /// очередь, — а короткие соединения браузера к этому моменту уже
+    /// закрыты, и спрашивать не у кого. Системные службы держат
+    /// соединения долго и потому опознавались, браузеры — никогда.
+    #[test]
+    fn приложения_проверяются_раньше_доменов() {
+        let c = build_config_with(
+            Path::new("."),
+            &[Route { process: "Cursor".into(),
+                      path: "/Applications/Cursor.app".into(),
+                      via: "основной".into() }],
+            &[DomainRule { pattern: "domain:grid.gg".into(), via: "основной".into() }],
+            &[Upstream { tag: "основной".into(), kind: Kind::Socks5,
+                         address: "172.31.211.1".into(), port: 1081,
+                         user: None, password: None }],
+        );
+        let rules = c["route"]["rules"].as_array().unwrap();
+        let app = rules.iter().position(|r| r.get("process_name").is_some()).unwrap();
+        let dom = rules.iter().position(|r| r.get("domain_suffix").is_some()).unwrap();
+        assert!(app < dom, "приложения обязаны проверяться раньше доменов: {app} и {dom}");
     }
 }
