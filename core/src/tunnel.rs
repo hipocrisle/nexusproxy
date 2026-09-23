@@ -821,10 +821,13 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
     for name in ["runner.log", "tunnel.log", "daemon.log", "sing-box.log"] {
         if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
             out.extend(t.lines().rev()
-                // ⛔ Не наши беды в журнал не тащим: соединения, ушедшие
-                // напрямую и не дошедшие, — это сеть, а не перехват. Они
-                // забивают журнал и мешают увидеть настоящую причину.
+                // ⛔ Убираем шум, за которым не видно сути:
+                // — наши собственные обращения к прокси (их десятки в минуту);
+                // — соединения, ушедшие напрямую и не дошедшие: это сеть.
+                // Иначе решение по нужному приложению тонет в мусоре.
                 .filter(|l| !l.contains("outbound/direct"))
+                .filter(|l| !l.contains("NexusProxy.app") && !l.contains("nexusproxy.exe"))
+                .filter(|l| !l.contains("inbound connection from"))
                 .take(lines)
                 .map(|s| s.to_string()));
         }
@@ -1119,7 +1122,7 @@ pub fn diagnosis(dir: &Path) -> String {
         if engine_running(dir) { "да" } else { "нет" }));
 
     out.push_str("\n── журнал ──\n");
-    out.push_str(&log_tail(dir, 25));
+    out.push_str(&log_tail(dir, 40));
     out
 }
 
