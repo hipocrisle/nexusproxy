@@ -1053,6 +1053,7 @@ function Tunnel() {
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
   const [log, setLog] = useState("");
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
     invoke<TunnelState>("tunnel_state").then(setSt).catch(() => {});
@@ -1125,6 +1126,15 @@ function Tunnel() {
           <summary className="hint" style={{ cursor: "pointer" }}>
             Подробности работы
           </summary>
+          <div className="row" style={{ marginTop: 6 }}>
+            <button className="small" onClick={() => {
+              navigator.clipboard.writeText(log);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            }}>
+              {copied ? "Скопировано" : "Копировать"}
+            </button>
+          </div>
           <pre className="log" style={{ maxHeight: 280, marginTop: 6 }}>{log}</pre>
         </details>
       )}

@@ -132,8 +132,13 @@ pub struct DomainRule {
     pub via: String,
 }
 
+/// Куда движок пишет свой журнал.
+pub fn engine_log_path(dir: &Path) -> PathBuf {
+    dir.join("sing-box.log")
+}
+
 pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Value {
-    build_config_with(routes, &[], upstreams)
+    build_config_with(Path::new("."), routes, &[], upstreams)
 }
 
 /// ⛔ TUN режим заменяет режим прокси целиком, а не дополняет его.
@@ -142,6 +147,7 @@ pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Val
 /// перенести эти правила сюда. У пользователя так разом отвалилось всё,
 /// кроме приложений из списка.
 pub fn build_config_with(
+    dir_hint: &Path,
     routes: &[Route],
     domains: &[DomainRule],
     upstreams: &[Upstream],
@@ -238,7 +244,15 @@ pub fn build_config_with(
     }
 
     serde_json::json!({
-        "log": { "level": "warn", "timestamp": true },
+        // ⛔ Уровень «info», а не «warn»: при «warn» движок молчит, и
+        // когда перехват не работает, мы не видим даже того, создался ли
+        // сетевой интерфейс. Журнал пишется в свой файл, чтобы не
+        // теряться среди записей наблюдателя.
+        "log": {
+            "level": "info",
+            "timestamp": true,
+            "output": engine_log_path(dir_hint).display().to_string()
+        },
         "inbounds": [{
             "type": "tun",
             "tag": "tun-in",
@@ -637,7 +651,7 @@ pub fn kill_orphans(dir: &Path) -> usize {
 pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
                     upstreams: &[Upstream]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-    let cfg = build_config_with(routes, domains, upstreams);
+    let cfg = build_config_with(dir, routes, domains, upstreams);
     std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
         .map_err(|e| format!("не записать настройки: {e}"))?;
     // Какие именно процессы ловим — самое важное для разбора: если имя
@@ -804,7 +818,7 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
     let mut out = Vec::new();
     // Собираем все следы: что делали мы, что ответила система, что сказал
     // сам движок. Разбирать «не работает» по одному из них невозможно.
-    for name in ["runner.log", "tunnel.log", "daemon.log"] {
+    for name in ["runner.log", "tunnel.log", "daemon.log", "sing-box.log"] {
         if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
             out.extend(t.lines().rev()
                 // ⛔ Не наши беды в журнал не тащим: соединения, ушедшие
@@ -995,6 +1009,7 @@ mod domain_tests {
     #[test]
     fn правила_доменов_переходят_в_туннель() {
         let c = build_config_with(
+            Path::new("."),
             &[],
             &[DomainRule { pattern: "domain:grid.gg".into(), via: "основной".into() }],
             &[corp()],
@@ -1009,6 +1024,7 @@ mod domain_tests {
     #[test]
     fn подсети_тоже_переходят() {
         let c = build_config_with(
+            Path::new("."),
             &[],
             &[DomainRule { pattern: "10.0.0.0/8".into(), via: "основной".into() }],
             &[corp()],
@@ -1024,6 +1040,7 @@ mod domain_tests {
     #[test]
     fn служебные_записи_не_попадают() {
         let c = build_config_with(
+            Path::new("."),
             &[],
             &[DomainRule { pattern: "_Группа".into(), via: "основной".into() }],
             &[corp()],
@@ -1056,6 +1073,7 @@ pub fn diagnosis(dir: &Path) -> String {
     say(&mut out, "движок", binary_path(dir));
     say(&mut out, "настройки", config_path(dir));
     say(&mut out, "признак включения", dir.join("enabled"));
+    say(&mut out, "журнал движка", engine_log_path(dir));
     #[cfg(target_os = "macos")]
     {
         say(&mut out, "наблюдатель", dir.join("watch.sh"));
