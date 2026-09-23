@@ -137,15 +137,6 @@ pub struct Config {
     /// понять, что чем управляет.
     #[serde(default)]
     pub tunnel_mode: bool,
-    /// В TUN режиме вести через прокси ВЕСЬ трафик, кроме исключений.
-    ///
-    /// ⛔ Нужно потому, что определение программы по соединению работает
-    /// не везде: на macOS движок опознаёт системные службы, а браузеры —
-    /// нет, их соединения он видит «ничьими». Правила по приложениям при
-    /// этом бесполезны, и единственный надёжный способ — вести всё, а
-    /// ненужное выносить в исключения.
-    #[serde(default)]
-    pub tunnel_all: bool,
     /// Подписка со странами. Хранится, чтобы поднимать их при запуске.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<Subscription>,
@@ -376,7 +367,6 @@ mod tests {
             through_proxy: through.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
             tunnel_mode: false,
-            tunnel_all: false,
             auto_reconnect: true,
             minimize_to_tray: true,
             enable_on_start: true,

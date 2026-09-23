@@ -742,7 +742,6 @@ fn set_flag(app: State<App>, name: String, value: bool) -> Result<(), String> {
             }
             "minimize_to_tray" => c.minimize_to_tray = value,
             "enable_on_start" => c.enable_on_start = value,
-            "tunnel_all" => c.tunnel_all = value,
             other => return Err(format!("неизвестная настройка: {other}")),
         }
     }
@@ -816,7 +815,6 @@ fn default_config() -> core::config::Config {
         subscription: None,
         apps: vec![],
         tunnel_mode: false,
-        tunnel_all: false,
         extra: Default::default(),
     }
 }
@@ -944,9 +942,8 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
             user: u.user.clone(), password: u.password.clone(),
         })
         .collect();
-    let everything = c.tunnel_all;
     drop(c);
-    core::tunnel::write_config_full(&dir, &routes, &domains, &ups, everything)?;
+    core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
     // ⛔ Служба тоже могла устареть: наблюдатель и способ запуска
     // меняются вместе с программой, а ставится он один раз. Без этой
     // проверки после обновления продолжает работать прежний — со
@@ -962,12 +959,9 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
 fn tunnel_state(app: State<App>) -> serde_json::Value {
     let path = app.path.lock().unwrap().clone();
     let dir = core::tunnel_dir(&path);
-    let (mode, all_traffic, apps) = match engine(&app) {
-        Ok(e) => {
-            let c = e.cfg.lock().unwrap();
-            (c.tunnel_mode, c.tunnel_all, c.apps.len())
-        }
-        Err(_) => (false, false, 0),
+    let (mode, apps) = match engine(&app) {
+        Ok(e) => { let c = e.cfg.lock().unwrap(); (c.tunnel_mode, c.apps.len()) }
+        Err(_) => (false, 0),
     };
     let svc = core::tunnel_service::state_in(&dir);
     serde_json::json!({
@@ -979,7 +973,6 @@ fn tunnel_state(app: State<App>) -> serde_json::Value {
         "running": svc == core::tunnel_service::State::Running
                    || core::tunnel::is_running(),
         "mode": mode,
-        "all": all_traffic,
         "apps": apps,
         "error": core::tunnel::last_error(),
     })
