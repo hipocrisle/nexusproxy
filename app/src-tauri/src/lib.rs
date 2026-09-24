@@ -714,8 +714,9 @@ fn system_proxy(app: State<App>, on: bool) -> Result<(), String> {
         if tunnel {
             let path = app.path.lock().unwrap().clone();
             let dir = core::tunnel_dir(&path);
-            // системные настройки перехвату не нужны и только мешают
-            e.system_proxy_off();
+            // системные настройки перехвату не нужны и только мешают:
+            // браузеры читают их и уходят на локальный адрес мимо туннеля
+            e.system_proxy_drop();
             core::tunnel_service::start_in(&dir)
         } else {
             e.tunnel_off();
@@ -945,7 +946,7 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
     drop(c);
     // ⛔ В TUN режиме системные настройки прокси обязаны быть сняты:
     // иначе браузеры идут по ним на локальный адрес, мимо туннеля.
-    e.system_proxy_off();
+    e.system_proxy_drop();
     core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
     // ⛔ Служба тоже могла устареть: наблюдатель и способ запуска
     // меняются вместе с программой, а ставится он один раз. Без этой
@@ -1053,6 +1054,11 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
 
     tokio::task::spawn_blocking(move || {
         if !on {
+            // ⛔ Переключение способа обязано его СРАЗУ применить, а не
+            // просто запомнить. Человек выбрал режим прокси — значит
+            // системные настройки должны прописаться тут же, без похода
+            // к кнопке в шапке: «включил — прописались, выключил —
+            // убрались», как на Windows.
             let _ = core::tunnel_service::stop_in(&dir);
             core::tunnel::stop_elevated();
             core::tunnel::stop();
@@ -1078,7 +1084,17 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // Способ выбран — применяем его сразу.
+    let state = app.state::<App>();
+    let e = engine(&state)?;
+    if on {
+        e.system_proxy_drop();
+    } else {
+        e.system_proxy_on()?;
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1235,7 +1251,7 @@ pub fn run() {
                         // на наш локальный адрес — а туда туннель не смотрит,
                         // это петля внутри машины. Их соединений не видно
                         // вовсе, и выглядит как «перехват их не ловит».
-                        e.system_proxy_off();
+                        e.system_proxy_drop();
                         core::logfile::line(&core::logfile::now_stamp(),
                             "TUN режим: системные настройки прокси сняты");
                     }

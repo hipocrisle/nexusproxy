@@ -121,6 +121,17 @@ mod imp {
         }
     }
 
+    /// Выключить прокси на всех сетевых службах.
+    ///
+    /// ⛔ Только выключаем, адреса не стираем: человек мог настроить их
+    /// сам, и вернуть их потом должно быть легко.
+    pub fn clear() {
+        for s in services() {
+            let _ = run(&["-setwebproxystate", &s, "off"]);
+            let _ = run(&["-setsecurewebproxystate", &s, "off"]);
+        }
+    }
+
     pub fn current() -> String {
         for s in services() {
             let (on, addr) = read_proxy(&s, "-getsecurewebproxy");
