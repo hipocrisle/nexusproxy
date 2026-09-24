@@ -21,6 +21,8 @@ type Candidate = {
   examples: string[]; triggered_by: string | null;
 };
 type Preset = { name: string; note: string; domains: string[] };
+/// Что видел движок в TUN режиме: куда ушло соединение.
+type Seen = { host: string; via: string; proxied: boolean };
 type Conn = {
   id: number; host: string; port: number; route: string; via: string;
   app: string; app_path: string; pid: number;
@@ -791,6 +793,29 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
   const [live, setLive] = useState<Candidate[]>([]);
   const [added, setAdded] = useState<Set<string>>(new Set());
 
+  // ⛔ В TUN режиме наши записи пусты: программы обращаются не к нам.
+  // Берём то, что видел движок, и предлагаем ушедшее напрямую — это и
+  // есть ответ на вопрос «что добавить в правила».
+  const [fromTunnel, setFromTunnel] = useState<Candidate[]>([]);
+  useEffect(() => {
+    const tick = async () => {
+      const seen = await invoke<Seen[]>("tunnel_seen").catch(() => []);
+      const byDomain = new Map<string, number>();
+      for (const c of seen) {
+        if (c.proxied) continue;              // уже идёт через прокси
+        if (/^[\d.:]+$/.test(c.host)) continue; // адрес без имени не предложишь
+        const d = c.host.replace(/:\d+$/, "");
+        byDomain.set(d, (byDomain.get(d) ?? 0) + 1);
+      }
+      setFromTunnel([...byDomain.entries()]
+        .map(([domain, count]) => ({ domain, count, hosts_count: 1, examples: [], triggered_by: null }))
+        .sort((a, b) => b.count - a.count));
+    };
+    tick();
+    const t = setInterval(tick, 3000);
+    return () => clearInterval(t);
+  }, []);
+
   useEffect(() => {
     if (!active) return;
     const t = setInterval(async () => setLive(await invoke<Candidate[]>("discovery_live")), 1200);
@@ -816,6 +841,26 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
 
   return (
     <div className="panel">
+      {fromTunnel.length > 0 && (
+        <div className="card wide">
+          <h3>Ушли напрямую — {fromTunnel.length}</h3>
+          <p className="hint">
+            Замечены в туннеле и не попали ни под одно правило. Если какой-то
+            из них должен идти через прокси — добавьте его.
+          </p>
+          <div className="list">
+            {fromTunnel.slice(0, 40).map((c) => (
+              <div className="item" key={c.domain}>
+                <span className="grow mono">{c.domain}</span>
+                <span className="hint">{c.count}</span>
+                {added.has(c.domain)
+                  ? <span className="tag proxy">добавлен</span>
+                  : <button className="btn small" onClick={() => addOne(c.domain)}>Добавить</button>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="card">
         <h3>Подбор сопутствующих доменов</h3>
         <p className="hint">
@@ -882,6 +927,10 @@ type TotalKey = "domain" | "conns" | "sent" | "received";
 
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
+  // ⛔ В TUN режиме программы не обращаются к нашему входу, и наши
+  // собственные записи пусты — человек видит пустую вкладку и решает,
+  // что всё сломалось. Берём то, что видел движок.
+  const [seen, setSeen] = useState<Seen[]>([]);
   const [totals, setTotals] = useState<DomainStat[]>([]);
   const [fails, setFails] = useState<Failure[]>([]);
   const [filter, setFilter] = useSticky("conn.filter", "");
@@ -902,6 +951,7 @@ function Connections() {
       setLive(await invoke<Conn[]>("conns_active").catch(() => []));
       setTotals(await invoke<DomainStat[]>("conns_totals").catch(() => []));
       setFails(await invoke<Failure[]>("failures_recent").catch(() => []));
+      setSeen(await invoke<Seen[]>("tunnel_seen").catch(() => []));
     };
     tick();
     const t = setInterval(tick, 1000);
@@ -934,6 +984,24 @@ function Connections() {
 
   return (
     <div className="panel">
+      {seen.length > 0 && (
+        <div className="card wide">
+          <h3>Через туннель — {seen.length}</h3>
+          <p className="hint">
+            Последние соединения и куда они ушли. В этом режиме программы
+            обращаются не к нам, а прямо в сеть, поэтому счётчиков трафика
+            здесь нет.
+          </p>
+          <div className="list">
+            {seen.slice(0, 60).map((c, i) => (
+              <div className="item" key={c.host + i}>
+                <span className="grow mono">{c.host}</span>
+                <span className={"tag " + (c.proxied ? "proxy" : "direct")}>{c.via}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {fails.length > 0 && (
         <div className="card">
           <div className="row" style={{ marginBottom: 6 }}>
@@ -1237,7 +1305,9 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
 
   const saveSettings = async () => {
     const path = await saveFile({
-      defaultPath: "nexusproxy-настройки.json",
+      // ⛔ Имя файла — латиницей: кириллица в именах ломается при
+      // передаче через почту и общие папки.
+      defaultPath: "nexusproxy-settings.json",
       filters: [{ name: "Настройки", extensions: ["json"] }],
     });
     if (typeof path !== "string") return;
