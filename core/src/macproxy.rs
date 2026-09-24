@@ -127,8 +127,8 @@ mod imp {
     /// сам, и вернуть их потом должно быть легко.
     pub fn clear() {
         for s in services() {
-            let _ = run(&["-setwebproxystate", &s, "off"]);
-            let _ = run(&["-setsecurewebproxystate", &s, "off"]);
+            let _ = networksetup(&["-setwebproxystate", &s, "off"]);
+            let _ = networksetup(&["-setsecurewebproxystate", &s, "off"]);
         }
     }
 
@@ -151,9 +151,10 @@ mod imp {
         Err(io::Error::other("доступно только в macOS"))
     }
     pub fn restore(_s: &Saved) {}
+    pub fn clear() {}
     pub fn current() -> String {
         "не поддерживается на этой системе".into()
     }
 }
 
-pub use imp::{apply, current, restore};
+pub use imp::{apply, clear, current, restore};
