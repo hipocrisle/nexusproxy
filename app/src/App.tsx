@@ -707,10 +707,11 @@ function Apps() {
   const save = async () => {
     if (!path.trim()) return;
     try {
-      await invoke("app_save", {
+      const warn = await invoke<string>("app_save", {
         item: { name: name.trim() || path, path, kind: "auto", via },
       });
       if (editing && editing !== path) await invoke("app_remove", { path: editing });
+      setSaid(warn || "");
       reset(); load();
     } catch (e) { alert(String(e)); }
   };
@@ -726,7 +727,11 @@ function Apps() {
   };
 
   const remove = async (p: string) => {
-    try { await invoke("app_remove", { path: p }); load(); } catch (e) { alert(String(e)); }
+    try {
+      const warn = await invoke<string>("app_remove", { path: p });
+      setSaid(warn || "");
+      load();
+    } catch (e) { alert(String(e)); }
   };
 
   return (
@@ -780,9 +785,12 @@ function Apps() {
               ? "Перехват включён — запускайте приложения обычным ярлыком."
               : "Перед запуском закройте программу полностью."}
           </p>
-          {said && <p className="hint">{said}</p>}
         </div>
       )}
+      {/* ⛔ Сообщение живёт вне списка: при удалении последнего
+          приложения список исчезает вместе с ним, и человек не узнаёт,
+          что перехват не обновился. */}
+      {said && <p className="note">{said}</p>}
     </div>
   );
 }

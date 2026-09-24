@@ -844,7 +844,7 @@ fn apps_list(app: State<App>) -> Vec<core::launch::App> {
 }
 
 #[tauri::command]
-fn app_save(state: State<App>, item: core::launch::App) -> Result<(), String> {
+fn app_save(state: State<App>, item: core::launch::App) -> Result<String, String> {
     if item.path.trim().is_empty() {
         return Err("не указан путь к программе".into());
     }
@@ -866,15 +866,25 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<(), String> {
     e.apply_and_save()?;
     // ⛔ Иначе движок останется со старым списком: приложение в окне
     // есть, а трафик его идёт мимо.
-    refresh_tunnel(&state)
+    //
+    // ⛔ Но НЕ ценой самой записи. Приложение уже сохранено, и падать
+    // здесь нельзя: человек видел бы «не добавилось», хотя добавилось.
+    // Про неудачу говорим отдельно — записи это не отменяет.
+    Ok(match refresh_tunnel(&state) {
+        Ok(()) => String::new(),
+        Err(e) => format!("Приложение добавлено, но перехват не обновился: {e}"),
+    })
 }
 
 #[tauri::command]
-fn app_remove(state: State<App>, path: String) -> Result<(), String> {
+fn app_remove(state: State<App>, path: String) -> Result<String, String> {
     let e = engine(&state)?;
     e.cfg.lock().unwrap().apps.retain(|a| a.path != path);
     e.apply_and_save()?;
-    refresh_tunnel(&state)
+    Ok(match refresh_tunnel(&state) {
+        Ok(()) => String::new(),
+        Err(e) => format!("Приложение убрано, но перехват не обновился: {e}"),
+    })
 }
 
 /// На каких портах мы слушаем — берём из живого движка.
