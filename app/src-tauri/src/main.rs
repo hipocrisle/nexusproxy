@@ -14,14 +14,12 @@ fn main() {
     // Запуск движка перехвата задачей планировщика: окно прячем мы.
     if args.len() >= 3 && args[1] == "--run-tunnel" {
         let dir = std::path::PathBuf::from(&args[2]);
-        // На macOS демон живёт постоянно и сам следит за признаком
-        // включения: полагаться на launchd в этом нельзя.
-        let r = if cfg!(target_os = "macos") {
-            let flag = dir.join("enabled");
-            nexusproxy_core::tunnel::watch_flag(&dir, &flag)
-        } else {
-            nexusproxy_core::tunnel::run_foreground(&dir)
-        };
+        // ⛔ Служба живёт постоянно и сама следит за признаком
+        // включения — на обеих системах. Запускать и останавливать её
+        // из окна нельзя: она принадлежит системе, а у человека в
+        // организации прав на неё нет. Признак же он пишет своими.
+        let flag = dir.join("enabled");
+        let r = nexusproxy_core::tunnel::watch_flag(&dir, &flag);
         if let Err(e) = r {
             eprintln!("{e}");
         }

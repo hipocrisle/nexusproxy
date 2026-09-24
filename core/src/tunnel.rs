@@ -819,6 +819,7 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
 
     let mut running: Option<std::process::Child> = None;
     let mut cfg_stamp = config_stamp(dir);
+    let mut tick: u64 = 0;
     loop {
         let want = flag.exists();
         let fresh = config_stamp(dir);
@@ -828,6 +829,15 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
             // просят работать, а движка нет — поднимаем
             (None, true) => {
                 cfg_stamp = fresh;
+                // ⛔ Движок от прошлого запуска держит сетевой интерфейс,
+                // и новый падает с «The object already exists». Снимаем
+                // старый и ждём, пока система уберёт интерфейс.
+                let left = kill_orphans(dir);
+                if left > 0 {
+                    crate::logfile::line(&crate::logfile::now_stamp(),
+                        &format!("перехват: снят прежний движок ({left})"));
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                }
                 match spawn_engine(dir) {
                     Ok(c) => {
                         crate::logfile::line(&crate::logfile::now_stamp(), "перехват: движок поднят");
@@ -866,6 +876,12 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
             }
             (None, false) => {}
         }
+        // ⛔ Журнал движка на подробном уровне растёт мегабайтами в час.
+        // Без обрезки он съедает место, а программа виснет, читая его.
+        tick += 1;
+        if tick % 60 == 0 {
+            trim_log(dir);
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
@@ -902,56 +918,6 @@ fn spawn_engine(dir: &Path) -> Result<std::process::Child, String> {
     Ok(child)
 }
 
-pub fn run_foreground(dir: &Path) -> Result<(), String> {
-    crate::logfile::open(dir.join("runner.log")).ok();
-    crate::logfile::line(&crate::logfile::now_stamp(),
-        &format!("перехват: запускаю движок из {}", dir.display()));
-    // ⛔ Движок от прошлого запуска держит сетевой интерфейс, и новый
-    // падает с «The object already exists». Снимаем старый и ждём, пока
-    // система уберёт интерфейс: иначе тот же отказ, только позже.
-    let left = kill_orphans(dir);
-    if left > 0 {
-        crate::logfile::line(&crate::logfile::now_stamp(),
-            &format!("перехват: снят прежний движок ({left})"));
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-    }
-    let bin = binary_path(dir);
-    if !bin.is_file() {
-        return Err(format!("движок перехвата не найден: {}", bin.display()));
-    }
-    let cfg = config_path(dir);
-    let log = std::fs::File::create(log_path(dir))
-        .map_err(|e| format!("не создать журнал: {e}"))?;
-    let log_err = log.try_clone().map_err(|e| format!("не создать журнал: {e}"))?;
-
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("run").arg("-c").arg(&cfg)
-       .current_dir(dir)
-       .stdout(log).stderr(log_err);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // без окна
-    }
-    let mut child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
-    // Пока движок работает, приглядываем за размером его журнала.
-    {
-        let dir = dir.to_path_buf();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            trim_log(&dir);
-        });
-    }
-    // ⛔ Иначе движок переживает того, кто его запустил: задачу сняли, а
-    // он продолжает держать сетевой интерфейс и заворачивать трафик.
-    // Человек закрыл программу — и не понимает, почему всё ещё работает.
-    #[cfg(windows)]
-    crate::xray::assign_to_job(&child);
-    let code = child.wait();
-    crate::logfile::line(&crate::logfile::now_stamp(),
-        &format!("перехват: движок завершился ({code:?})"));
-    Ok(())
-}
 
 /// Последние строки журнала движка — чтобы человек видел причину, а не
 /// пустой экран с невключившимся перехватом.
