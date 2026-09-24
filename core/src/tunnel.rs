@@ -238,6 +238,22 @@ pub fn build_config_with(
             }
         }
     }
+    // ⛔ ВЕСЬ UDP идёт напрямую, а не только QUIC.
+    //
+    // Через SOCKS5 протокол UDP не проходит вовсе — тот его не умеет.
+    // Поэтому заворачивать UDP в прокси бессмысленно: он либо не дойдёт,
+    // либо приложение свалится на запасной путь по TCP. Видеозвонки так
+    // и теряли качество: они ходят по портам 3478 и выше, под правило
+    // для QUIC не попадали, уходили в прокси и откатывались на TCP.
+    //
+    // Правило стоит ПЕРЕД правилами приложений: иначе их UDP уйдёт в
+    // прокси раньше, чем дойдёт очередь сюда.
+    rules.push(serde_json::json!({
+        "network": "udp",
+        "action": "route",
+        "outbound": "direct"
+    }));
+
     // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
     // требует совпадения всех условий сразу, а у приложения процессы
     // зовутся по-разному: главный «Cursor», рабочий «Cursor Helper
@@ -273,25 +289,6 @@ pub fn build_config_with(
         "action": "route",
         "outbound": "direct"
     }));
-    // ⛔ QUIC пропускаем напрямую, а не запрещаем.
-    //
-    // Это HTTP поверх UDP, и через SOCKS5 он не пройдёт — тот протокол
-    // UDP не умеет. Но запрет оказался хуже: для UDP движок не определяет
-    // владельца соединения, поэтому правило по приложению к нему не
-    // применяется — запрет накрывает всех подряд. Chrome и Safari тянут
-    // по QUIC почти всё и вместо отката на обычный TCP просто ждут;
-    // Firefox, который им почти не пользуется, работал.
-    //
-    // Пропуская QUIC напрямую, мы теряем часть трафика мимо прокси, зато
-    // браузеры работают. Кому нужен весь трафик через прокси — выключает
-    // QUIC в самом браузере.
-    rules.push(serde_json::json!({
-        "network": "udp",
-        "port": [443, 80],
-        "action": "route",
-        "outbound": "direct"
-    }));
-
     // правила по доменам и подсетям — то же, что в режиме прокси
     let mut dom_by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
     for d in domains {
@@ -1355,11 +1352,12 @@ fn count_processes(bin: &Path) -> usize {
 mod quic_tests {
     use super::*;
 
-    /// ⛔ QUIC идёт напрямую, а не запрещается: для UDP движок не знает
-    /// владельца соединения, поэтому запрет накрывал всех подряд, и
-    /// браузеры, тянущие по QUIC почти всё, переставали работать вовсе.
+    /// ⛔ Весь UDP идёт напрямую: через SOCKS5 он не проходит вовсе.
+    /// Заворачивая его в прокси, мы либо теряем соединение, либо
+    /// вынуждаем программу откатиться на TCP — так у видеозвонков и
+    /// падало качество.
     #[test]
-    fn quic_идёт_напрямую() {
+    fn весь_udp_идёт_напрямую() {
         let c = build_config(
             &[Route { process: "Cursor".into(), path: "/Applications/Cursor.app".into(),
                       via: "основной".into() }],
@@ -1367,12 +1365,13 @@ mod quic_tests {
                          address: "172.31.211.1".into(), port: 1081,
                          user: None, password: None }],
         );
-        let direct = c["route"]["rules"].as_array().unwrap().iter().any(|r| {
-            r["network"] == "udp"
-                && r["outbound"] == "direct"
-                && r["port"].as_array().map_or(false, |p| p.iter().any(|x| x == 443))
-        });
-        assert!(direct, "QUIC обязан идти напрямую, иначе браузеры не работают");
+        let rules = c["route"]["rules"].as_array().unwrap();
+        let udp = rules.iter().position(|r| {
+            r["network"] == "udp" && r["outbound"] == "direct" && r.get("port").is_none()
+        }).expect("весь UDP обязан идти напрямую");
+        let app = rules.iter().position(|r| r.get("process_name").is_some()).unwrap();
+        assert!(udp < app,
+                "UDP должен уходить напрямую раньше правил приложений: {udp} и {app}");
     }
 }
 
