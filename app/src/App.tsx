@@ -11,7 +11,7 @@ type Status = {
   running: boolean; upstream: string; http_port: number; socks_port: number;
   system_on: boolean; discovering: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
-  enable_on_start: boolean; default_upstream: string;
+  enable_on_start: boolean; tunnel_mode: boolean; default_upstream: string;
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
@@ -104,6 +104,7 @@ const routeLabel: Record<string, string> = { proxy: "через прокси", d
 type Theme = "system" | "light" | "dark";
 
 export default function App() {
+  const [hideStart, setHideStart] = useSticky("start.hidden", false);
   const [tab, setTab] = useSticky<"rules" | "apps" | "discover" | "conns" | "log" | "settings">("tab", "rules");
   const [st, setSt] = useState<Status | null>(null);
   const [version, setVersion] = useState("");
@@ -167,7 +168,15 @@ export default function App() {
           </span>
         )}
         <span className="meta">
-          {st?.running ? `${st.upstream} · правил ${st.rules_count}` : ""}
+          {/* Главное в шапке — способ работы и куда идёт трафик. Числа
+              правил тут не нужны, а способ человек ищет постоянно: от него
+              зависит, что вообще происходит с его сетью. */}
+          {st?.running && (
+            <>
+              <b>{st.tunnel_mode ? "TUN режим" : "Режим прокси"}</b>
+              {" · "}{st.upstream}
+            </>
+          )}
         </span>
         <div className="theme">
           {(["system", "light", "dark"] as const).map((t) => (
@@ -195,7 +204,12 @@ export default function App() {
       </div>
 
       <div className="body">
-        {tab === "rules" && <Rules onChange={refresh} />}
+        {tab === "rules" && (
+          <div className="panel">
+            {!hideStart && <FirstRun st={st} onDone={() => setHideStart(true)} />}
+            <Rules onChange={refresh} />
+          </div>
+        )}
           {tab === "apps" && <Apps />}
         {tab === "discover" && <Discover active={!!st?.discovering} onChange={refresh} />}
         {tab === "conns" && <Connections />}
@@ -321,6 +335,55 @@ function Alerts({ st, onChange }: { st: Status | null; onChange: () => void }) {
   );
 }
 
+
+/// Что показать человеку, который открыл программу впервые.
+///
+/// ⛔ Без этого он видит пустые вкладки и не понимает, с чего начать:
+/// прокси не задан, правил нет, ничего не работает. Короткий путь из
+/// трёх шагов решает это лучше любой подсказки в углу.
+function FirstRun({ st, onDone }: { st: Status | null; onDone: () => void }) {
+  const [ups, setUps] = useState<Upstream[]>([]);
+  useEffect(() => {
+    invoke<{ upstreams: Upstream[] }>("upstreams_list")
+      .then((u) => setUps(u.upstreams)).catch(() => {});
+  }, []);
+
+  if (!st) return null;
+  // Прокси задан — значит человек уже настроился, не мешаем.
+  const ready = ups.some((u) => u.address && u.address !== "127.0.0.1");
+  if (ready) return null;
+
+  return (
+    <div className="card wide">
+      <h3>С чего начать</h3>
+      <p className="hint">
+        Программа ведёт трафик через ваш прокси — целиком или только для
+        выбранных приложений и адресов.
+      </p>
+      <ol className="steps">
+        <li>
+          <b>Укажите прокси</b> — «Настройки», кнопка «Добавить прокси».
+          Адрес и порт даёт тот, кто выдал вам доступ.
+        </li>
+        <li>
+          <b>Выберите способ.</b> «Режим прокси» — для программ, которые
+          умеют через него работать. «TUN режим» — для остальных: Cursor,
+          браузеров, всего подряд.
+        </li>
+        <li>
+          <b>Добавьте правила или приложения.</b> Адреса — во вкладке
+          «Правила», программы целиком — во вкладке «Приложения».
+        </li>
+      </ol>
+      <p className="hint">
+        Если коллега уже настроил такую же — попросите файл настроек и
+        загрузите его в «Настройках», это быстрее.
+      </p>
+      <button className="btn" onClick={onDone}>Понятно, скрыть</button>
+    </div>
+  );
+}
+
 /* ─────────────── Правила ─────────────── */
 
 type RuleItem = { pattern: string; via: string };
@@ -431,7 +494,7 @@ function Rules({ onChange }: { onChange: () => void }) {
       <div className="card wide">
         <h3>Готовые наборы</h3>
         <p className="hint">
-Щелчок добавляет домены набора, повторный убирает. Галочка — набор добавлен.
+Щелчок добавляет набор, повторный убирает.
         </p>
         <div className="presets">
           {presets.map((p) => (
@@ -500,7 +563,7 @@ function Rules({ onChange }: { onChange: () => void }) {
 
       <div className="card">
         <h3>Проверить, каким путём пойдёт</h3>
-        <p className="hint">Результат по текущим правилам, без обращения к ресурсу.</p>
+        <p className="hint">По текущим правилам, без обращения к ресурсу.</p>
         <div className="row">
           <input className="field" value={probe} placeholder="api.openai.com"
             onChange={(e) => setProbe(e.target.value)} onKeyDown={(e) => e.key === "Enter" && doCheck()} />
@@ -1040,6 +1103,27 @@ function Log() {
 }
 
 
+/// Перевести отказ на человеческий и сказать, что делать.
+///
+/// ⛔ Без этого человек видит «не включилось» и идёт читать подробности,
+/// где ему нечего понять. Частые случаи объясняем прямо в окне.
+function explainFailure(err: string): string {
+  const t = err.toLowerCase();
+  if (t.includes("права") || t.includes("администратор")) {
+    return "Права не выданы. Перехват создаёт сетевой интерфейс — без прав этого не сделать. Нажмите ещё раз и подтвердите запрос системы.";
+  }
+  if (t.includes("не скачан") || t.includes("не найден")) {
+    return "Движок перехвата ещё не установлен. Нажмите «Установить» выше — это около 20 МБ, один раз.";
+  }
+  if (t.includes("не принял настройки")) {
+    return `Движок отказался от настроек: ${err}. Проверьте адрес прокси в «Настройках».`;
+  }
+  if (t.includes("прокси") && (t.includes("не отвечает") || t.includes("не найден"))) {
+    return "Прокси не отвечает. Проверьте адрес и порт в «Настройках» — и что вы в сети, откуда он доступен.";
+  }
+  return err;
+}
+
 type TunnelState = {
   installed: boolean; running: boolean; mode: boolean;
   apps: number; error: string | null;
@@ -1120,7 +1204,11 @@ function Tunnel() {
         </button>
       )}
 
-      {err && <p className="note">{err}</p>}
+      {err && (
+        <p className="note">
+          {explainFailure(err)}
+        </p>
+      )}
       {log && (
         <details style={{ marginTop: 8 }}>
           <summary className="hint" style={{ cursor: "pointer" }}>
@@ -1145,6 +1233,35 @@ function Tunnel() {
 /* ─────────────── Настройки ─────────────── */
 
 function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
+  const [transfer, setTransfer] = useState("");
+
+  const saveSettings = async () => {
+    const path = await saveFile({
+      defaultPath: "nexusproxy-настройки.json",
+      filters: [{ name: "Настройки", extensions: ["json"] }],
+    });
+    if (typeof path !== "string") return;
+    try {
+      await invoke("settings_export", { path });
+      setTransfer("Сохранено. Файл можно передать коллегам.");
+    } catch (e) { setTransfer(String(e)); }
+  };
+
+  const loadSettings = async () => {
+    const path = await openFile({
+      multiple: false,
+      filters: [{ name: "Настройки", extensions: ["json"] }],
+    });
+    if (typeof path !== "string") return;
+    try {
+      const missing = await invoke<string[]>("settings_import", { path });
+      setTransfer(missing.length
+        ? `Загружено. Не нашлись на этой машине: ${missing.join(", ")} — укажите пути заново.`
+        : "Загружено, всё на месте.");
+      onSaved();
+    } catch (e) { setTransfer(String(e)); }
+  };
+
   const [httpPort, setHttpPort] = useState("18080");
   const [socksPort, setSocksPort] = useState("18081");
   const [auto, setAuto] = useState(false);
@@ -1189,6 +1306,19 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
       <Upstreams defaultName={st?.default_upstream ?? ""} onSaved={onSaved} />
 
       <Tunnel />
+      <div className="card">
+        <h3>Перенести настройки</h3>
+        <p className="hint">
+          Прокси, правила и приложения — одним файлом. Пути к программам
+          у разных людей отличаются, поэтому после загрузки проверьте список.
+        </p>
+        <div className="row">
+          <button onClick={saveSettings}>Сохранить в файл</button>
+          <button onClick={loadSettings}>Загрузить из файла</button>
+        </div>
+        {transfer && <p className="hint">{transfer}</p>}
+      </div>
+
       <div className="card">
         <h3>Локальные порты</h3>
         <p className="hint">

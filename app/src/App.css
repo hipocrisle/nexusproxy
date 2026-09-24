@@ -304,3 +304,14 @@ select.field { appearance: auto; }
   white-space: pre-wrap; word-break: break-word; max-height: 140px;
   overflow: auto;
 }
+
+/* Короткий путь для тех, кто открыл программу впервые. */
+.steps {
+  margin: 0 0 10px;
+  padding-left: 20px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.steps li { margin-bottom: 6px; }
+.steps li b { color: var(--accent); }

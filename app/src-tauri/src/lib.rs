@@ -26,6 +26,7 @@ pub struct Status {
     auto_reconnect: bool,
     minimize_to_tray: bool,
     enable_on_start: bool,
+    tunnel_mode: bool,
     default_upstream: String,
     rules_count: usize,
     upstream_up: bool,
@@ -69,6 +70,7 @@ fn status(app: State<App>) -> Status {
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,
                 enable_on_start: c.enable_on_start,
+                tunnel_mode: c.tunnel_mode,
                 os: std::env::consts::OS.to_string(),
                 default_upstream: c.default_upstream.clone(),
                 rules_count: c.through_proxy.iter().filter(|s| !s.starts_with('_')).count(),
@@ -83,6 +85,7 @@ fn status(app: State<App>) -> Status {
             running: false, upstream: String::new(), http_port: 0, socks_port: 0,
             system_on: false, discovering: false,
             auto_reconnect: true, minimize_to_tray: true, enable_on_start: true,
+            tunnel_mode: false,
             os: std::env::consts::OS.to_string(),
             default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
@@ -1097,6 +1100,41 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Сохранить настройки в файл — чтобы перенести на другую машину.
+#[tauri::command]
+fn settings_export(app: State<App>, path: String) -> Result<(), String> {
+    let e = engine(&app)?;
+    let data = e.cfg.lock().unwrap().export();
+    let text = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("не собрать настройки: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("не записать файл: {e}"))
+}
+
+/// Принять настройки из файла.
+///
+/// Возвращает список приложений, которых на этой машине нет: пути у
+/// разных людей отличаются, и человек должен увидеть это сразу, а не
+/// гадать, почему перехват их не ловит.
+#[tauri::command]
+async fn settings_import(app: AppHandle, path: String) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("не прочитать файл: {e}"))?;
+    let data: core::config::Portable = serde_json::from_str(&text)
+        .map_err(|_| "это не файл настроек NexusProxy".to_string())?;
+
+    let missing = {
+        let state = app.state::<App>();
+        let e = engine(&state)?;
+        let missing = e.cfg.lock().unwrap().import(data);
+        e.apply_and_save()?;
+        missing
+    };
+    // применяем выбранный способ сразу, как при переключении вручную
+    let on = { let s = app.state::<App>(); let e = engine(&s)?; let m = e.cfg.lock().unwrap().tunnel_mode; m };
+    tunnel_set(app, on).await?;
+    Ok(missing)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1274,7 +1312,8 @@ pub fn run() {
             discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
             apps_list, app_save, app_remove, app_launch,
-            tunnel_state, tunnel_install, tunnel_set, tunnel_log
+            tunnel_state, tunnel_install, tunnel_set, tunnel_log,
+            settings_export, settings_import
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
