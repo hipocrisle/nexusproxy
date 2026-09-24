@@ -78,26 +78,51 @@ mod imp {
     }
 
     pub fn install_command(_exe: &Path, dir: &Path) -> String {
-        format!("schtasks.exe /create /tn {NAME} /f /xml \"{}\" & schtasks.exe /run /tn {NAME}",
-                xml_path(dir).display())
+        // ⛔ Копию кладём здесь, а не заранее: к этому месту задача уже
+        // остановлена, и файл, который она держала, свободен. Раньше
+        // копирование шло до повышения и молча не срабатывало — служба
+        // продолжала запускать старую программу.
+        format!("copy /Y \"{}\" \"{}\" & schtasks.exe /create /tn {NAME} /f /xml \"{}\" \
+                 & schtasks.exe /run /tn {NAME}",
+                super::current_exe_display(), runner_path(dir).display(), xml_path(dir).display())
     }
 
     pub fn uninstall_command() -> String {
         format!("schtasks.exe /end /tn {NAME} & schtasks.exe /delete /tn {NAME} /f")
     }
 
-    /// Работает ли задача сама по себе — независимо от того, просили мы
-    /// перехват или нет.
-    fn task_running() -> bool {
-        matches!(schtasks(&["/query", "/tn", NAME, "/fo", "list"]),
-                 Ok(t) if t.contains("Running") || t.contains("Выполняется"))
+    /// ⛔ Отказ в доступе — это НЕ «задачи нет». Задача принадлежит
+    /// системе, и у человека нет прав даже прочитать её. Раньше мы
+    /// принимали отказ за отсутствие: программа писала «служба не
+    /// установлена» и «задача не создалась» при работающем перехвате, а
+    /// затем пыталась запустить задачу и получала тот же отказ.
+    fn denied(e: &str) -> bool {
+        let t = e.to_lowercase();
+        t.contains("отказано") || t.contains("access is denied") || t.contains("denied")
+    }
+
+    /// Есть ли задача вообще. Отказ в доступе означает, что есть.
+    fn task_exists() -> bool {
+        match schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
+            Ok(_) => true,
+            Err(e) => denied(&e),
+        }
+    }
+
+    /// Работает ли задача сама по себе. При отказе в доступе спросить
+    /// планировщик нельзя — смотрим на сам движок.
+    fn task_running(dir: &Path) -> bool {
+        match schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
+            Ok(t) => t.contains("Running") || t.contains("Выполняется"),
+            Err(e) => denied(&e) && crate::tunnel::is_alive(dir),
+        }
     }
 
     pub fn state_in(dir: &Path) -> State {
-        if let Err(_) = schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
+        if !task_exists() {
             return State::Absent;
         }
-        if super::flag_path(dir).exists() && task_running() { State::Running } else { State::Stopped }
+        if super::flag_path(dir).exists() && task_running(dir) { State::Running } else { State::Stopped }
     }
 
     /// ⛔ Ставим признак, а не запускаем задачу. Задача принадлежит
@@ -107,17 +132,23 @@ mod imp {
     pub fn start_in(dir: &Path) -> Result<(), String> {
         std::fs::write(super::flag_path(dir), b"1")
             .map_err(|e| format!("не включить перехват: {e}"))?;
-        // Если задача почему-то не выполняется — попробуем поднять. Без
-        // прав это не выйдет, и тогда скажем человеку прямо.
-        if !task_running() {
-            let _ = schtasks(&["/run", "/tn", NAME]);
-            std::thread::sleep(std::time::Duration::from_millis(800));
-            if !task_running() {
-                return Err("служба перехвата не выполняется. Переустановите её \
-                            в настройках — потребуются права администратора".into());
+        // ⛔ Запускать задачу НЕ пытаемся: она принадлежит системе, и
+        // попытка кончается отказом, который человек видит как поломку.
+        // Задача крутится с включения компьютера и сама поднимет движок
+        // по признаку — на это нужно несколько секунд.
+        // Движок уже работает — больше ничего не нужно.
+        for _ in 0..20 {
+            if crate::tunnel::is_alive(dir) {
+                return Ok(());
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        Ok(())
+        if task_exists() {
+            Err("служба перехвата установлена, но движок не поднялся. \
+                 Загляните в подробности работы — там ответ движка".into())
+        } else {
+            Err("служба перехвата не установлена".into())
+        }
     }
 
     pub fn stop_in(dir: &Path) -> Result<(), String> {
@@ -351,12 +382,13 @@ mod tests {
     /// пользователя. Потеряв часть пути, служба молча не запустится.
     #[test]
     fn путь_с_пробелами_не_теряется() {
-        let xml = task_xml(
-            Path::new("C:\\Program Files\\Nexus Proxy\\app.exe"),
-            Path::new("C:\\Users\\Иван Петров\\перехват"),
-        );
-        assert!(xml.contains("Program Files\\Nexus Proxy"), "{xml}");
-        assert!(xml.contains("Иван Петров"), "{xml}");
+        let dir = Path::new("C:\\Users\\Иван Петров\\Мой перехват");
+        let xml = task_xml(Path::new("C:\\Program Files\\NexusProxy\\app.exe"), dir);
+        assert!(xml.contains("Иван Петров\\Мой перехват"), "потерян путь: {xml}");
+        // Служба запускает копию в папке данных, а не программу из папки
+        // установки: занятый файл нельзя заменить при обновлении.
+        assert!(xml.contains(&runner_path(dir).display().to_string()),
+                "задача должна запускать копию: {xml}");
     }
 
     /// ⛔ Задача обязана работать ОТ СИСТЕМЫ. От имени человека без прав
@@ -405,9 +437,9 @@ mod tests {
     /// Угловые скобки и амперсанд в пути не должны ломать описание задачи.
     #[test]
     fn опасные_знаки_в_пути_экранируются() {
-        let xml = task_xml(Path::new("C:\\a&b"), Path::new("C:\\<t>"));
-        assert!(xml.contains("C:\\a&amp;b"), "{xml}");
-        assert!(xml.contains("C:\\&lt;t&gt;"), "{xml}");
+        let xml = task_xml(Path::new("C:\\app.exe"), Path::new("C:\\<t>&b"));
+        assert!(xml.contains("C:\\&lt;t&gt;&amp;b"), "{xml}");
+        assert!(!xml.contains("C:\\<t>&b"), "знаки не экранированы: {xml}");
     }
 }
 
@@ -447,7 +479,7 @@ fn esc(s: &str) -> String {
 /// ⛔ Задача запускает НАС, а не движок напрямую: сама она окно
 /// консоли спрятать не умеет, и у человека висело бы чёрное окно с
 /// журналом. Движок поднимаем мы, уже без окна.
-pub fn task_xml(exe: &Path, dir: &Path) -> String {
+pub fn task_xml(_exe: &Path, dir: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -505,7 +537,7 @@ pub fn task_xml(exe: &Path, dir: &Path) -> String {
 </Task>
 "#,
         who = SYSTEM,
-        exe = esc(&exe.display().to_string()),
+            exe = esc(&runner_path(dir).display().to_string()),
         dir = esc(&dir.display().to_string()),
     )
 }
@@ -541,10 +573,8 @@ fn signature_path(dir: &Path) -> std::path::PathBuf {
 fn signature_text(exe: &Path, dir: &Path) -> String {
     #[allow(unused_mut)]
     let mut s = install_command(exe, dir);
-    // ⛔ Иначе после обновления программы служба продолжит запускать
-    // старую копию: в окне новая версия, а работает прежняя.
     s.push('\n');
-    s.push_str(&exe_stamp(exe));
+    s.push_str(&SERVICE_REVISION.to_string());
     #[cfg(windows)]
     {
         s.push('\n');
@@ -577,40 +607,25 @@ pub fn needs_reinstall(dir: &Path) -> bool {
 /// Служба работает от имени системы и держит файл открытым, а установщик
 /// идёт от имени человека — заменить занятый файл он не может, и
 /// обновление падает с ошибкой на ровном месте.
-/// ⛔ Имя копии зависит от самой программы. Перезаписать файл, который
-/// сейчас выполняется службой, Windows не даёт — а останавливать службу
-/// ради этого значило бы спрашивать права дважды. Новая версия просто
-/// кладётся рядом под своим именем.
-pub fn runner_path(dir: &Path, exe: &Path) -> std::path::PathBuf {
-    let size = std::fs::metadata(exe).map(|m| m.len()).unwrap_or(0);
-    dir.join(if cfg!(windows) { format!("runner-{size}.exe") } else { format!("runner-{size}") })
+/// Путь к самой программе — для команды копирования.
+#[cfg(windows)]
+fn current_exe_display() -> String {
+    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-/// Убрать копии от прежних версий. Занятые пропускаем: та, что работает
-/// прямо сейчас, освободится после переустановки службы.
-fn sweep_runners(dir: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let path = e.path();
-        if path == keep {
-            continue;
-        }
-        if path.file_name().and_then(|n| n.to_str())
-            .map(|n| n.starts_with("runner-")).unwrap_or(false)
-        {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+/// ⛔ Имя копии ПОСТОЯННОЕ. Меняющееся означало бы новое описание
+/// задачи при каждом обновлении программы, а значит и запрос прав —
+/// ровно то, чего быть не должно. Занятый файл перезаписывается уже
+/// под повышением, когда служба остановлена.
+pub fn runner_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(if cfg!(windows) { "runner.exe" } else { "runner" })
 }
 
-/// Отпечаток программы — по нему видно, что она обновилась и копию пора
-/// обновить тоже.
-fn exe_stamp(exe: &Path) -> String {
-    match std::fs::metadata(exe) {
-        Ok(m) => format!("{}:{:?}", m.len(), m.modified().ok()),
-        Err(_) => String::new(),
-    }
-}
+/// ⛔ Номер повадок службы. Подпись НЕ включает версию программы: иначе
+/// каждое обновление требовало бы прав администратора. Права нужны лишь
+/// когда меняется сама служба — тогда номер поднимается в коде, и
+/// переустановка проходит один раз.
+const SERVICE_REVISION: u32 = 5;
 
 pub fn install(dir: &Path) -> Result<(), String> {
     if !crate::tunnel::binary_path(dir).is_file() {
@@ -618,22 +633,6 @@ pub fn install(dir: &Path) -> Result<(), String> {
     }
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;
-    // Копию кладём заранее: папка своя, прав хватает.
-    let me = {
-        let copy = runner_path(dir, &me);
-        sweep_runners(dir, &copy);
-        match std::fs::copy(&me, &copy) {
-            // Копия уже на месте с прошлого раза — это не ошибка.
-            Ok(_) => copy,
-            // Не вышло скопировать — работаем как раньше, от установленной
-            // программы: перехват важнее гладкого обновления.
-            Err(e) => {
-                crate::logfile::line(&crate::logfile::now_stamp(),
-                    &format!("перехват: не скопировать программу для службы: {e}"));
-                me
-            }
-        }
-    };
     // Описание задачи кладём заранее: пишется оно правами обычного
     // пользователя, а повышение нужно только на саму установку.
     #[cfg(windows)]

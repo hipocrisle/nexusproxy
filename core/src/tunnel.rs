@@ -593,6 +593,15 @@ pub fn last_error() -> Option<String> {
     LAST_ERROR.lock().unwrap().clone()
 }
 
+/// Поднят ли движок хоть кем-то — нами или службой.
+///
+/// ⛔ Служба работает от имени системы, её движок нам не принадлежит, и
+/// обычной проверки своего дочернего процесса мало: программа считала
+/// перехват выключенным при работающем туннеле.
+pub fn is_alive(dir: &Path) -> bool {
+    is_running() || crate::xray::is_alive(&binary_path(dir))
+}
+
 pub fn is_running() -> bool {
     let mut g = CHILD.lock().unwrap();
     match g.as_mut() {
