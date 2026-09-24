@@ -386,6 +386,22 @@ pub fn build_config_with(
 
 #[cfg(test)]
 mod tests {
+
+    /// ⛔ Движок службы не виден в списке процессов обычному
+    /// пользователю: он принадлежит системе. Живость определяется по
+    /// свежести его журнала, иначе окно показывает «выключено» при
+    /// работающем туннеле.
+    #[test]
+    fn движок_службы_считается_живым_по_свежему_журналу() {
+        let dir = std::env::temp_dir().join("np-alive-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let log = engine_log_path(&dir);
+        let _ = std::fs::remove_file(&log);
+        assert!(!is_alive(&dir), "журнала нет — движка нет");
+        std::fs::write(&log, "свежая запись").unwrap();
+        assert!(is_alive(&dir), "журнал только что писали — движок жив");
+        let _ = std::fs::remove_file(&log);
+    }
     use super::*;
 
     fn corp() -> Upstream {
@@ -599,7 +615,20 @@ pub fn last_error() -> Option<String> {
 /// обычной проверки своего дочернего процесса мало: программа считала
 /// перехват выключенным при работающем туннеле.
 pub fn is_alive(dir: &Path) -> bool {
-    is_running() || crate::xray::is_alive(&binary_path(dir))
+    if is_running() || crate::xray::is_alive(&binary_path(dir)) {
+        return true;
+    }
+    // ⛔ Движок работает от имени системы, и узнать путь его процесса
+    // обычными правами нельзя: перечисление процессов возвращает про
+    // него пустоту. Программа при этом показывала «перехват выключен»
+    // при живом туннеле. Зато виден его журнал — если в него только что
+    // писали, движок работает.
+    std::fs::metadata(engine_log_path(dir))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e.as_secs() < 90)
+        .unwrap_or(false)
 }
 
 pub fn is_running() -> bool {
