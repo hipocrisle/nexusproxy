@@ -812,7 +812,7 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
         .sort((a, b) => b.count - a.count));
     };
     tick();
-    const t = setInterval(tick, 3000);
+    const t = setInterval(tick, 5000);
     return () => clearInterval(t);
   }, []);
 
@@ -951,11 +951,16 @@ function Connections() {
       setLive(await invoke<Conn[]>("conns_active").catch(() => []));
       setTotals(await invoke<DomainStat[]>("conns_totals").catch(() => []));
       setFails(await invoke<Failure[]>("failures_recent").catch(() => []));
-      setSeen(await invoke<Seen[]>("tunnel_seen").catch(() => []));
+
     };
     tick();
     const t = setInterval(tick, 1000);
-    return () => clearInterval(t);
+    // ⛔ Журнал движка опрашиваем редко: это чтение с диска, и частый
+    // опрос подвешивал окно.
+    const seenTick = () => { invoke<Seen[]>("tunnel_seen").then(setSeen).catch(() => {}); };
+    seenTick();
+    const ts = setInterval(seenTick, 5000);
+    return () => { clearInterval(t); clearInterval(ts); };
   }, []);
 
   const sum = totals.reduce((a, t) => ({ s: a.s + t.sent, r: a.r + t.received }), { s: 0, r: 0 });

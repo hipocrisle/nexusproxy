@@ -934,6 +934,14 @@ pub fn run_foreground(dir: &Path) -> Result<(), String> {
         cmd.creation_flags(0x0800_0000); // без окна
     }
     let mut child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
+    // Пока движок работает, приглядываем за размером его журнала.
+    {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            trim_log(&dir);
+        });
+    }
     // ⛔ Иначе движок переживает того, кто его запустил: задачу сняли, а
     // он продолжает держать сетевой интерфейс и заворачивать трафик.
     // Человек закрыл программу — и не понимает, почему всё ещё работает.
@@ -1649,6 +1657,48 @@ mod helper_tests {
     }
 }
 
+/// Сколько журналу движка позволено занимать.
+///
+/// ⛔ На подробном уровне он растёт мегабайтами в час. Без обрезки за
+/// неделю работы набежали бы сотни мегабайт в папке настроек — человек
+/// такого не ждёт и не найдёт, куда делось место.
+pub const LOG_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Обрезать журнал, если разросся: оставляем хвост, начало не нужно.
+pub fn trim_log(dir: &Path) {
+    let path = engine_log_path(dir);
+    let len = match std::fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if len <= LOG_LIMIT {
+        return;
+    }
+    if let Some(tail) = tail_of(&path, LOG_LIMIT / 2) {
+        let _ = std::fs::write(&path, tail);
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: журнал движка обрезан ({len} байт)"));
+    }
+}
+
+/// Последние байты файла — целиком его читать незачем и вредно.
+fn tail_of(path: &Path, bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(bytes);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::with_capacity(bytes.min(len) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    // Начало куска может рассечь строку посередине — отбрасываем её.
+    let text = String::from_utf8_lossy(&buf).to_string();
+    Some(if from > 0 {
+        text.splitn(2, '\n').nth(1).unwrap_or("").to_string()
+    } else {
+        text
+    })
+}
+
 /// Одно соединение, как его видел движок.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Seen {
@@ -1668,9 +1718,12 @@ pub struct Seen {
 /// что всё сломалось. Читаем журнал движка — там есть и имя узла, и
 /// решение по нему.
 pub fn seen_connections(dir: &Path, limit: usize) -> Vec<Seen> {
-    let text = match std::fs::read_to_string(engine_log_path(dir)) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
+    // ⛔ Читаем только хвост. Журнал движка растёт до мегабайтов за
+    // минуты, и чтение целиком подвешивало окно — а вызывается это
+    // каждые несколько секунд.
+    let text = match tail_of(&engine_log_path(dir), 512 * 1024) {
+        Some(t) => t,
+        None => return Vec::new(),
     };
 
     // Движок пишет решение и имя узла разными строками, связывая их
@@ -1776,5 +1829,74 @@ mod seen_tests {
         let d = tmp("self");
         write(&d, "+0300 INFO [333 0ms] inbound/tun[tun-in]: inbound connection to 172.31.211.1:1081\n");
         assert!(seen_connections(&d, 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    /// ⛔ Журнал движка растёт до мегабайтов за минуты. Читая его
+    /// целиком, мы подвешивали окно — а читаем каждые несколько секунд.
+    #[test]
+    fn берём_только_хвост() {
+        let d = std::env::temp_dir().join(format!("np-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("big.log");
+        let mut text = String::new();
+        for i in 0..50_000 {
+            text.push_str(&format!("строка номер {i}\n"));
+        }
+        std::fs::write(&f, &text).unwrap();
+
+        let tail = tail_of(&f, 4096).unwrap();
+        assert!(tail.len() <= 4096, "прочитали больше, чем просили: {}", tail.len());
+        assert!(tail.contains("49999"), "хвост должен быть концом файла");
+        assert!(!tail.contains("строка номер 0\n"), "начало файла читать незачем");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Обрезанную первую строку не показываем: она бессмысленна.
+    #[test]
+    fn рассечённую_строку_отбрасываем() {
+        let d = std::env::temp_dir().join(format!("np-tail2-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("x.log");
+        std::fs::write(&f, "первая строка\nвторая строка\nтретья\n").unwrap();
+        let tail = tail_of(&f, 20).unwrap();
+        assert!(!tail.starts_with("рая"), "обрывок строки не годится: {tail}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    /// ⛔ Без обрезки журнал движка съедает сотни мегабайт за неделю:
+    /// на подробном уровне он растёт мегабайтами в час.
+    #[test]
+    fn разросшийся_журнал_обрезается() {
+        let d = std::env::temp_dir().join(format!("np-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let big = "строка журнала движка\n".repeat(600_000);
+        std::fs::write(engine_log_path(&d), &big).unwrap();
+        assert!(std::fs::metadata(engine_log_path(&d)).unwrap().len() > LOG_LIMIT);
+
+        trim_log(&d);
+        let after = std::fs::metadata(engine_log_path(&d)).unwrap().len();
+        assert!(after <= LOG_LIMIT, "после обрезки {after} байт");
+        assert!(after > 0, "журнал не должен исчезать целиком");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn небольшой_журнал_не_трогаем() {
+        let d = std::env::temp_dir().join(format!("np-trim2-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(engine_log_path(&d), "немного строк\n").unwrap();
+        trim_log(&d);
+        assert_eq!(std::fs::read_to_string(engine_log_path(&d)).unwrap(), "немного строк\n");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
