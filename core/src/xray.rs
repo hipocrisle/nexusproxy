@@ -375,6 +375,43 @@ mod tests {
 // Убиваем СТРОГО по полному пути своего файла: у Happ и других клиентов
 // свой xray.exe, трогать его нельзя. [[feedback-no-broad-process-kill]]
 
+/// Работает ли эта программа в системе — хоть кем запущенная.
+///
+/// ⛔ Своего дочернего процесса мало: движок поднимает служба от имени
+/// системы, и программе он не принадлежит. Спрашивать о нём планировщик
+/// тоже нельзя — на чужую задачу у человека нет прав.
+#[cfg(windows)]
+pub fn is_alive(bin: &Path) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
+
+    let want = bin.to_string_lossy().to_lowercase();
+    let mut pids = vec![0u32; 4096];
+    let mut needed = 0u32;
+    unsafe {
+        if EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed) == 0 {
+            return false;
+        }
+        let count = needed as usize / 4;
+        for &pid in pids.iter().take(count) {
+            if pid == 0 {
+                continue;
+            }
+            if matches!(crate::proc::path_of_pid(pid), Some(p) if p.to_lowercase() == want) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_alive(bin: &Path) -> bool {
+    Command::new("pgrep").arg("-f").arg(bin.to_string_lossy().as_ref())
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
 #[cfg(windows)]
 pub fn kill_orphans(bin: &Path) -> usize {
     use windows_sys::Win32::Foundation::CloseHandle;
