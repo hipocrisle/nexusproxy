@@ -77,14 +77,6 @@ mod imp {
             .collect()
     }
 
-    pub fn state() -> State {
-        match schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
-            Err(_) => State::Absent,
-            Ok(t) if t.contains("Running") || t.contains("Выполняется") => State::Running,
-            Ok(_) => State::Stopped,
-        }
-    }
-
     pub fn install_command(_exe: &Path, dir: &Path) -> String {
         format!("schtasks.exe /create /tn {NAME} /f /xml \"{}\" & schtasks.exe /run /tn {NAME}",
                 xml_path(dir).display())
@@ -133,11 +125,6 @@ mod imp {
         Ok(())
     }
 
-    pub fn start() -> Result<(), String> {
-        Err("перехват включается признаком в своей папке".into())
-    }
-
-    pub fn stop() -> Result<(), String> { Ok(()) }
 }
 
 #[cfg(target_os = "macos")]
@@ -161,10 +148,6 @@ mod imp {
             return State::Absent;
         }
         if super::flag_path(dir).exists() { State::Running } else { State::Stopped }
-    }
-
-    pub fn state() -> State {
-        if plist_path().exists() { State::Stopped } else { State::Absent }
     }
 
     /// Описание демона.
@@ -334,7 +317,6 @@ done
 #[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     use super::*;
-    pub fn state() -> State { State::Absent }
     pub fn state_in(_d: &Path) -> State { State::Absent }
     pub fn start_in(_d: &Path) -> Result<(), String> { start() }
     pub fn stop_in(_d: &Path) -> Result<(), String> { stop() }
@@ -386,7 +368,7 @@ mod tests {
     fn задача_работает_от_системы() {
         let xml = task_xml(Path::new("C:\\app.exe"), Path::new("C:\\tunnel"));
         assert!(xml.contains("<UserId>S-1-5-18</UserId>"), "задача не от системы: {xml}");
-        assert!(xml.contains("<LogonType>ServiceAccount</LogonType>"), "{xml}");
+        assert!(!xml.contains("<LogonType>"), "способ входа указывать нельзя: {xml}");
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"), "{xml}");
     }
 
@@ -485,7 +467,11 @@ pub fn task_xml(exe: &Path, dir: &Path) -> String {
   <Principals>
 <Principal id="Author">
   <UserId>{who}</UserId>
-  <LogonType>ServiceAccount</LogonType>
+      <!-- ⛔ Способ входа здесь НЕ указывается. «ServiceAccount» — слово
+           из обёртки PowerShell, в самом XML такого значения нет, и
+           планировщик отвергает файл целиком: «LogonType:ServiceAccount
+           — значение в неправильном формате», а служба не ставится
+           вовсе. У системной учётной записи способ входа не указывают. -->
   <RunLevel>HighestAvailable</RunLevel>
 </Principal>
   </Principals>
@@ -553,7 +539,12 @@ fn signature_path(dir: &Path) -> std::path::PathBuf {
 /// обрезка журнала) не меняет команду, программа считает установленное
 /// свежим и продолжает работать по-старому.
 fn signature_text(exe: &Path, dir: &Path) -> String {
+    #[allow(unused_mut)]
     let mut s = install_command(exe, dir);
+    // ⛔ Иначе после обновления программы служба продолжит запускать
+    // старую копию: в окне новая версия, а работает прежняя.
+    s.push('\n');
+    s.push_str(&exe_stamp(exe));
     #[cfg(windows)]
     {
         s.push('\n');
@@ -580,13 +571,69 @@ pub fn needs_reinstall(dir: &Path) -> bool {
     }
 }
 
+/// Копия программы, которую запускает служба.
+///
+/// ⛔ Служба обязана запускать КОПИЮ, а не программу из папки установки.
+/// Служба работает от имени системы и держит файл открытым, а установщик
+/// идёт от имени человека — заменить занятый файл он не может, и
+/// обновление падает с ошибкой на ровном месте.
+/// ⛔ Имя копии зависит от самой программы. Перезаписать файл, который
+/// сейчас выполняется службой, Windows не даёт — а останавливать службу
+/// ради этого значило бы спрашивать права дважды. Новая версия просто
+/// кладётся рядом под своим именем.
+pub fn runner_path(dir: &Path, exe: &Path) -> std::path::PathBuf {
+    let size = std::fs::metadata(exe).map(|m| m.len()).unwrap_or(0);
+    dir.join(if cfg!(windows) { format!("runner-{size}.exe") } else { format!("runner-{size}") })
+}
+
+/// Убрать копии от прежних версий. Занятые пропускаем: та, что работает
+/// прямо сейчас, освободится после переустановки службы.
+fn sweep_runners(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path == keep {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str())
+            .map(|n| n.starts_with("runner-")).unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Отпечаток программы — по нему видно, что она обновилась и копию пора
+/// обновить тоже.
+fn exe_stamp(exe: &Path) -> String {
+    match std::fs::metadata(exe) {
+        Ok(m) => format!("{}:{:?}", m.len(), m.modified().ok()),
+        Err(_) => String::new(),
+    }
+}
+
 pub fn install(dir: &Path) -> Result<(), String> {
     if !crate::tunnel::binary_path(dir).is_file() {
         return Err("движок перехвата ещё не скачан".into());
     }
-    // Задача запускает нас же — мы поднимем движок без окна.
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;
+    // Копию кладём заранее: папка своя, прав хватает.
+    let me = {
+        let copy = runner_path(dir, &me);
+        sweep_runners(dir, &copy);
+        match std::fs::copy(&me, &copy) {
+            // Копия уже на месте с прошлого раза — это не ошибка.
+            Ok(_) => copy,
+            // Не вышло скопировать — работаем как раньше, от установленной
+            // программы: перехват важнее гладкого обновления.
+            Err(e) => {
+                crate::logfile::line(&crate::logfile::now_stamp(),
+                    &format!("перехват: не скопировать программу для службы: {e}"));
+                me
+            }
+        }
+    };
     // Описание задачи кладём заранее: пишется оно правами обычного
     // пользователя, а повышение нужно только на саму установку.
     #[cfg(windows)]
