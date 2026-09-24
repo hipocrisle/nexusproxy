@@ -1139,17 +1139,27 @@ async fn settings_import(app: AppHandle, path: String) -> Result<Vec<String>, St
 ///
 /// ⛔ В TUN режиме программы не обращаются к нашему входу, поэтому наши
 /// собственные записи пусты. Берём из журнала движка.
+/// ⛔ Обязательно async + отдельный поток: чтение и разбор журнала —
+/// работа с диском, и в потоке окна она подвешивала программу.
 #[tauri::command]
-fn tunnel_seen(app: State<App>) -> Vec<core::tunnel::Seen> {
-    let path = app.path.lock().unwrap().clone();
-    let tunnel = match engine(&app) {
-        Ok(e) => { let m = e.cfg.lock().unwrap().tunnel_mode; m }
-        Err(_) => false,
+async fn tunnel_seen(app: AppHandle) -> Vec<core::tunnel::Seen> {
+    let (path, tunnel) = {
+        let state = app.state::<App>();
+        let path = state.path.lock().unwrap().clone();
+        let tunnel = match engine(&state) {
+            Ok(e) => { let m = e.cfg.lock().unwrap().tunnel_mode; m }
+            Err(_) => false,
+        };
+        (path, tunnel)
     };
     if !tunnel {
         return Vec::new();
     }
-    core::tunnel::seen_connections(&core::tunnel_dir(&path), 200)
+    tokio::task::spawn_blocking(move || {
+        core::tunnel::seen_connections(&core::tunnel_dir(&path), 200)
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

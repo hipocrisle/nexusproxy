@@ -199,6 +199,12 @@ while true; do
     # держим, пока признак на месте и настройки не изменились
     STAMP=$(stat -f %m "$CFG" 2>/dev/null)
     while [ -f "$FLAG" ] && kill -0 "$PID" 2>/dev/null; do
+      # ⛔ Журнал движка растёт мегабайтами в час. Без обрезки за неделю
+      # работы набежали бы сотни мегабайт в папке настроек.
+      SIZE=$(stat -f %z "{enginelog}" 2>/dev/null || echo 0)
+      if [ "$SIZE" -gt 8388608 ]; then
+        tail -c 4194304 "{enginelog}" > "{enginelog}.tmp" && mv "{enginelog}.tmp" "{enginelog}"
+      fi
       NOW=$(stat -f %m "$CFG" 2>/dev/null)
       if [ "$NOW" != "$STAMP" ]; then
         echo "$(date '+%F %T') настройки изменились, перезапускаю" >> "$LOG"
