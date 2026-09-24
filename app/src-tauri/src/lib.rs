@@ -943,6 +943,9 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
         })
         .collect();
     drop(c);
+    // ⛔ В TUN режиме системные настройки прокси обязаны быть сняты:
+    // иначе браузеры идут по ним на локальный адрес, мимо туннеля.
+    e.system_proxy_off();
     core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
     // ⛔ Служба тоже могла устареть: наблюдатель и способ запуска
     // меняются вместе с программой, а ставится он один раз. Без этой
@@ -1215,14 +1218,26 @@ pub fn run() {
             {
                 let e = app.state::<App>().engine.lock().unwrap().clone();
                 if let Some(e) = e {
-                    let want = e.cfg.lock().unwrap().enable_on_start;
-                    if want {
+                    let (want, tunnel) = {
+                        let c = e.cfg.lock().unwrap();
+                        (c.enable_on_start, c.tunnel_mode)
+                    };
+                    if want && !tunnel {
                         match e.system_proxy_on() {
                             Ok(_) => core::logfile::line(&core::logfile::now_stamp(),
-                                                        "перехват включён при запуске"),
+                                                        "режим прокси включён при запуске"),
                             Err(err) => core::logfile::line(&core::logfile::now_stamp(),
-                                &format!("не удалось включить перехват при запуске: {err}")),
+                                &format!("не удалось включить режим прокси: {err}")),
                         }
+                    } else if want && tunnel {
+                        // ⛔ В TUN режиме системные настройки прокси ставить
+                        // НЕЛЬЗЯ. Браузеры (кроме Firefox) их читают и идут
+                        // на наш локальный адрес — а туда туннель не смотрит,
+                        // это петля внутри машины. Их соединений не видно
+                        // вовсе, и выглядит как «перехват их не ловит».
+                        e.system_proxy_off();
+                        core::logfile::line(&core::logfile::now_stamp(),
+                            "TUN режим: системные настройки прокси сняты");
                     }
                 }
             }
