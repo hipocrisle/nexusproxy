@@ -221,3 +221,20 @@ pub fn spawn_guard(config_path: &str) {
     }
     let _ = cmd.spawn();
 }
+
+/// Указывают ли системные настройки на нас.
+///
+/// ⛔ Только на себя и смотрим: чужие настройки — не наше дело, снести
+/// их значило бы оставить человека без чужого прокси, который ему нужен.
+pub fn points_to_us() -> bool {
+    let now = current();
+    now.contains("127.0.0.1") || now.contains("localhost")
+}
+
+/// Снять настройки прокси начисто.
+pub fn clear() {
+    #[cfg(windows)]
+    crate::winproxy::clear();
+    #[cfg(target_os = "macos")]
+    crate::macproxy::clear();
+}

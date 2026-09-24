@@ -80,6 +80,22 @@ fn path_prefix(path: &str) -> Option<String> {
     Some(p[..cut].to_string())
 }
 
+/// Приложения, которые ходят в сеть не сами, а через отдельный процесс
+/// системы. Его путь лежит вне папки приложения, и обычное правило по
+/// пути до него не достаёт.
+///
+/// ⛔ Safari именно таков: в журнале его соединения принадлежат
+/// `com.apple.WebKit.Networking` из StagedFrameworks, а не самому
+/// Safari.app. Без этого правила перехват его не ловит, хотя видит.
+fn helper_paths(path: &str) -> Vec<String> {
+    let low = path.to_lowercase();
+    let mut extra = Vec::new();
+    if low.contains("safari.app") {
+        extra.push("StagedFrameworks[\\\\/]Safari[\\\\/]".to_string());
+    }
+    extra
+}
+
 /// Отбор по пути: экранируем всё, что значимо для выражения, иначе
 /// точка в «Cursor.app» совпадёт с любым знаком, а обратная косая
 /// в путях Windows — испортит выражение целиком.
@@ -214,6 +230,12 @@ pub fn build_config_with(
         // нужный нам может зваться иначе, чем главный.
         if let Some(prefix) = path_prefix(&r.path) {
             e.1.push(path_regex(&prefix));
+        }
+        // и сетевой процесс, если приложение ходит в сеть не само
+        for extra in helper_paths(&r.path) {
+            if !e.1.contains(&extra) {
+                e.1.push(extra);
+            }
         }
     }
     // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
@@ -1591,5 +1613,39 @@ mod order_of_rules_tests {
         let app = rules.iter().position(|r| r.get("process_name").is_some()).unwrap();
         let dom = rules.iter().position(|r| r.get("domain_suffix").is_some()).unwrap();
         assert!(app < dom, "приложения обязаны проверяться раньше доменов: {app} и {dom}");
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    /// ⛔ Safari в сеть не ходит сам — за него это делает отдельный
+    /// процесс системы, лежащий вне папки приложения. Обычное правило по
+    /// пути до него не достаёт, и перехват его не ловит, хотя видит.
+    #[test]
+    fn сетевой_процесс_safari_тоже_ловится() {
+        let c = build_config(
+            &[Route { process: "Safari".into(),
+                      path: "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app".into(),
+                      via: "основной".into() }],
+            &[Upstream { tag: "основной".into(), kind: Kind::Socks5,
+                         address: "172.31.211.1".into(), port: 1081,
+                         user: None, password: None }],
+        );
+        let by_path = c["route"]["rules"].as_array().unwrap().iter()
+            .find(|r| r.get("process_path_regex").is_some())
+            .expect("правило по пути должно быть");
+        let all: Vec<&str> = by_path["process_path_regex"].as_array().unwrap()
+            .iter().filter_map(|x| x.as_str()).collect();
+        assert!(all.iter().any(|re| re.contains("StagedFrameworks")),
+                "сетевой процесс Safari обязан попадать под правило: {all:?}");
+    }
+
+    /// Обычным программам лишних правил не добавляем.
+    #[test]
+    fn обычным_программам_ничего_лишнего() {
+        assert!(helper_paths("/Applications/Cursor.app").is_empty());
+        assert!(helper_paths(r"C:\Program Files\cursor\Cursor.exe").is_empty());
     }
 }

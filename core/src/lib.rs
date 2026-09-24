@@ -528,6 +528,22 @@ impl Engine {
         sysproxy::forget(&self.path);
     }
 
+    /// Снять системные настройки прокси, даже если ставили их не мы.
+    ///
+    /// ⛔ Нужно для TUN режима. Обычное снятие возвращает то, что мы
+    /// запомнили при включении, — а если настройки остались от прошлого
+    /// запуска, мы про них ничего не знаем и не трогаем. Браузеры же их
+    /// читают и идут на наш локальный адрес, мимо туннеля: у человека
+    /// Chrome и Safari не работали именно поэтому.
+    pub fn system_proxy_drop(&self) {
+        self.system_proxy_off();
+        if sysproxy::points_to_us() {
+            sysproxy::clear();
+            logfile::line(&logfile::now_stamp(),
+                "сняты системные настройки прокси, оставшиеся от прошлого запуска");
+        }
+    }
+
     pub fn system_proxy_is_ours(&self) -> bool {
         self.saved.lock().unwrap().is_some()
     }

@@ -226,6 +226,12 @@ mod imp {
         cleaned
     }
 
+    /// Выключить прокси, не стирая адрес: человек мог настроить его сам.
+    pub fn clear() {
+        let _ = set_dword(INET, "ProxyEnable", 0);
+        notify();
+    }
+
     pub fn current() -> String {
         let on = get_dword(INET, "ProxyEnable").unwrap_or(0) == 1;
         let srv = get_str(INET, "ProxyServer").unwrap_or_default();
@@ -242,9 +248,10 @@ mod imp {
     }
     pub fn restore(_s: &Saved) {}
     pub fn sweep_stale_env() -> Vec<String> { Vec::new() }
+    pub fn clear() {}
     pub fn current() -> String {
         "не поддерживается на этой системе".into()
     }
 }
 
-pub use imp::{apply, current, restore, sweep_stale_env};
+pub use imp::{apply, clear, current, restore, sweep_stale_env};
