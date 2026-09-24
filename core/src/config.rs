@@ -597,3 +597,109 @@ mod remove_tests {
     }
 }
 
+
+/// Что можно перенести на другую машину.
+///
+/// ⛔ Переносим только то, что человек настраивал руками: прокси,
+/// правила, приложения, способ работы. Всё, что привязано к машине —
+/// пути, состояние, признак первого запуска — остаётся своим. Иначе
+/// настройки одного человека утащат за собой чужие пути, и у второго
+/// ничего не заработает.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Portable {
+    /// Чтобы старая программа не подавилась новым файлом.
+    pub version: u32,
+    pub upstreams: Vec<Upstream>,
+    pub default_upstream: String,
+    pub groups: Vec<RouteGroup>,
+    pub through_proxy: Vec<String>,
+    pub direct: Vec<String>,
+    pub apps: Vec<crate::launch::App>,
+    pub tunnel_mode: bool,
+}
+
+impl Config {
+    /// Собрать настройки для переноса.
+    pub fn export(&self) -> Portable {
+        Portable {
+            version: 1,
+            upstreams: self.all_upstreams(),
+            default_upstream: self.default_upstream.clone(),
+            groups: self.groups.clone(),
+            through_proxy: self.through_proxy.clone(),
+            direct: self.direct.clone(),
+            apps: self.apps.clone(),
+            tunnel_mode: self.tunnel_mode,
+        }
+    }
+
+    /// Принять перенесённые настройки.
+    ///
+    /// ⛔ Пути к приложениям у другого человека будут свои: имя
+    /// пользователя в пути отличается, программа может стоять в другом
+    /// месте. Поэтому приложения принимаем, но помечаем те, чьих файлов
+    /// нет, — человек увидит и поправит, а не будет гадать, почему
+    /// перехват их не ловит.
+    pub fn import(&mut self, p: Portable) -> Vec<String> {
+        self.upstreams = p.upstreams;
+        self.default_upstream = p.default_upstream;
+        self.groups = p.groups;
+        self.through_proxy = p.through_proxy;
+        self.direct = p.direct;
+        self.tunnel_mode = p.tunnel_mode;
+        self.upstream = None;
+
+        let mut missing = Vec::new();
+        for a in &p.apps {
+            if !std::path::Path::new(&a.path).exists() {
+                missing.push(a.name.clone());
+            }
+        }
+        self.apps = p.apps;
+        missing
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    /// ⛔ В перенос не должно попадать ничего, привязанного к машине:
+    /// пути к журналу, состояние, порты. Иначе настройки одного человека
+    /// утащат за собой чужое, и у второго не заработает.
+    #[test]
+    fn переносим_только_настроенное_руками() {
+        let c = tests::cfg(&["domain:grid.gg"], &[]);
+        let p = c.export();
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("grid.gg"));
+        assert!(!json.contains("config_path"), "путей к файлам тут не место");
+        assert!(!json.contains("defaults_applied"), "состояние машины не переносим");
+    }
+
+    /// Человек должен сразу увидеть, каких программ на этой машине нет,
+    /// а не гадать, почему перехват их не ловит.
+    #[test]
+    fn отсутствующие_программы_называются() {
+        let mut c = tests::cfg(&[], &[]);
+        let mut p = c.export();
+        p.apps = vec![crate::launch::App {
+            name: "Cursor".into(),
+            path: "/нет/такого/Cursor.exe".into(),
+            kind: crate::launch::Kind::Auto,
+            via: "основной".into(),
+        }];
+        let missing = c.import(p);
+        assert_eq!(missing, vec!["Cursor".to_string()]);
+    }
+
+    #[test]
+    fn правила_и_прокси_переносятся() {
+        let from = tests::cfg(&["domain:grid.gg", "10.0.0.0/8"], &["localhost"]);
+        let mut to = tests::cfg(&[], &[]);
+        to.import(from.export());
+        assert!(to.through_proxy.contains(&"domain:grid.gg".to_string()));
+        assert!(to.direct.contains(&"localhost".to_string()));
+        assert_eq!(to.default_upstream, from.default_upstream);
+    }
+}
