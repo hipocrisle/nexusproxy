@@ -59,7 +59,7 @@ mod imp {
     }
 
     /// Перевод из кодировки консоли Windows (866) в обычный текст.
-    fn oem_to_utf8(raw: &[u8]) -> String {
+    pub fn oem_to_utf8(raw: &[u8]) -> String {
         // Таблица только для кириллицы и псевдографики — остальное
         // совпадает с латиницей.
         const HIGH: [char; 128] = [
@@ -85,42 +85,59 @@ mod imp {
         }
     }
 
-    /// ⛔ Кавычки обязательны: в путях бывают пробелы («Program Files»,
-    /// имя пользователя). Без них задача получит обрезанный путь и молча
-    /// не запустится — перехват «не работает», а почему, не видно.
-    /// ⛔ Задача запускает НАС, а не движок напрямую: сама она окно
-    /// консоли спрятать не умеет, и у человека висело бы чёрное окно с
-    /// журналом. Движок поднимаем мы, уже без окна.
-    pub fn install_command(exe: &Path, dir: &Path) -> String {
-        format!(
-            "schtasks.exe /create /tn {NAME} /f /sc once /st 00:00 /rl highest \
-             /tr \"\\\"{}\\\" --run-tunnel \\\"{}\\\"\"",
-            exe.display(), dir.display()
-        )
+    pub fn install_command(_exe: &Path, dir: &Path) -> String {
+        format!("schtasks.exe /create /tn {NAME} /f /xml \"{}\" & schtasks.exe /run /tn {NAME}",
+                xml_path(dir).display())
     }
 
     pub fn uninstall_command() -> String {
         format!("schtasks.exe /end /tn {NAME} & schtasks.exe /delete /tn {NAME} /f")
     }
 
-    pub fn start() -> Result<(), String> {
-        // ⛔ Сначала снимаем, потом запускаем. Движок читает настройки
-        // при запуске: если задача уже выполняется, просто «запустить»
-        // ничего не меняет — он продолжает работать со старыми. Так у
-        // человека и оставался прежний сервер имён после исправления.
-        let _ = schtasks(&["/end", "/tn", NAME]);
-        std::thread::sleep(std::time::Duration::from_millis(600));
-        schtasks(&["/run", "/tn", NAME]).map(|_| ())
-            .map_err(|e| format!("перехват не включился: {e}"))
+    /// Работает ли задача сама по себе — независимо от того, просили мы
+    /// перехват или нет.
+    fn task_running() -> bool {
+        matches!(schtasks(&["/query", "/tn", NAME, "/fo", "list"]),
+                 Ok(t) if t.contains("Running") || t.contains("Выполняется"))
     }
 
-    pub fn stop() -> Result<(), String> {
-        match schtasks(&["/end", "/tn", NAME]) {
-            Ok(_) => Ok(()),
-            Err(e) if e.contains("267011") || e.to_lowercase().contains("not running") => Ok(()),
-            Err(e) => Err(format!("перехват не выключился: {e}")),
+    pub fn state_in(dir: &Path) -> State {
+        if let Err(_) = schtasks(&["/query", "/tn", NAME, "/fo", "list"]) {
+            return State::Absent;
         }
+        if super::flag_path(dir).exists() && task_running() { State::Running } else { State::Stopped }
     }
+
+    /// ⛔ Ставим признак, а не запускаем задачу. Задача принадлежит
+    /// системе, и обычный пользователь запустить её не вправе —
+    /// планировщик отвечает отказом. Задача крутится сама и смотрит на
+    /// этот файл; создать его человек может своими правами.
+    pub fn start_in(dir: &Path) -> Result<(), String> {
+        std::fs::write(super::flag_path(dir), b"1")
+            .map_err(|e| format!("не включить перехват: {e}"))?;
+        // Если задача почему-то не выполняется — попробуем поднять. Без
+        // прав это не выйдет, и тогда скажем человеку прямо.
+        if !task_running() {
+            let _ = schtasks(&["/run", "/tn", NAME]);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            if !task_running() {
+                return Err("служба перехвата не выполняется. Переустановите её \
+                            в настройках — потребуются права администратора".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stop_in(dir: &Path) -> Result<(), String> {
+        let _ = std::fs::remove_file(super::flag_path(dir));
+        Ok(())
+    }
+
+    pub fn start() -> Result<(), String> {
+        Err("перехват включается признаком в своей папке".into())
+    }
+
+    pub fn stop() -> Result<(), String> { Ok(()) }
 }
 
 #[cfg(target_os = "macos")]
@@ -131,13 +148,9 @@ mod imp {
     /// включать и выключать его через launchctl, пароль спрашивался бы
     /// каждый раз — ровно то, чего мы избегаем.
     ///
-    /// Поэтому демон следит за файлом-признаком: файл появился — launchd
-    /// поднял перехват, файл удалён — остановил. Создать и удалить файл
-    /// в своей папке может обычный пользователь, без всяких прав.
-    /// Администратор нужен один раз, чтобы положить описание демона.
-    pub fn flag_path(dir: &Path) -> std::path::PathBuf {
-        dir.join("enabled")
-    }
+    /// Поэтому демон следит за файлом-признаком: файл появился —
+    /// перехват поднят, файл удалён — остановлен. Сам признак общий для
+    /// обеих систем, см. [`super::flag_path`].
 
     pub fn plist_path() -> std::path::PathBuf {
         std::path::PathBuf::from(format!("/Library/LaunchDaemons/{NAME}.plist"))
@@ -147,7 +160,7 @@ mod imp {
         if !plist_path().exists() {
             return State::Absent;
         }
-        if flag_path(dir).exists() { State::Running } else { State::Stopped }
+        if super::flag_path(dir).exists() { State::Running } else { State::Stopped }
     }
 
     pub fn state() -> State {
@@ -221,7 +234,7 @@ done
 "#,
             bin = crate::tunnel::binary_path(dir).display(),
             cfg = crate::tunnel::config_path(dir).display(),
-            flag = flag_path(dir).display(),
+            flag = super::flag_path(dir).display(),
             log = dir.join("daemon.log").display(),
             enginelog = crate::tunnel::engine_log_path(dir).display())
     }
@@ -275,7 +288,7 @@ done
     /// Включение и выключение — просто файл. Прав не требует.
     pub fn start_in(dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-        let flag = flag_path(dir);
+        let flag = super::flag_path(dir);
         let was_on = flag.exists();
         std::fs::write(&flag, b"on")
             .map_err(|e| format!("перехват не включился: {e}"))?;
@@ -305,7 +318,7 @@ done
     }
 
     pub fn stop_in(dir: &Path) -> Result<(), String> {
-        match std::fs::remove_file(flag_path(dir)) {
+        match std::fs::remove_file(super::flag_path(dir)) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("перехват не выключился: {e}")),
@@ -322,6 +335,9 @@ done
 mod imp {
     use super::*;
     pub fn state() -> State { State::Absent }
+    pub fn state_in(_d: &Path) -> State { State::Absent }
+    pub fn start_in(_d: &Path) -> Result<(), String> { start() }
+    pub fn stop_in(_d: &Path) -> Result<(), String> { stop() }
     pub fn install_command(_e: &Path, _d: &Path) -> String { String::new() }
     pub fn uninstall_command() -> String { String::new() }
     pub fn start() -> Result<(), String> { Err("перехват на этой системе не поддерживается".into()) }
@@ -332,65 +348,84 @@ pub use imp::{install_command, uninstall_command};
 
 /// Что сейчас с перехватом.
 pub fn state_in(dir: &Path) -> State {
-    #[cfg(target_os = "macos")]
-    { imp::state_in(dir) }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = dir; imp::state() }
+    imp::state_in(dir)
 }
 
 /// Включить. На macOS — создать файл-признак, на Windows — запустить задачу.
 pub fn start_in(dir: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    { imp::start_in(dir) }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = dir; imp::start() }
+    imp::start_in(dir)
 }
 
 /// Выключить.
 pub fn stop_in(dir: &Path) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    { imp::stop_in(dir) }
-    #[cfg(not(target_os = "macos"))]
-    { let _ = dir; imp::stop() }
+    imp::stop_in(dir)
 }
 
-// ⛔ Механизма нет на Linux, и проверять там нечего: заглушка отдаёт
-// пустую строку. Тесты идут только там, где перехват работает.
-#[cfg(all(test, any(windows, target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// ⛔ В путях бывают пробелы — и в «Program Files», и в имени
     /// пользователя. Потеряв часть пути, служба молча не запустится.
-    /// ⛔ В путях бывают пробелы — и в «Program Files», и в имени
-    /// пользователя. Потеряв часть пути, служба молча не запустится.
     #[test]
     fn путь_с_пробелами_не_теряется() {
-        let c = install_command(
-            Path::new("/Applications/Nexus Proxy/NexusProxy"),
-            Path::new("/Users/Иван Петров/перехват"),
+        let xml = task_xml(
+            Path::new("C:\\Program Files\\Nexus Proxy\\app.exe"),
+            Path::new("C:\\Users\\Иван Петров\\перехват"),
         );
-        assert!(c.contains("Иван Петров"), "{c}");
+        assert!(xml.contains("Program Files\\Nexus Proxy"), "{xml}");
+        assert!(xml.contains("Иван Петров"), "{xml}");
     }
 
-    /// ⛔ Перехват включает человек, а не система при загрузке. На
-    /// Windows это ручной запуск задачи; на macOS демон-наблюдатель
-    /// работает постоянно, но движок поднимает только при появлении
-    /// признака — иначе трафик заворачивался бы сам, без спросу.
+    /// ⛔ Задача обязана работать ОТ СИСТЕМЫ. От имени человека без прав
+    /// администратора движок падает на создании интерфейса — «configure
+    /// tun interface: Access is denied», — и перехват не включается
+    /// вовсе, а выглядит это как «программа сломалась». «Наивысшие
+    /// доступные» права обычной учётной записи — это обычные права.
     #[test]
-    fn перехват_не_включается_сам() {
-        let c = install_command(Path::new("a"), Path::new("b"));
-        #[cfg(windows)]
-        assert!(c.contains("/sc once"), "задача не должна запускаться сама: {c}");
-        #[cfg(target_os = "macos")]
-        {
-            // демон поднимает наблюдателя, а тот запускает движок только
-            // при наличии признака — сам по себе перехват не включается
-            assert!(c.contains("watch.sh"), "демон обязан запускать наблюдателя: {c}");
-            assert!(c.contains("[ -f \"$FLAG\" ]"),
-                    "наблюдатель обязан смотреть на признак: {c}");
-        }
-        let _ = c;
+    fn задача_работает_от_системы() {
+        let xml = task_xml(Path::new("C:\\app.exe"), Path::new("C:\\tunnel"));
+        assert!(xml.contains("<UserId>S-1-5-18</UserId>"), "задача не от системы: {xml}");
+        assert!(xml.contains("<LogonType>ServiceAccount</LogonType>"), "{xml}");
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"), "{xml}");
+    }
+
+    /// ⛔ Служба переживает перезагрузку: иначе человек включил перехват,
+    /// выключил компьютер — и наутро ничего не работает.
+    #[test]
+    fn служба_поднимается_после_перезагрузки() {
+        let xml = task_xml(Path::new("C:\\app.exe"), Path::new("C:\\tunnel"));
+        assert!(xml.contains("<BootTrigger>"), "не поднимется после перезагрузки: {xml}");
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+                "планировщик снимет службу через трое суток: {xml}");
+    }
+
+    /// ⛔ Служба работает всегда, а перехват включается признаком.
+    /// Запускать и останавливать саму службу человек не может: она
+    /// принадлежит системе, и прав на неё у него нет.
+    #[test]
+    fn перехват_включается_признаком_а_не_запуском_службы() {
+        let dir = Path::new("/папка/перехват");
+        assert_eq!(flag_path(dir), dir.join("enabled"));
+        let xml = task_xml(Path::new("/app"), dir);
+        assert!(xml.contains("--run-tunnel"), "служба обязана следить за признаком: {xml}");
+    }
+
+    /// ⛔ Сам по себе перехват не включается — движок поднимается только
+    /// при появлении признака, иначе трафик заворачивался бы без спросу.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn наблюдатель_смотрит_на_признак() {
+        let w = imp::watcher(Path::new("/папка"));
+        assert!(w.contains("[ -f \"$FLAG\" ]"), "наблюдатель не смотрит на признак: {w}");
+    }
+
+    /// Угловые скобки и амперсанд в пути не должны ломать описание задачи.
+    #[test]
+    fn опасные_знаки_в_пути_экранируются() {
+        let xml = task_xml(Path::new("C:\\a&b"), Path::new("C:\\<t>"));
+        assert!(xml.contains("C:\\a&amp;b"), "{xml}");
+        assert!(xml.contains("C:\\&lt;t&gt;"), "{xml}");
     }
 }
 
@@ -399,6 +434,109 @@ mod tests {
 /// ⛔ Это единственное место, где программа просит администратора.
 /// Дальше перехват включается и выключается без вопросов: службе при
 /// установке выдаётся право на запуск и остановку обычным пользователем.
+/// Файл-признак: есть — перехват включён. ⛔ Через него, а не через
+/// запуск службы: служба принадлежит системе, и человек без прав
+/// администратора запустить её не может, а файл в своей папке — может.
+pub fn flag_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("enabled")
+}
+
+pub fn xml_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("task.xml")
+}
+
+/// ⛔ Задача работает от СИСТЕМЫ, а не от человека за компьютером.
+/// Сетевой интерфейс создаётся только с правами администратора, а в
+/// организации у человека их нет: задача от его имени поднимается с
+/// обычными правами и движок падает с «configure tun interface:
+/// Access is denied». «Наивысшие доступные» права для обычной
+/// учётной записи — это обычные права.
+const SYSTEM: &str = "S-1-5-18";
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// ⛔ Задача описывается файлом, а не параметром `/tr`. В `/tr` путь
+/// приходится брать в кавычки внутри кавычек, и на части систем
+/// планировщик разбирает это по-своему и отказывается создавать
+/// задачу вовсе. В файле путь и аргументы лежат отдельными полями,
+/// и экранировать нечего.
+/// ⛔ Задача запускает НАС, а не движок напрямую: сама она окно
+/// консоли спрятать не умеет, и у человека висело бы чёрное окно с
+/// журналом. Движок поднимаем мы, уже без окна.
+pub fn task_xml(exe: &Path, dir: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+<Description>Перехват трафика NexusProxy</Description>
+  </RegistrationInfo>
+  <Triggers>
+<!-- ⛔ Задача поднимается при включении компьютера и работает
+     постоянно. Человек без прав администратора запустить её не
+     может, поэтому просить его об этом нельзя: включение и
+     выключение идут через файл-признак, который пишется обычными
+     правами. -->
+<BootTrigger>
+  <Enabled>true</Enabled>
+</BootTrigger>
+  </Triggers>
+  <Principals>
+<Principal id="Author">
+  <UserId>{who}</UserId>
+  <LogonType>ServiceAccount</LogonType>
+  <RunLevel>HighestAvailable</RunLevel>
+</Principal>
+  </Principals>
+  <Settings>
+<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+<AllowHardTerminate>true</AllowHardTerminate>
+<StartWhenAvailable>false</StartWhenAvailable>
+<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+<IdleSettings>
+  <StopOnIdleEnd>false</StopOnIdleEnd>
+  <RestartOnIdle>false</RestartOnIdle>
+</IdleSettings>
+<AllowStartOnDemand>true</AllowStartOnDemand>
+<Enabled>true</Enabled>
+<Hidden>false</Hidden>
+<RunOnlyIfIdle>false</RunOnlyIfIdle>
+<WakeToRun>false</WakeToRun>
+<!-- ⛔ Без ограничения по времени: по умолчанию планировщик снимает
+     задачу через трое суток, и перехват отваливается сам собой. -->
+<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+<Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+<Exec>
+  <Command>{exe}</Command>
+  <Arguments>--run-tunnel "{dir}"</Arguments>
+</Exec>
+  </Actions>
+</Task>
+"#,
+        who = SYSTEM,
+        exe = esc(&exe.display().to_string()),
+        dir = esc(&dir.display().to_string()),
+    )
+}
+
+/// Файл задачи должен быть в UTF-16: планировщик отказывается читать
+/// его в другой кодировке, а имена папок бывают и кириллицей.
+pub fn write_xml(exe: &Path, dir: &Path) -> Result<(), String> {
+    let text = task_xml(exe, dir);
+    let mut bytes = vec![0xFF, 0xFE];
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(xml_path(dir), bytes)
+        .map_err(|e| format!("не записать описание задачи: {e}"))
+}
+
+
 /// Чем именно сейчас установлена служба. Пусто — не установлена или
 /// поставлена версией, которая этого не записывала.
 fn signature_path(dir: &Path) -> std::path::PathBuf {
@@ -410,9 +548,30 @@ fn signature_path(dir: &Path) -> std::path::PathBuf {
 /// по-старому — человек ставит новую версию и не видит НИКАКИХ
 /// изменений, потому что работает старая запись. Поэтому храним, чем
 /// именно она поставлена, и переустанавливаем при расхождении.
+/// ⛔ Подпись — не только команда установки, но и ПОЛНОЕ описание
+/// задачи и наблюдателя. Иначе правка внутри них (путь, аргументы,
+/// обрезка журнала) не меняет команду, программа считает установленное
+/// свежим и продолжает работать по-старому.
+fn signature_text(exe: &Path, dir: &Path) -> String {
+    let mut s = install_command(exe, dir);
+    #[cfg(windows)]
+    {
+        s.push('\n');
+        s.push_str(&task_xml(exe, dir));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        s.push('\n');
+        s.push_str(&imp::plist(exe, dir));
+        s.push('\n');
+        s.push_str(&imp::watcher(dir));
+    }
+    s
+}
+
 pub fn needs_reinstall(dir: &Path) -> bool {
     let want = match std::env::current_exe() {
-        Ok(me) => install_command(&me, dir),
+        Ok(me) => signature_text(&me, dir),
         Err(_) => return false,
     };
     match std::fs::read_to_string(signature_path(dir)) {
@@ -428,6 +587,11 @@ pub fn install(dir: &Path) -> Result<(), String> {
     // Задача запускает нас же — мы поднимем движок без окна.
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;
+    // Описание задачи кладём заранее: пишется оно правами обычного
+    // пользователя, а повышение нужно только на саму установку.
+    #[cfg(windows)]
+    write_xml(&me, dir)?;
+
     let cmd = install_command(&me, dir);
     crate::logfile::line(&crate::logfile::now_stamp(),
         &format!("перехват: ставлю службу заново\n  {cmd}"));
@@ -438,7 +602,21 @@ pub fn install(dir: &Path) -> Result<(), String> {
     // найти указанный файл». Разделять только амперсандом.
     let full = format!("{} & {cmd}", uninstall_command());
     run_elevated(&full)?;
-    let _ = std::fs::write(signature_path(dir), &cmd);
+
+    // ⛔ Спрашиваем систему, появилась ли задача на самом деле. Раньше
+    // здесь стояла запись «служба установлена» сразу после запроса прав
+    // — и она появлялась в журнале ВСЕГДА, даже когда установка
+    // проваливалась. Человек видел «установлена», а затем поток строк
+    // «не удается найти указанный файл»: задачи не было, а программа
+    // была уверена в обратном.
+    if state_in(dir) == State::Absent {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            "перехват: задача не создалась — смотрите ответ системы выше");
+        return Err("не удалось создать задачу перехвата. Подробности — \
+                    в журнале программы, строка «система ответила»".into());
+    }
+
+    let _ = std::fs::write(signature_path(dir), signature_text(&me, dir));
     crate::logfile::line(&crate::logfile::now_stamp(), "перехват: служба установлена");
     Ok(())
 }
@@ -452,15 +630,27 @@ pub fn uninstall() -> Result<(), String> {
 fn run_elevated(cmd: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows_sys::Win32::Foundation::CloseHandle;
 
     let wide = |s: &str| -> Vec<u16> {
         std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     };
+    // ⛔ Вывод обязательно в файл. Окно скрыто, и всё, что система
+    // ответила об отказе, раньше уходило в никуда: в журнале оставалось
+    // бодрое «служба установлена», а причина — почему задача не
+    // создалась — терялась безвозвратно.
+    let log = std::env::temp_dir().join("nexusproxy-elevated.log");
+    let _ = std::fs::remove_file(&log);
     let verb = wide("runas");
     let file = wide("cmd.exe");
-    let args = wide(&format!("/c {cmd}"));
+    // ⛔ Скобки обязательны. Перенаправление в cmd относится только к
+    // ТОЙ команде, после которой стоит: без скобок в журнал попадал бы
+    // ответ последней команды цепочки, а отказ на создании задачи — то
+    // единственное, ради чего журнал и заводился, — терялся бы.
+    // Внешние кавычки cmd снимает сам, поэтому внутренние, вокруг путей
+    // с пробелами, доходят до команды целыми.
+    let args = wide(&format!("/c \"( {cmd} ) > \"{}\" 2>&1\"", log.display()));
 
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -475,11 +665,28 @@ fn run_elevated(cmd: &str) -> Result<(), String> {
         // Человек мог нажать «Нет» — это его решение, а не наша поломка.
         return Err("права администратора не выданы".into());
     }
+    let mut code: u32 = 0;
     unsafe {
         WaitForSingleObject(info.hProcess, 60_000);
+        GetExitCodeProcess(info.hProcess, &mut code);
         CloseHandle(info.hProcess);
     }
-    Ok(())
+
+    let said = std::fs::read(&log).map(|b| imp::oem_to_utf8(&b)).unwrap_or_default();
+    let _ = std::fs::remove_file(&log);
+    crate::logfile::line(&crate::logfile::now_stamp(),
+        &format!("перехват: система ответила ({code}): {}",
+                 if said.trim().is_empty() { "молча" } else { said.trim() }));
+
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(if said.trim().is_empty() {
+            format!("планировщик отказал, код {code}")
+        } else {
+            said.trim().to_string()
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
