@@ -1648,3 +1648,133 @@ mod helper_tests {
         assert!(helper_paths(r"C:\Program Files\cursor\Cursor.exe").is_empty());
     }
 }
+
+/// Одно соединение, как его видел движок.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Seen {
+    /// Имя узла, если движок его распознал, иначе адрес.
+    pub host: String,
+    /// Куда ушло: имя прокси или «напрямую».
+    pub via: String,
+    /// Через прокси или нет — для окраски в окне.
+    pub proxied: bool,
+}
+
+/// Что прошло через туннель — из журнала движка.
+///
+/// ⛔ В TUN режиме программы не обращаются к нашему входу, поэтому
+/// «Соединения», «Журнал» и «Подбор доменов» оставались пустыми: им
+/// неоткуда было брать данные. Человек видел пустые вкладки и решал,
+/// что всё сломалось. Читаем журнал движка — там есть и имя узла, и
+/// решение по нему.
+pub fn seen_connections(dir: &Path, limit: usize) -> Vec<Seen> {
+    let text = match std::fs::read_to_string(engine_log_path(dir)) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+
+    // Движок пишет решение и имя узла разными строками, связывая их
+    // номером соединения — собираем по нему.
+    let mut host_of: std::collections::HashMap<String, String> = Default::default();
+    let mut via_of: std::collections::HashMap<String, (String, bool)> = Default::default();
+    let mut order: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let Some(id) = line.split('[').nth(1).and_then(|r| r.split(']').next()) else { continue };
+        let id = id.split_whitespace().next().unwrap_or(id).to_string();
+
+        if let Some(rest) = line.split("domain: ").nth(1) {
+            let host = rest.split(&[',', ' '][..]).next().unwrap_or("").to_string();
+            if !host.is_empty() {
+                host_of.insert(id.clone(), host);
+            }
+        } else if let Some(rest) = line.split("connection to ").nth(1) {
+            let addr = rest.trim().trim_end_matches('.').to_string();
+            host_of.entry(id.clone()).or_insert(addr);
+        }
+
+        if let Some(rest) = line.split("=> route(").nth(1) {
+            let via = rest.split(')').next().unwrap_or("").to_string();
+            let proxied = via != "direct";
+            via_of.insert(id.clone(), (
+                if proxied { via } else { "напрямую".into() }, proxied));
+        }
+
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    }
+
+    let mut out: Vec<Seen> = order.iter().rev()
+        .filter_map(|id| {
+            let host = host_of.get(id)?.clone();
+            // ⛔ Своё же обращение к прокси в списке только мешает:
+            // человек ищет там свои программы, а не нашу кухню.
+            if host.contains(":1081") || host.starts_with("172.19.0.") {
+                return None;
+            }
+            let (via, proxied) = via_of.get(id)
+                .cloned()
+                .unwrap_or_else(|| ("напрямую".to_string(), false));
+            Some(Seen { host, via, proxied })
+        })
+        .collect();
+    out.dedup_by(|a, b| a.host == b.host && a.via == b.via);
+    out.truncate(limit);
+    out
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use super::*;
+
+    fn write(dir: &Path, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(engine_log_path(dir), text).unwrap();
+    }
+
+    fn tmp(who: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("np-seen-{}-{who}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ⛔ В TUN режиме программы не обращаются к нашему входу, и все
+    /// списки оставались пустыми — человек решал, что всё сломалось.
+    #[test]
+    fn собираем_имя_и_решение_по_соединению() {
+        let d = tmp("basic");
+        write(&d, "\
++0300 DEBUG [111 0ms] router: sniffed protocol: tls, domain: myip.com
++0300 DEBUG [111 0ms] router: match[4] process_path_regex=[x] => route(основной)
++0300 INFO [111 0ms] inbound/tun[tun-in]: inbound connection to 1.2.3.4:443
+");
+        let seen = seen_connections(&d, 10);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].host, "myip.com");
+        assert_eq!(seen[0].via, "основной");
+        assert!(seen[0].proxied);
+    }
+
+    #[test]
+    fn ушедшее_напрямую_видно_как_напрямую() {
+        let d = tmp("direct");
+        write(&d, "\
++0300 DEBUG [222 0ms] router: sniffed protocol: tls, domain: discord.com
++0300 DEBUG [222 0ms] router: match[1] ip_is_private=true => route(direct)
+");
+        let seen = seen_connections(&d, 10);
+        assert_eq!(seen[0].host, "discord.com");
+        assert_eq!(seen[0].via, "напрямую");
+        assert!(!seen[0].proxied);
+    }
+
+    /// ⛔ Наши собственные обращения к прокси в списке только мешают:
+    /// человек ищет там свои программы, а не нашу кухню.
+    #[test]
+    fn своё_обращение_к_прокси_не_показываем() {
+        let d = tmp("self");
+        write(&d, "+0300 INFO [333 0ms] inbound/tun[tun-in]: inbound connection to 172.31.211.1:1081\n");
+        assert!(seen_connections(&d, 10).is_empty());
+    }
+}

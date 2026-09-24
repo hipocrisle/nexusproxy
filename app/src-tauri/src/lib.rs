@@ -1135,6 +1135,23 @@ async fn settings_import(app: AppHandle, path: String) -> Result<Vec<String>, St
     Ok(missing)
 }
 
+/// Что прошло через туннель — для «Соединений» и «Подбора доменов».
+///
+/// ⛔ В TUN режиме программы не обращаются к нашему входу, поэтому наши
+/// собственные записи пусты. Берём из журнала движка.
+#[tauri::command]
+fn tunnel_seen(app: State<App>) -> Vec<core::tunnel::Seen> {
+    let path = app.path.lock().unwrap().clone();
+    let tunnel = match engine(&app) {
+        Ok(e) => { let m = e.cfg.lock().unwrap().tunnel_mode; m }
+        Err(_) => false,
+    };
+    if !tunnel {
+        return Vec::new();
+    }
+    core::tunnel::seen_connections(&core::tunnel_dir(&path), 200)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1313,7 +1330,7 @@ pub fn run() {
             system_proxy, settings_save, set_flag, quit,
             apps_list, app_save, app_remove, app_launch,
             tunnel_state, tunnel_install, tunnel_set, tunnel_log,
-            settings_export, settings_import
+            settings_export, settings_import, tunnel_seen
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

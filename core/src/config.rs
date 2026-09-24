@@ -614,7 +614,6 @@ pub struct Portable {
     pub groups: Vec<RouteGroup>,
     pub through_proxy: Vec<String>,
     pub direct: Vec<String>,
-    pub apps: Vec<crate::launch::App>,
     pub tunnel_mode: bool,
 }
 
@@ -628,18 +627,18 @@ impl Config {
             groups: self.groups.clone(),
             through_proxy: self.through_proxy.clone(),
             direct: self.direct.clone(),
-            apps: self.apps.clone(),
             tunnel_mode: self.tunnel_mode,
         }
     }
 
     /// Принять перенесённые настройки.
     ///
-    /// ⛔ Пути к приложениям у другого человека будут свои: имя
+    /// ⛔ Приложения НЕ переносим. Пути к ним у каждого свои: имя
     /// пользователя в пути отличается, программа может стоять в другом
-    /// месте. Поэтому приложения принимаем, но помечаем те, чьих файлов
-    /// нет, — человек увидит и поправит, а не будет гадать, почему
-    /// перехват их не ловит.
+    /// месте или не стоять вовсе. Перенесённый список был бы набором
+    /// чужих путей, от которых нет никакой пользы, — их всё равно
+    /// пришлось бы задавать заново, только сперва разобравшись, почему
+    /// перехват не работает.
     pub fn import(&mut self, p: Portable) -> Vec<String> {
         self.upstreams = p.upstreams;
         self.default_upstream = p.default_upstream;
@@ -649,14 +648,7 @@ impl Config {
         self.tunnel_mode = p.tunnel_mode;
         self.upstream = None;
 
-        let mut missing = Vec::new();
-        for a in &p.apps {
-            if !std::path::Path::new(&a.path).exists() {
-                missing.push(a.name.clone());
-            }
-        }
-        self.apps = p.apps;
-        missing
+        Vec::new()
     }
 }
 
@@ -677,20 +669,21 @@ mod portable_tests {
         assert!(!json.contains("defaults_applied"), "состояние машины не переносим");
     }
 
-    /// Человек должен сразу увидеть, каких программ на этой машине нет,
-    /// а не гадать, почему перехват их не ловит.
+    /// ⛔ Приложения переносить нельзя: пути у каждого свои. Свой
+    /// список приложений при загрузке чужих настроек должен уцелеть.
     #[test]
-    fn отсутствующие_программы_называются() {
-        let mut c = tests::cfg(&[], &[]);
-        let mut p = c.export();
-        p.apps = vec![crate::launch::App {
-            name: "Cursor".into(),
-            path: "/нет/такого/Cursor.exe".into(),
-            kind: crate::launch::Kind::Auto,
-            via: "основной".into(),
+    fn приложения_не_переносятся() {
+        let from = tests::cfg(&[], &[]);
+        let json = serde_json::to_string(&from.export()).unwrap();
+        assert!(!json.contains("apps"), "путям к чужим программам тут не место");
+
+        let mut to = tests::cfg(&[], &[]);
+        to.apps = vec![crate::launch::App {
+            name: "Cursor".into(), path: "/свой/Cursor".into(),
+            kind: crate::launch::Kind::Auto, via: "основной".into(),
         }];
-        let missing = c.import(p);
-        assert_eq!(missing, vec!["Cursor".to_string()]);
+        to.import(from.export());
+        assert_eq!(to.apps.len(), 1, "свои приложения должны остаться");
     }
 
     #[test]
