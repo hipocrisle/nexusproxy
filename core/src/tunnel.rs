@@ -251,11 +251,23 @@ pub fn build_config_with(
         "action": "route",
         "outbound": "direct"
     }));
-
+    // ⛔ QUIC пропускаем напрямую, а не запрещаем.
+    //
+    // Это HTTP поверх UDP, и через SOCKS5 он не пройдёт — тот протокол
+    // UDP не умеет. Но запрет оказался хуже: для UDP движок не определяет
+    // владельца соединения, поэтому правило по приложению к нему не
+    // применяется — запрет накрывает всех подряд. Chrome и Safari тянут
+    // по QUIC почти всё и вместо отката на обычный TCP просто ждут;
+    // Firefox, который им почти не пользуется, работал.
+    //
+    // Пропуская QUIC напрямую, мы теряем часть трафика мимо прокси, зато
+    // браузеры работают. Кому нужен весь трафик через прокси — выключает
+    // QUIC в самом браузере.
     rules.push(serde_json::json!({
         "network": "udp",
         "port": [443, 80],
-        "action": "reject"
+        "action": "route",
+        "outbound": "direct"
     }));
 
     // правила по доменам и подсетям — то же, что в режиме прокси
@@ -1313,11 +1325,11 @@ fn count_processes(bin: &Path) -> usize {
 mod quic_tests {
     use super::*;
 
-    /// ⛔ QUIC — это HTTP поверх UDP, а SOCKS5 протокол UDP не пропускает.
-    /// Соединение виснет молча: программа не сообщает об ошибке, просто
-    /// не работает. Закрываем, чтобы она откатилась на TCP.
+    /// ⛔ QUIC идёт напрямую, а не запрещается: для UDP движок не знает
+    /// владельца соединения, поэтому запрет накрывал всех подряд, и
+    /// браузеры, тянущие по QUIC почти всё, переставали работать вовсе.
     #[test]
-    fn quic_закрыт() {
+    fn quic_идёт_напрямую() {
         let c = build_config(
             &[Route { process: "Cursor".into(), path: "/Applications/Cursor.app".into(),
                       via: "основной".into() }],
@@ -1325,12 +1337,12 @@ mod quic_tests {
                          address: "172.31.211.1".into(), port: 1081,
                          user: None, password: None }],
         );
-        let blocked = c["route"]["rules"].as_array().unwrap().iter().any(|r| {
+        let direct = c["route"]["rules"].as_array().unwrap().iter().any(|r| {
             r["network"] == "udp"
-                && r["action"] == "reject"
+                && r["outbound"] == "direct"
                 && r["port"].as_array().map_or(false, |p| p.iter().any(|x| x == 443))
         });
-        assert!(blocked, "QUIC обязан быть закрыт, иначе программа виснет молча");
+        assert!(direct, "QUIC обязан идти напрямую, иначе браузеры не работают");
     }
 }
 
