@@ -9,20 +9,15 @@ import { enable as autoOn, disable as autoOff, isEnabled as autoIs } from "@taur
 type Status = {
   os?: string;
   running: boolean; upstream: string; http_port: number; socks_port: number;
-  system_on: boolean; discovering: boolean; rules_count: number;
+  system_on: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
   enable_on_start: boolean; tunnel_mode: boolean; default_upstream: string;
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
 type Entry = { id: number; at: string; host: string; port: number; route: string; via: string };
-type Candidate = {
-  domain: string; count: number; hosts_count: number;
-  examples: string[]; triggered_by: string | null;
-};
 type Preset = { name: string; note: string; domains: string[] };
 /// Что видел движок в TUN режиме: куда ушло соединение.
-type Seen = { host: string; via: string; proxied: boolean };
 type Conn = {
   id: number; host: string; port: number; route: string; via: string;
   app: string; app_path: string; pid: number;
@@ -200,7 +195,7 @@ export default function App() {
            ["log", "Журнал"], ["settings", "Настройки"]] as const)
           .map(([k, label]) => (
             <button key={k} className={"tab" + (tab === k ? " sel" : "")} onClick={() => setTab(k)}>
-              {label}{k === "discover" && st?.discovering ? " ●" : ""}
+              {label}
             </button>
           ))}
       </div>
@@ -213,7 +208,7 @@ export default function App() {
           </div>
         )}
           {tab === "apps" && <Apps />}
-        {tab === "discover" && <Discover active={!!st?.discovering} onChange={refresh} />}
+        {tab === "discover" && <Discover onChange={refresh} />}
         {tab === "conns" && <Connections />}
         {tab === "log" && <Log />}
         {tab === "settings" && <Settings st={st} onSaved={refresh} />}
@@ -797,95 +792,68 @@ function Apps() {
 
 /* ─────────────── Подбор доменов ─────────────── */
 
-function Discover({ active, onChange }: { active: boolean; onChange: () => void }) {
-  const [live, setLive] = useState<Candidate[]>([]);
+function Discover({ onChange }: { onChange: () => void }) {
+  const [totals, setTotals] = useState<DomainStat[]>([]);
   const [added, setAdded] = useState<Set<string>>(new Set());
+  // Что уже было к началу записи. Пусто — запись не идёт, показываем всё.
+  const [base, setBase] = useState<Set<string> | null>(null);
+  const [filter, setFilter] = useSticky("disc.filter", "");
 
-  // ⛔ В TUN режиме наши записи пусты: программы обращаются не к нам.
-  // Берём то, что видел движок, и предлагаем ушедшее напрямую — это и
-  // есть ответ на вопрос «что добавить в правила».
-  const [fromTunnel, setFromTunnel] = useState<Candidate[]>([]);
+  // ⛔ Один источник на оба режима. Раньше здесь жили два списка сразу:
+  // свои записи (в режиме перехвата всегда пустые) и отдельная выборка
+  // из журнала движка — человек видел задвоение, причём работала из них
+  // только одна половина.
   useEffect(() => {
-    const tick = async () => {
-      const seen = await invoke<Seen[]>("tunnel_seen").catch(() => []);
-      const byDomain = new Map<string, number>();
-      for (const c of seen) {
-        if (c.proxied) continue;              // уже идёт через прокси
-        if (/^[\d.:]+$/.test(c.host)) continue; // адрес без имени не предложишь
-        const d = c.host.replace(/:\d+$/, "");
-        byDomain.set(d, (byDomain.get(d) ?? 0) + 1);
-      }
-      setFromTunnel([...byDomain.entries()]
-        .map(([domain, count]) => ({ domain, count, hosts_count: 1, examples: [], triggered_by: null }))
-        .sort((a, b) => b.count - a.count));
-    };
+    const tick = () => invoke<DomainStat[]>("conns_totals").then(setTotals).catch(() => {});
     tick();
-    const t = setInterval(tick, 5000);
+    const t = setInterval(tick, 2000);
     return () => clearInterval(t);
   }, []);
 
-  useEffect(() => {
-    if (!active) return;
-    const t = setInterval(async () => setLive(await invoke<Candidate[]>("discovery_live")), 1200);
-    return () => clearInterval(t);
-  }, [active]);
+  const direct = totals
+    .filter((t) => t.route === "direct")
+    .filter((t) => !/^[\d.:]+$/.test(t.domain))   // голый адрес в правило не добавишь
+    .filter((t) => !filter || t.domain.toLowerCase().includes(filter.toLowerCase()));
+  const shown = base ? direct.filter((d) => !base.has(d.domain)) : direct;
+  const rest = shown.filter((c) => !added.has(c.domain));
 
-  const start = async () => { setAdded(new Set()); setLive([]); await invoke("discovery_start"); onChange(); };
-  const stop = async () => { await invoke("discovery_stop"); onChange(); };
+  const start = () => { setAdded(new Set()); setBase(new Set(direct.map((d) => d.domain))); };
+  const stop = () => setBase(null);
 
   const addOne = async (domain: string) => {
     await invoke<Bulk>("rule_add", { text: domain });
     setAdded((s) => new Set(s).add(domain));
     onChange();
   };
-  const rest = live.filter((c) => !added.has(c.domain));
   const addAll = async () => {
     if (!rest.length) return;
     await invoke<Bulk>("rule_add", { text: rest.map((c) => c.domain).join("\n") });
     setAdded((s) => { const n = new Set(s); rest.forEach((c) => n.add(c.domain)); return n; });
     onChange();
   };
-  const copyList = () => navigator.clipboard.writeText(live.map((c) => c.domain).join("\n"));
+  const copyList = () => navigator.clipboard.writeText(shown.map((c) => c.domain).join("\n"));
 
   return (
     <div className="panel">
-      {fromTunnel.length > 0 && (
-        <div className="card wide">
-          <h3>Ушли напрямую — {fromTunnel.length}</h3>
-          <p className="hint">
-            Замечены в туннеле и не попали ни под одно правило. Если какой-то
-            из них должен идти через прокси — добавьте его.
-          </p>
-          <div className="list">
-            {fromTunnel.slice(0, 40).map((c) => (
-              <div className="item" key={c.domain}>
-                <span className="grow mono">{c.domain}</span>
-                <span className="hint">{c.count}</span>
-                {added.has(c.domain)
-                  ? <span className="tag proxy">добавлен</span>
-                  : <button className="btn small" onClick={() => addOne(c.domain)}>Добавить</button>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       <div className="card">
-        <h3>Подбор сопутствующих доменов</h3>
+        <h3>Что ушло напрямую</h3>
         <p className="hint">
-          Записывает адреса, ушедшие напрямую в течение 15 секунд после обращения
-          через прокси. Адреса, встречавшиеся до начала записи, исключаются.
+          Эти адреса не попали ни под одно правило. Если какой-то из них должен
+          идти через прокси — добавьте его.
         </p>
         <p className="hint">
-          Результат сводится к домену второго уровня: имена узлов у части сервисов
-          генерируются на каждый сеанс. В скобках — сколько имён относится к домену.
+          «Начать запись» запоминает нынешний список и дальше показывает только
+          новое: удобно, когда нужно понять, куда лезет одна конкретная программа.
         </p>
         <div className="row">
-          {!active
-            ? <button className="btn primary" onClick={start}>Начать подбор</button>
-            : <button className="btn" onClick={stop}>Закончить</button>}
-          {active && <span className="meta">идёт запись</span>}
+          {!base
+            ? <button className="btn primary" onClick={start}>Начать запись</button>
+            : <button className="btn" onClick={stop}>Показать всё</button>}
+          {base && <span className="meta">идёт запись</span>}
+          <input className="field" placeholder="поиск по домену"
+                 value={filter} onChange={(e) => setFilter(e.target.value)} />
           <span className="grow" />
-          {active && live.length > 0 && (
+          {shown.length > 0 && (
             <>
               <button className="btn small" onClick={copyList}>Копировать</button>
               <button className="btn" onClick={addAll} disabled={!rest.length}>
@@ -896,29 +864,25 @@ function Discover({ active, onChange }: { active: boolean; onChange: () => void 
         </div>
       </div>
 
-      {active && (
-        <div className="card">
-          <h3>Найдено доменов — {live.length}</h3>
-          <div className="list">
-            {live.length === 0 && <div className="empty">Новых адресов не зафиксировано.</div>}
-            {live.map((c) => (
-              <div className="item" key={c.domain}>
-                <span className="grow">
-                  {c.domain}
-                  {c.hosts_count > 1 && (
-                    <span className="sub"> · {c.hosts_count} имён, напр. {c.examples[0]}</span>
-                  )}
-                </span>
-                {c.triggered_by && <span className="tag">следом за {c.triggered_by}</span>}
-                <span className="tag">×{c.count}</span>
-                {added.has(c.domain)
-                  ? <span className="tag proxy">добавлен</span>
-                  : <button className="btn small" onClick={() => addOne(c.domain)}>Добавить</button>}
-              </div>
-            ))}
-          </div>
+      <div className="card wide">
+        <h3>Найдено — {shown.length}</h3>
+        <div className="list">
+          {shown.length === 0 && (
+            <div className="empty">
+              {base ? "Нового пока нет." : "Пока ничего не зафиксировано."}
+            </div>
+          )}
+          {shown.slice(0, 200).map((c) => (
+            <div className="item" key={c.domain}>
+              <span className="grow mono">{c.domain}</span>
+              <span className="hint">{c.conns}</span>
+              {added.has(c.domain)
+                ? <span className="tag proxy">добавлен</span>
+                : <button className="btn small" onClick={() => addOne(c.domain)}>Добавить</button>}
+            </div>
+          ))}
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -935,10 +899,6 @@ type TotalKey = "domain" | "conns" | "sent" | "received";
 
 function Connections() {
   const [live, setLive] = useState<Conn[]>([]);
-  // ⛔ В TUN режиме программы не обращаются к нашему входу, и наши
-  // собственные записи пусты — человек видит пустую вкладку и решает,
-  // что всё сломалось. Берём то, что видел движок.
-  const [seen, setSeen] = useState<Seen[]>([]);
   const [totals, setTotals] = useState<DomainStat[]>([]);
   const [fails, setFails] = useState<Failure[]>([]);
   const [filter, setFilter] = useSticky("conn.filter", "");
@@ -963,12 +923,7 @@ function Connections() {
     };
     tick();
     const t = setInterval(tick, 1000);
-    // ⛔ Журнал движка опрашиваем редко: это чтение с диска, и частый
-    // опрос подвешивал окно.
-    const seenTick = () => { invoke<Seen[]>("tunnel_seen").then(setSeen).catch(() => {}); };
-    seenTick();
-    const ts = setInterval(seenTick, 5000);
-    return () => { clearInterval(t); clearInterval(ts); };
+    return () => clearInterval(t);
   }, []);
 
   const sum = totals.reduce((a, t) => ({ s: a.s + t.sent, r: a.r + t.received }), { s: 0, r: 0 });
@@ -997,24 +952,6 @@ function Connections() {
 
   return (
     <div className="panel">
-      {seen.length > 0 && (
-        <div className="card wide">
-          <h3>Через туннель — {seen.length}</h3>
-          <p className="hint">
-            Последние соединения и куда они ушли. В этом режиме программы
-            обращаются не к нам, а прямо в сеть, поэтому счётчиков трафика
-            здесь нет.
-          </p>
-          <div className="list">
-            {seen.slice(0, 60).map((c, i) => (
-              <div className="item" key={c.host + i}>
-                <span className="grow mono">{c.host}</span>
-                <span className={"tag " + (c.proxied ? "proxy" : "direct")}>{c.via}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
       {fails.length > 0 && (
         <div className="card">
           <div className="row" style={{ marginBottom: 6 }}>
@@ -1096,7 +1033,17 @@ function Connections() {
       </div>
 
       <div className="card">
-        <h3>Трафик по доменам</h3>
+        <div className="row">
+          <h3 style={{ margin: 0 }}>Трафик по доменам</h3>
+          <span className="grow" />
+          {/* ⛔ Отбор нужен и здесь: раньше галка стояла только у верхней
+              таблицы, и в нижней отфильтровать было нечем. */}
+          <label className="check">
+            <input type="checkbox" checked={onlyProxy}
+                   onChange={(e) => setOnlyProxy(e.target.checked)} />
+            только через прокси
+          </label>
+        </div>
         <p className="hint">Учёт по домену второго уровня, за всё время работы программы.</p>
         <div className="list">
           <div className="item head">
