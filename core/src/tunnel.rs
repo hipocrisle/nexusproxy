@@ -960,6 +960,8 @@ pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
     // следит за его отпечатком и на любую запись перезапускает движок.
     // Лишний перезапуск — это разрыв всех соединений на ровном месте.
     if std::fs::read(config_path(dir)).map(|было| было == text).unwrap_or(false) {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            "перехват: настройки движка не изменились, перезапуск не нужен");
         return Ok(());
     }
 
@@ -986,11 +988,20 @@ pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
     }
     // Какие именно процессы ловим — самое важное для разбора: если имя
     // не совпадёт с настоящим, перехват работает, а трафик идёт мимо.
-    crate::logfile::line(&crate::logfile::now_stamp(),
-        &format!("перехват: ловим процессы [{}], правил по адресам: {}",
-                 routes.iter().map(|r| format!("{} → {}", r.process, r.via))
-                       .collect::<Vec<_>>().join(", "),
-                 domains.len()));
+    crate::logfile::line(&crate::logfile::now_stamp(), &format!(
+        "перехват: настройки движка обновлены\n  \
+         программы: [{}]\n  \
+         правил по адресам: {}\n  \
+         прокси: [{}]\n  \
+         файл: {} ({} Б)",
+        routes.iter().map(|r| format!("{} → {}", r.process, r.via))
+              .collect::<Vec<_>>().join(", "),
+        domains.len(),
+        upstreams.iter().map(|u| format!("{} = {}:{}", u.tag, u.address, u.port))
+                 .collect::<Vec<_>>().join(", "),
+        config_path(dir).display(),
+        text.len(),
+    ));
     Ok(())
 }
 
@@ -1496,6 +1507,8 @@ pub fn diagnosis(dir: &Path) -> String {
     };
 
     out.push_str("── файлы ──\n");
+    say(&mut out, "закрытая папка", crate::tunnel_service::secure_dir(dir));
+    say(&mut out, "копия для службы", crate::tunnel_service::runner_path(dir));
     say(&mut out, "движок", engine_at_hand(dir));
     say(&mut out, "настройки", config_path(dir));
     say(&mut out, "признак включения", dir.join("enabled"));

@@ -57,7 +57,9 @@ pub fn push(host: &str, port: u16, route: &Route, via: &str) {
         j.items.pop_front();
     }
     drop(g);
-    crate::logfile::line(&stamp, &format!("{:12} {host}:{port}", route.label()));
+    // ⛔ В свой файл: этих строк тысячи в час, и записи о работе
+    // программы среди них не найти.
+    crate::logfile::traffic(&stamp, &format!("{:12} {host}:{port}", route.label()));
 }
 
 /// Всё, что появилось после указанного номера.
