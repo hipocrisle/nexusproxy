@@ -276,6 +276,29 @@ fn presets() -> Vec<core::presets::Preset> {
     core::presets::all()
 }
 
+/// Снять сразу несколько правил.
+///
+/// ⛔ Одной командой, а не по одному вызову на домен: каждый вызов
+/// перезаписывает настройки целиком и перенастраивает перехват, и на
+/// наборе из десятков доменов это подвешивало окно, а маршрутизация
+/// несколько секунд была в промежуточном состоянии.
+#[tauri::command]
+fn rule_remove_many(app: State<App>, patterns: Vec<String>) -> Result<usize, String> {
+    let e = engine(&app)?;
+    let mut снято = 0;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        for p in &patterns {
+            if c.remove_proxy(p) {
+                снято += 1;
+            }
+        }
+    }
+    e.apply_and_save()?;
+    let _ = refresh_tunnel(&app);
+    Ok(снято)
+}
+
 #[tauri::command]
 fn rule_remove(app: State<App>, pattern: String) -> Result<bool, String> {
     let e = engine(&app)?;
@@ -1377,7 +1400,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            status, rules_list, rule_add, rule_edit, rule_remove, rule_set_via, rules_set_via,
+            status, rules_list, rule_add, rule_edit, rule_remove, rule_remove_many, rule_set_via, rules_set_via,
             rule_add_from_file, rules_export, presets, check,
             journal_since, journal_clear, open_folder, install_info, open_installed,
             conns_active, conns_totals, conns_reset,

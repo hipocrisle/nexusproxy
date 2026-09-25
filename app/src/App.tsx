@@ -204,7 +204,7 @@ export default function App() {
         {tab === "rules" && (
           <div className="panel">
             {!hideStart && <FirstRun st={st} onDone={() => setHideStart(true)} />}
-            <Rules onChange={refresh} />
+            <Rules onChange={refresh} defaultName={st?.default_upstream ?? ""} />
           </div>
         )}
           {tab === "apps" && <Apps />}
@@ -219,7 +219,10 @@ export default function App() {
 
 /* ─────────────── Полоса важных сообщений ─────────────── */
 
-type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number };
+/// ⛔ `up` — лишь «порт открыт». Сквозная проверка живёт в `probe_ok`:
+/// без неё человек видел зелёную точку у прокси, через который ничего
+/// не ходит, и не понимал, почему сайты не открываются.
+type ProxyHealth = { name: string; up: boolean; ms: number; checked_secs_ago: number; probe_ok: boolean };
 type Override = { from: string; to: string };
 
 /// Всё, о чём человек должен узнать сразу, а не найдя в настройках:
@@ -262,10 +265,12 @@ function Alerts({ st, onChange }: { st: Status | null; onChange: () => void }) {
 
   // упавшие прокси, через которые реально идут правила и подмены ещё нет
   const broken = health.filter(
-    (h) => !h.up && inUse.includes(h.name)
+    // ⛔ Считаем сломанным и тот прокси, чей порт открыт, а трафик через
+    // него не ходит: для человека это одно и то же — «не работает».
+    (h) => (!h.up || !h.probe_ok) && inUse.includes(h.name)
       && !overrides.some((o) => o.from === h.name) && !declined.has(h.name)
   );
-  const alive = health.filter((h) => h.up).map((h) => h.name);
+  const alive = health.filter((h) => h.up && h.probe_ok).map((h) => h.name);
 
   const showUpdate = newVersion && !updateHidden;
   if (!showUpdate && broken.length === 0 && overrides.length === 0) return null;
@@ -347,7 +352,10 @@ function FirstRun({ st, onDone }: { st: Status | null; onDone: () => void }) {
 
   if (!st) return null;
   // Прокси задан — значит человек уже настроился, не мешаем.
-  const ready = ups.some((u) => u.address && u.address !== "127.0.0.1");
+  // ⛔ Местный адрес тоже считается настроенным: страны из подписки
+  // поднимаются как порты на этой же машине, и полностью настроенный
+  // человек иначе до конца дней видел бы «прокси не задан».
+  const ready = ups.some((u) => u.address && (u.address !== "127.0.0.1" || u.port !== 1080));
   if (ready) return null;
 
   return (
@@ -385,7 +393,7 @@ function FirstRun({ st, onDone }: { st: Status | null; onDone: () => void }) {
 
 type RuleItem = { pattern: string; via: string };
 
-function Rules({ onChange }: { onChange: () => void }) {
+function Rules({ onChange, defaultName }: { onChange: () => void; defaultName: string }) {
   const [items, setItems] = useState<RuleItem[]>([]);
   const [ups, setUps] = useState<Upstream[]>([]);
   const [text, setText] = useState("");
@@ -428,7 +436,17 @@ function Rules({ onChange }: { onChange: () => void }) {
 
   const saveEdit = async (old: string) => {
     if (draft.trim() && draft !== old) {
-      try { await invoke<Bulk>("rule_edit", { old, new: draft }); } catch (e) { alert(String(e)); }
+      // ⛔ Смотрим, что ответил движок. Правка сперва удаляет прежнее
+      // правило и только потом добавляет новое: если новое не прошло
+      // проверку, прежнее уже стёрто, и раньше об этом не говорилось ни
+      // слова — правило просто исчезало из списка.
+      try {
+        const r = await invoke<Bulk>("rule_edit", { old, new: draft });
+        if (r && r.added.length === 0) {
+          alert(`«${draft}» не подходит как правило, прежнее правило «${old}» удалено. ` +
+                `Добавьте его заново или впишите верное значение.`);
+        }
+      } catch (e) { alert(String(e)); }
     }
     setEditing(null); load(); onChange();
   };
@@ -464,27 +482,32 @@ function Rules({ onChange }: { onChange: () => void }) {
     });
     load(); onChange();
   };
+  // ⛔ Подпись говорит, какой прокси основной, — по имени, а не по
+  // месту в списке. Раньше первым пунктом считался основной, и после
+  // «Сделать основным» человек выбирал один прокси, а правило уходило
+  // через другой.
   const upName = (u: Upstream) => {
     const f = flagOf(u.name);
-    return (f ? f + " " : "") + (nameOnly(u.name) || "по умолчанию");
+    const имя = nameOnly(u.name) || u.name;
+    return (f ? f + " " : "") + имя + (u.name === defaultName ? " · основной" : "");
   };
   const togglePreset = async (p: Preset) => {
-    if (hasAll(p)) {
-      // Наборы делят домены: у Gemini и YouTube общие google-адреса.
-      // Убирать общее нельзя — иначе снятие одного набора рушит другой.
-      const нужны_другим = new Set(
-        presets.filter((o) => o.name !== p.name && hasAll(o)).flatMap((o) => o.domains)
-      );
-      for (const d of p.domains) {
-        if (!нужны_другим.has(d)) {
-          await invoke("rule_remove", { pattern: "domain:" + d });
-        }
+    // ⛔ Снимаем одной командой. Раньше на каждый домен уходил
+    // отдельный вызов, и каждый из них перезаписывал настройки целиком
+    // и перенастраивал перехват: на наборе из нескольких десятков
+    // доменов окно подвисало, а маршрутизация несколько секунд была в
+    // промежуточном состоянии.
+    try {
+      if (hasAll(p)) {
+        await invoke("rule_remove_many", { patterns: p.domains.map((d) => "domain:" + d) });
+      } else {
+        await invoke<Bulk>("rule_add", { text: p.domains.join("\n"), via: addVia });
       }
-    } else {
-      await invoke<Bulk>("rule_add", { text: p.domains.join("\n"), via: addVia });
-    }
-    load(); onChange();
+      load();
+      onChange();
+    } catch (e) { alert(String(e)); }
   };
+
 
   return (
     <div className="panel split">
@@ -510,7 +533,7 @@ function Rules({ onChange }: { onChange: () => void }) {
                     onChange={(e) => movePreset(p, e.target.value)}>
                     {presetVia(p) === "\u0000mixed" && <option value="">смешано</option>}
                     {ups.map((u, i) => (
-                      <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                      <option key={u.name || i} value={u.name}>{upName(u)}</option>
                     ))}
                   </select>
                 </div>
@@ -540,7 +563,7 @@ function Rules({ onChange }: { onChange: () => void }) {
               <select className="field small-sel" value={addVia}
                 onChange={(e) => setAddVia(e.target.value)}>
                 {ups.map((u, i) => (
-                  <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                  <option key={u.name || i} value={u.name}>{upName(u)}</option>
                 ))}
               </select>
             </>
@@ -622,7 +645,7 @@ function Rules({ onChange }: { onChange: () => void }) {
                         load(); onChange();
                       }}>
                       {ups.map((u, i) => (
-                        <option key={u.name || i} value={i === 0 ? "" : u.name}>{upName(u)}</option>
+                        <option key={u.name || i} value={u.name}>{upName(u)}</option>
                       ))}
                     </select>
                   )}
@@ -810,14 +833,18 @@ function Discover({ onChange }: { onChange: () => void }) {
     return () => clearInterval(t);
   }, []);
 
-  const direct = totals
+  // ⛔ Отбор по поиску применяем ПОСЛЕ снимка. Раньше «Начать запись»
+  // запоминала отфильтрованный список: стоило что-то искать перед
+  // нажатием — и всё остальное, существовавшее до записи, тут же
+  // показывалось как новое, а «Добавить все» тащило это в правила.
+  const весь = totals
     .filter((t) => t.route === "direct")
-    .filter((t) => !/^[\d.:]+$/.test(t.domain))   // голый адрес в правило не добавишь
-    .filter((t) => !filter || t.domain.toLowerCase().includes(filter.toLowerCase()));
-  const shown = base ? direct.filter((d) => !base.has(d.domain)) : direct;
+    .filter((t) => !/^[\d.:]+$/.test(t.domain));   // голый адрес в правило не добавишь
+  const новое = base ? весь.filter((d) => !base.has(d.domain)) : весь;
+  const shown = новое.filter((t) => !filter || t.domain.toLowerCase().includes(filter.toLowerCase()));
   const rest = shown.filter((c) => !added.has(c.domain));
 
-  const start = () => { setAdded(new Set()); setBase(new Set(direct.map((d) => d.domain))); };
+  const start = () => { setAdded(new Set()); setBase(new Set(весь.map((d) => d.domain))); };
   const stop = () => setBase(null);
 
   const addOne = async (domain: string) => {
@@ -865,7 +892,10 @@ function Discover({ onChange }: { onChange: () => void }) {
       </div>
 
       <div className="card wide">
-        <h3>Найдено — {shown.length}</h3>
+        <h3>
+          Найдено — {shown.length}
+          {shown.length > 200 && <span className="sub"> · показаны первые 200</span>}
+        </h3>
         <div className="list">
           {shown.length === 0 && (
             <div className="empty">
@@ -971,8 +1001,13 @@ function Connections() {
                 {f.route === "direct" ? (
                   <button className="btn small" title="пустить этот домен через прокси"
                     onClick={async () => {
-                      await invoke("rule_add", { text: f.domain });
-                      invoke("failures_clear"); setFails([]);
+                      // ⛔ Убираем ТОЛЬКО эту строку. Раньше нажатие
+                      // стирало весь список, и остальные отказы исчезали
+                      // прежде, чем человек успевал их прочесть.
+                      try {
+                        await invoke("rule_add", { text: f.domain });
+                        setFails((p) => p.filter((x) => x.domain !== f.domain));
+                      } catch (e) { alert(String(e)); }
                     }}>
                     Пустить через прокси
                   </button>
@@ -991,12 +1026,15 @@ function Connections() {
 
       <div className="card">
         <div className="row">
-          <h3 style={{ margin: 0 }}>Открыто сейчас — {live.length}</h3>
+          <h3 style={{ margin: 0 }}>
+            Открыто сейчас — {live.length}
+            {shownLive.length > 300 && <span className="sub"> · показаны первые 300</span>}
+          </h3>
           <span className="grow" />
           <span className="meta">
             всего отдано {human(sum.s)} · получено {human(sum.r)} · через прокси {human(viaProxy)}
           </span>
-          <button className="btn small" onClick={() => invoke("conns_reset")}>Сбросить счётчики</button>
+          <button className="btn small" onClick={() => { invoke("conns_reset").catch((e) => alert(String(e))); }}>Сбросить счётчики</button>
         </div>
         <div className="row" style={{ marginTop: 8 }}>
           <input className="field" placeholder="поиск по адресу, программе или её пути"
@@ -1016,7 +1054,9 @@ function Connections() {
             <span className="col-b sortable" onClick={() => flip("received")}>Получено{arrow("received")}</span>
           </div>
           {shownLive.length === 0 && <div className="empty">Ничего не открыто.</div>}
-          {shownLive.map((c) => (
+          {/* ⛔ Рисуем часть: список обновляется каждую секунду, и
+              тысячи строк в разметке заметно подтормаживают окно. */}
+          {shownLive.slice(0, 300).map((c) => (
             <div className="item" key={c.id}>
               <span className="grow">{c.host}:{c.port}</span>
               <span className="col-app sub"
@@ -1054,7 +1094,7 @@ function Connections() {
             <span className="col-b sortable" onClick={() => tFlip("received")}>Получено{tArrow("received")}</span>
           </div>
           {shownTotals.length === 0 && <div className="empty">Пока пусто.</div>}
-          {shownTotals.map((t) => (
+          {shownTotals.slice(0, 300).map((t) => (
             <div className="item" key={t.domain}>
               <span className="grow">{t.domain}</span>
               <span className={"col-v tag " + t.route}>{t.via || routeLabel[t.route]}</span>
@@ -1091,7 +1131,7 @@ function Log() {
   }, []);
 
   const shown = lines.filter(
-    (l) => (!onlyProxy || l.route === "proxy") && (!filter || l.host.includes(filter.toLowerCase()))
+    (l) => (!onlyProxy || l.route === "proxy") && (!filter || l.host.toLowerCase().includes(filter.toLowerCase()))
   );
 
   return (
@@ -1107,7 +1147,7 @@ function Log() {
             shown.map((l) => `${l.host}:${l.port}`).join("\n"))} disabled={!shown.length}>
             Копировать
           </button>
-          <button className="btn" onClick={() => { setLines([]); invoke("journal_clear"); }}>Очистить</button>
+          <button className="btn" onClick={() => { setLines([]); invoke("journal_clear").catch(() => {}); }}>Очистить</button>
         </div>
       </div>
       <div className="card">
@@ -1404,12 +1444,12 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         <h3>Поведение</h3>
         <label className="check">
           <input type="checkbox" checked={auto} onChange={(e) => toggleAuto(e.target.checked)} />
-          Запускать вместе с Windows
+          {st?.os === "macos" ? "Запускать при входе в систему" : "Запускать вместе с Windows"}
         </label>
         {autoErr && <div className="note" style={{ marginTop: 6 }}>Автозапуск не включился: {autoErr}</div>}
         <label className="check" style={{ marginTop: 8 }}>
           <input type="checkbox" checked={st?.minimize_to_tray ?? true}
-            onChange={(e) => invoke("set_flag", { name: "minimize_to_tray", value: e.target.checked }).then(onSaved)} />
+            onChange={(e) => invoke("set_flag", { name: "minimize_to_tray", value: e.target.checked }).then(onSaved).catch((e) => alert(String(e)))} />
           Сворачивать в трей вместо закрытия
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
@@ -1417,7 +1457,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.enable_on_start ?? true}
-            onChange={(e) => invoke("set_flag", { name: "enable_on_start", value: e.target.checked }).then(onSaved)} />
+            onChange={(e) => invoke("set_flag", { name: "enable_on_start", value: e.target.checked }).then(onSaved).catch((e) => alert(String(e)))} />
           Сразу включать при запуске
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
@@ -1425,7 +1465,7 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         </p>
         <label className="check" style={{ marginTop: 12 }}>
           <input type="checkbox" checked={st?.auto_reconnect ?? true}
-            onChange={(e) => invoke("set_flag", { name: "auto_reconnect", value: e.target.checked }).then(onSaved)} />
+            onChange={(e) => invoke("set_flag", { name: "auto_reconnect", value: e.target.checked }).then(onSaved).catch((e) => alert(String(e)))} />
           Переподключаться, если прокси оборвался
         </label>
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
@@ -1511,15 +1551,23 @@ function Upstreams({ defaultName, onSaved }: { defaultName: string; onSaved: () 
           const h = health.find((x) => x.name === (u.name || `${u.address}:${u.port}`));
           return (
             <div className="item" key={u.name || "основной-" + i}>
-              <span className={"state " + (h ? (h.up ? "up" : "down") : "unknown")}
-                title={h ? (h.up ? `отвечает, ${h.ms} мс` : "не отвечает") : "ещё не проверялся"} />
+              <span className={"state " + (h ? (h.up && h.probe_ok ? "up" : "down") : "unknown")}
+                title={h
+                  ? (!h.up ? "не отвечает"
+                     : !h.probe_ok ? `порт открыт, но трафик не проходит (${h.ms} мс)`
+                     : `отвечает, ${h.ms} мс`)
+                  : "ещё не проверялся"} />
               <span className="grow">
                 {flagOf(u.name) && <span className="flag">{flagOf(u.name)}</span>}
                 {nameOnly(u.name)}
                 {u.name === defaultName && <span className="tag" style={{ marginLeft: 6 }}>по умолчанию</span>}
                 <span className="sub"> · {u.kind === "http" ? "HTTP" : "SOCKS5"} · {u.address}:{u.port}</span>
               </span>
-              <span className="sub">{h ? (h.up ? `${h.ms} мс` : "не отвечает") : "—"}</span>
+              <span className="sub">
+                {h ? (!h.up ? "не отвечает"
+                      : !h.probe_ok ? "трафик не проходит"
+                      : `${h.ms} мс`) : "—"}
+              </span>
               {u.name !== defaultName && (
                 <button className="btn small" title="правила без явного назначения пойдут через него"
                   onClick={async () => { await invoke("upstream_set_default", { name: u.name }); onSaved(); load(); }}>
