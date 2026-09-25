@@ -443,9 +443,11 @@ mod tests {
         std::fs::write(crate::tunnel::downloaded_engine(&dir), b"engine").unwrap();
         assert!(!crate::tunnel::binary_path(&dir).is_file(), "в закрытой папке его быть не должно");
 
-        let ошибка = install(&dir).unwrap_err();
-        assert!(!ошибка.contains("ещё не скачан"),
-                "установка отказалась, хотя движок скачан: {ошибка}");
+        // ⛔ Проверяем ПРЕДУСЛОВИЕ, а не саму установку: та просит
+        // права у системы, и на сборочной машине отвечать на этот
+        // вопрос некому — проверка висела до снятия по сроку.
+        assert!(engine_ready(&dir).is_ok(),
+                "установка отказалась бы, хотя движок скачан: {:?}", engine_ready(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -842,19 +844,26 @@ pub fn runner_path(dir: &Path) -> std::path::PathBuf {
 /// переустановка проходит один раз.
 const SERVICE_REVISION: u32 = 6;
 
-pub fn install(dir: &Path) -> Result<(), String> {
-    // ⛔ Проверяем СКАЧАННЫЙ движок, а не тот, что в закрытой папке:
-    // в закрытую его переносит сама эта установка. Спрашивая про него
-    // здесь, мы обрывались на первой же строке — «движок ещё не
-    // скачан», — и служба не переустанавливалась НИКОГДА. Именно из-за
-    // этого защита прав не доезжала до людей: программа видела, что
-    // служба устарела, бралась её ставить и молча выходила.
-    if !crate::tunnel::downloaded_engine(dir).is_file()
-        && !crate::tunnel::binary_path(dir).is_file()
+/// Есть ли чем поднимать перехват.
+///
+/// ⛔ Спрашиваем про СКАЧАННЫЙ движок, а не про тот, что в закрытой
+/// папке: в закрытую его переносит сама установка. Спрашивая про него
+/// перед установкой, мы обрывались на первой же строке — «движок ещё не
+/// скачан», — и служба не переустанавливалась НИКОГДА. Именно из-за
+/// этого защита прав не доезжала до людей: программа видела, что служба
+/// устарела, бралась её ставить и молча выходила.
+pub fn engine_ready(dir: &Path) -> Result<(), String> {
+    if crate::tunnel::downloaded_engine(dir).is_file()
+        || crate::tunnel::binary_path(dir).is_file()
     {
-        return Err(format!("движок перехвата ещё не скачан: нет {}",
-                           crate::tunnel::downloaded_engine(dir).display()));
+        return Ok(());
     }
+    Err(format!("движок перехвата ещё не скачан: нет {}",
+                crate::tunnel::downloaded_engine(dir).display()))
+}
+
+pub fn install(dir: &Path) -> Result<(), String> {
+    engine_ready(dir)?;
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;
     // Описание задачи кладём заранее: пишется оно правами обычного
