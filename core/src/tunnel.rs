@@ -26,12 +26,34 @@ fn exe_name() -> &'static str {
     if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
 }
 
-pub fn binary_path(dir: &Path) -> PathBuf {
-    dir.join(exe_name())
+/// Движок, который запускает служба. ⛔ Лежит в закрытой от записи
+/// папке: его выполняет учётная запись системы, и подмена означала бы
+/// выполнение чужого кода с её правами.
+pub fn binary_path(dir: &Path) -> std::path::PathBuf {
+    crate::tunnel_service::secure_dir(dir).join(engine_file_name())
+}
+
+/// Куда движок скачивается. Сюда пишет программа правами обычного
+/// пользователя, а в закрытую папку его переносит установка службы.
+pub fn downloaded_engine(dir: &Path) -> std::path::PathBuf {
+    dir.join(engine_file_name())
+}
+
+fn engine_file_name() -> &'static str {
+    if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
 }
 
 pub fn is_installed(dir: &Path) -> bool {
-    binary_path(dir).is_file()
+    // Движок считается установленным, когда он скачан: перенести его в
+    // закрытую папку — дело установки службы.
+    downloaded_engine(dir).is_file() || binary_path(dir).is_file()
+}
+
+/// Чем проверять настройки и что показывать человеку: берём тот, что
+/// работает, иначе скачанный.
+fn engine_at_hand(dir: &Path) -> std::path::PathBuf {
+    let secure = binary_path(dir);
+    if secure.is_file() { secure } else { downloaded_engine(dir) }
 }
 
 /// Имя файла в выпуске под текущую систему.
@@ -539,8 +561,19 @@ pub fn download(dir: &Path) -> Result<String, String> {
             n.contains(suffix) && n.ends_with(ext)
         })
         .ok_or_else(|| format!("в выпуске нет сборки для {suffix}"))?;
+    // ⛔ Берём только то, что выложено самим проектом движка: адрес
+    // приходит из ответа стороннего сервиса, и переход на чужой узел
+    // означал бы запуск чужого кода с правами системы.
+    let ok_host = |u: &str| {
+        u.starts_with("https://github.com/")
+            || u.starts_with("https://objects.githubusercontent.com/")
+            || u.starts_with("https://release-assets.githubusercontent.com/")
+    };
     let url = asset["browser_download_url"].as_str()
         .ok_or("у файла нет ссылки")?.to_string();
+    if !ok_host(&url) {
+        return Err(format!("движок предлагают скачать с чужого адреса: {url}"));
+    }
 
     let body: Vec<u8> = ureq::get(&url)
         .header("User-Agent", "NexusProxy")
@@ -552,7 +585,7 @@ pub fn download(dir: &Path) -> Result<String, String> {
         .read_to_vec()
         .map_err(|e| format!("обрыв при скачивании: {e}"))?;
 
-    let dest = binary_path(dir);
+    let dest = downloaded_engine(dir);
     let found = if want_zip {
         unpack_zip(&body, &dest)?
     } else {
@@ -743,11 +776,15 @@ pub fn stop_elevated() { stop(); }
 /// всё ещё заворачивается. Это та же беда, что с системным прокси,
 /// только крупнее.
 pub fn kill_orphans(dir: &Path) -> usize {
+    // ⛔ И тот, что остался от прежних версий рядом с настройками: он
+    // держит сетевой интерфейс, и новый движок из-за него не поднимется.
+    let old = downloaded_engine(dir);
+    let mut killed = if old.is_file() { crate::xray::kill_orphans(&old) } else { 0 };
     let bin = binary_path(dir);
-    if !bin.is_file() {
-        return 0;
+    if bin.is_file() {
+        killed += crate::xray::kill_orphans(&bin);
     }
-    crate::xray::kill_orphans(&bin)
+    killed
 }
 
 /// Записать настройки для движка. Служба читает их при запуске.
@@ -949,13 +986,28 @@ fn free_port() -> u16 {
         .unwrap_or(9191)
 }
 
+/// ⛔ Пароль берём у системного источника случайности. Собранный из
+/// номера процесса, времени и адреса переменной — предсказуем, а через
+/// это же API движком, работающим от имени системы, можно управлять:
+/// переключать исходящие, смотреть все соединения, снимать перехват.
+/// Случайная метка для имён временных файлов.
+pub fn random_tag() -> String {
+    let mut raw = [0u8; 8];
+    if getrandom::getrandom(&mut raw).is_err() {
+        // Хуже предсказуемого имени только отсутствие имени.
+        return format!("{:x}", std::process::id());
+    }
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn fresh_secret() -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(std::process::id().to_le_bytes());
-    h.update(format!("{:?}", std::time::SystemTime::now()).as_bytes());
-    h.update((&h as *const _ as usize).to_le_bytes());
-    format!("{:x}", h.finalize())[..32].to_string()
+    let mut raw = [0u8; 24];
+    if getrandom::getrandom(&mut raw).is_err() {
+        // Источник случайности недоступен — лучше не поднимать API
+        // вовсе, чем открыть его с предсказуемым паролем.
+        return String::new();
+    }
+    raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Отпечаток настроек — по нему видно, что их изменили.
@@ -1263,7 +1315,7 @@ pub fn diagnosis(dir: &Path) -> String {
     };
 
     out.push_str("── файлы ──\n");
-    say(&mut out, "движок", binary_path(dir));
+    say(&mut out, "движок", engine_at_hand(dir));
     say(&mut out, "настройки", config_path(dir));
     say(&mut out, "признак включения", dir.join("enabled"));
     say(&mut out, "журнал движка", engine_log_path(dir));
@@ -1581,7 +1633,7 @@ mod resolver_tests {
 
 /// Спросить у движка, годятся ли настройки.
 fn check_config(dir: &Path) -> Result<(), String> {
-    let bin = binary_path(dir);
+    let bin = engine_at_hand(dir);
     if !bin.is_file() {
         return Ok(()); // движка ещё нет — проверять нечем
     }

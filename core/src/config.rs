@@ -619,10 +619,17 @@ pub struct Portable {
 
 impl Config {
     /// Собрать настройки для переноса.
+    ///
+    /// ⛔ Пароли прокси в файл НЕ попадают. Этот файл заводят ровно
+    /// затем, чтобы отдать его коллеге или положить в общую папку, — а
+    /// пароль к корпоративному прокси это пароль доменной учётной
+    /// записи. Человек на той стороне впишет свой сам.
     pub fn export(&self) -> Portable {
         Portable {
             version: 1,
-            upstreams: self.all_upstreams(),
+            upstreams: self.all_upstreams().into_iter()
+                .map(|mut u| { u.password = None; u })
+                .collect(),
             default_upstream: self.default_upstream.clone(),
             groups: self.groups.clone(),
             through_proxy: self.through_proxy.clone(),
@@ -640,7 +647,23 @@ impl Config {
     /// пришлось бы задавать заново, только сперва разобравшись, почему
     /// перехват не работает.
     pub fn import(&mut self, p: Portable) -> Vec<String> {
-        self.upstreams = p.upstreams;
+        // ⛔ Свои пароли сохраняем: в перенесённом файле их нет, и без
+        // этого приём чужих настроек молча обнулял бы вход в прокси,
+        // который до того работал.
+        let mut kept: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for u in self.all_upstreams() {
+            if let Some(pw) = u.password.clone() {
+                kept.insert(u.name.clone(), pw);
+            }
+        }
+        self.upstreams = p.upstreams.into_iter()
+            .map(|mut u| {
+                if u.password.is_none() {
+                    u.password = kept.get(&u.name).cloned();
+                }
+                u
+            })
+            .collect();
         self.default_upstream = p.default_upstream;
         self.groups = p.groups;
         self.through_proxy = p.through_proxy;
@@ -655,6 +678,30 @@ impl Config {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+
+    /// ⛔ Пароль корпоративного прокси — это пароль доменной учётной
+    /// записи. Файл переноса кладут в общую папку и шлют в переписке.
+    #[test]
+    fn пароли_не_попадают_в_файл_переноса() {
+        let mut c = tests::cfg(&[], &[]);
+        c.upstreams[0].name = "офис".into();
+        c.upstreams[0].user = Some("ivan".into());
+        c.upstreams[0].password = Some("очень-секретно".into());
+        let text = serde_json::to_string(&c.export()).unwrap();
+        assert!(!text.contains("очень-секретно"), "пароль уехал в файл: {text}");
+        assert!(text.contains("офис"), "сам прокси перенестись обязан");
+    }
+
+    /// А свой пароль от приёма чужих настроек пропадать не должен.
+    #[test]
+    fn свой_пароль_переживает_приём_настроек() {
+        let mut c = tests::cfg(&[], &[]);
+        c.upstreams[0].name = "офис".into();
+        c.upstreams[0].password = Some("мой-пароль".into());
+        let принесённое = c.export();
+        c.import(принесённое);
+        assert_eq!(c.upstreams[0].password.as_deref(), Some("мой-пароль"));
+    }
 
     /// ⛔ В перенос не должно попадать ничего, привязанного к машине:
     /// пути к журналу, состояние, порты. Иначе настройки одного человека

@@ -78,13 +78,8 @@ mod imp {
     }
 
     pub fn install_command(_exe: &Path, dir: &Path) -> String {
-        // ⛔ Копию кладём здесь, а не заранее: к этому месту задача уже
-        // остановлена, и файл, который она держала, свободен. Раньше
-        // копирование шло до повышения и молча не срабатывало — служба
-        // продолжала запускать старую программу.
-        format!("copy /Y \"{}\" \"{}\" & schtasks.exe /create /tn {NAME} /f /xml \"{}\" \
-                 & schtasks.exe /run /tn {NAME}",
-                super::current_exe_display(), runner_path(dir).display(), xml_path(dir).display())
+        format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand {}",
+                super::encode_ps(&super::install_script(dir)))
     }
 
     pub fn uninstall_command() -> String {
@@ -195,7 +190,8 @@ mod imp {
     /// наблюдателя, а не про перехват.
     /// Путь к сценарию-наблюдателю.
     pub fn watcher_path(dir: &Path) -> std::path::PathBuf {
-        dir.join("watch.sh")
+        // ⛔ В закрытой папке: этот файл выполняет root.
+        super::secure_dir(dir).join("watch.sh")
     }
 
     /// ⛔ Демон запускает обычный сценарий оболочки, а не наш файл из
@@ -281,14 +277,24 @@ done
         let w = watcher_path(dir);
         // Здесь-документ: в путях бывают пробелы, а кавычки внутри xml
         // пришлось бы экранировать дважды.
+        let svc = super::secure_dir(dir);
+        let engine = crate::tunnel::downloaded_engine(dir);
+        let bin = crate::tunnel::binary_path(dir);
         format!(
-            "cat > '{w}' <<'NEXUSPROXY_WATCH'\n{watch}NEXUSPROXY_WATCH\n\
-             chmod 755 '{w}' && \
+            // ⛔ Папка с тем, что выполняет root, принадлежит root. Пока
+            // она была пользовательской, наблюдатель можно было просто
+            // удалить и положить свой — демон выполнил бы его с правами
+            // root после первой же перезагрузки.
+            "mkdir -p '{svc}' && \
+             cat > '{w}' <<'NEXUSPROXY_WATCH'\n{watch}NEXUSPROXY_WATCH\n\
+             if [ -f '{engine}' ]; then cp -f '{engine}' '{bin}'; fi; \
+             chown -R root:wheel '{svc}' && chmod 755 '{svc}' && chmod 755 '{w}' && \
              cat > '{p}' <<'NEXUSPROXY_PLIST'\n{plist}NEXUSPROXY_PLIST\n\
              chown root:wheel '{p}' && chmod 644 '{p}' && \
              launchctl bootout system/{NAME} 2>&1; \
              launchctl bootstrap system '{p}' 2>&1 && \
              launchctl print system/{NAME} 2>&1 | head -12",
+            svc = svc.display(), engine = engine.display(), bin = bin.display(),
             w = w.display(), watch = watcher(dir),
             p = p.display(), plist = plist(exe, dir)
         )
@@ -378,6 +384,53 @@ pub fn stop_in(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// ⛔ Всё, что исполняется от имени системы, обязано лежать в папке,
+    /// закрытой от записи. Иначе подмена файла даёт выполнение с её
+    /// правами после перезагрузки.
+    #[test]
+    fn исполняемое_системой_лежит_в_закрытой_папке() {
+        let dir = Path::new("/папка");
+        assert!(runner_path(dir).starts_with(secure_dir(dir)),
+                "копия программы вне закрытой папки: {:?}", runner_path(dir));
+        assert!(crate::tunnel::binary_path(dir).starts_with(secure_dir(dir)),
+                "движок вне закрытой папки");
+        // а скачивается движок правами обычного пользователя — рядом с настройками
+        assert!(!crate::tunnel::downloaded_engine(dir).starts_with(secure_dir(dir)));
+    }
+
+    #[test]
+    fn команда_установки_закрывает_права_и_ставит_задачу() {
+        let back = install_script(Path::new("C:\\данные"));
+        assert!(back.contains("icacls"), "права не закрываются: {back}");
+        assert!(back.contains("S-1-5-18"), "задача не от системы: {back}");
+        assert!(back.contains("Register-ScheduledTask"), "{back}");
+        assert!(back.contains("-AtStartup"), "не поднимется после перезагрузки");
+        assert!(back.contains("RestartCount"), "не поднимется после сбоя");
+    }
+
+    /// Обратное преобразование — только для проверки.
+    #[allow(dead_code)]
+    fn decode_ps(b64: &str) -> String {
+        const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = Vec::new();
+        for ch in b64.bytes().filter(|c| *c != b'=') {
+            let v = ABC.iter().position(|c| *c == ch).unwrap() as u32;
+            bits.push(v);
+        }
+        let mut raw = Vec::new();
+        for c in bits.chunks(4) {
+            let mut n = 0u32;
+            for (i, v) in c.iter().enumerate() { n |= v << (18 - 6 * i); }
+            raw.push((n >> 16) as u8);
+            if c.len() > 2 { raw.push((n >> 8) as u8); }
+            if c.len() > 3 { raw.push(n as u8); }
+        }
+        let units: Vec<u16> = raw.chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)])).collect();
+        String::from_utf16_lossy(&units)
+    }
+
+
     /// ⛔ В путях бывают пробелы — и в «Program Files», и в имени
     /// пользователя. Потеряв часть пути, служба молча не запустится.
     #[test]
@@ -448,6 +501,81 @@ mod tests {
 /// ⛔ Это единственное место, где программа просит администратора.
 /// Дальше перехват включается и выключается без вопросов: службе при
 /// установке выдаётся право на запуск и остановку обычным пользователем.
+/// Папка, закрытая от записи обычным пользователем. В ней лежит всё,
+/// что исполняется от имени системы.
+///
+/// ⛔ Иначе подмена одного файла в папке данных даёт выполнение от
+/// системы после перезагрузки — без запроса прав и без следов.
+pub fn secure_dir(dir: &Path) -> std::path::PathBuf {
+    dir.join("svc")
+}
+
+/// Что именно выполняется с правами администратора при установке.
+///
+/// ⛔ Раньше задача запускала файлы из папки данных пользователя, куда
+/// он (и любая программа от его имени) может писать. Подменив один
+/// файл, можно было получить выполнение от имени системы после
+/// перезагрузки, без единого запроса прав, — то есть обойти ровно ту
+/// политику, ради которой человека этих прав и лишили. Поэтому первым
+/// делом закрываем папку, и только потом кладём в неё исполняемое.
+///
+/// ⛔ Команды связаны `;` при снятии прежнего (его может не быть — это
+/// не ошибка) и остановом на первой же неудаче дальше: раньше успех
+/// определялся по последней команде цепочки, и неудачное копирование
+/// оставалось незамеченным — служба навсегда запускала прежнюю
+/// программу, а установка считалась удавшейся.
+pub fn install_script(dir: &Path) -> String {
+    let q = |v: String| format!("'{}'", v.replace('\'', "''"));
+    format!(
+        "$ErrorActionPreference='Stop'\n\
+         $svc={svc}\n\
+         $runner={runner}\n\
+         $bin={bin}\n\
+         $src={src}\n\
+         $engine={engine}\n\
+         New-Item -ItemType Directory -Force -Path $svc | Out-Null\n\
+         icacls $svc /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-11:(OI)(CI)RX' | Out-Null\n\
+         Copy-Item -LiteralPath $src -Destination $runner -Force\n\
+         if (Test-Path -LiteralPath $engine) {{ Copy-Item -LiteralPath $engine -Destination $bin -Force }}\n\
+         $a=New-ScheduledTaskAction -Execute $runner -Argument ('--run-tunnel \"' + {dir} + '\"')\n\
+         $p=New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -RunLevel Highest\n\
+         $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)\n\
+         $t=New-ScheduledTaskTrigger -AtStartup\n\
+         Register-ScheduledTask -TaskName '{NAME}' -Action $a -Principal $p -Settings $s -Trigger $t -Force | Out-Null\n\
+         Start-ScheduledTask -TaskName '{NAME}'\n",
+        svc = q(secure_dir(dir).display().to_string()),
+        runner = q(runner_path(dir).display().to_string()),
+        bin = q(crate::tunnel::binary_path(dir).display().to_string()),
+        src = q(current_exe_display()),
+        engine = q(crate::tunnel::downloaded_engine(dir).display().to_string()),
+        dir = q(dir.display().to_string()),
+    )
+}
+
+/// Команда для оболочки Windows — в её собственной кодировке.
+///
+/// ⛔ Так команда передаётся ОДНОЙ строкой параметра, без временного
+/// файла и без кавычек, которые пришлось бы согласовывать между cmd,
+/// оболочкой и планировщиком. Файл со сценарием пришлось бы класть в
+/// папку пользователя, а значит — снова открывать путь к подмене.
+pub fn encode_ps(script: &str) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut raw = Vec::with_capacity(script.len() * 2);
+    for u in script.encode_utf16() {
+        raw.extend_from_slice(&u.to_le_bytes());
+    }
+    let mut out = String::new();
+    for c in raw.chunks(3) {
+        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ABC[(n >> 18) as usize & 63] as char);
+        out.push(ABC[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { ABC[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { ABC[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 /// Файл-признак: есть — перехват включён. ⛔ Через него, а не через
 /// запуск службы: служба принадлежит системе, и человек без прав
 /// администратора запустить её не может, а файл в своей папке — может.
@@ -608,7 +736,6 @@ pub fn needs_reinstall(dir: &Path) -> bool {
 /// идёт от имени человека — заменить занятый файл он не может, и
 /// обновление падает с ошибкой на ровном месте.
 /// Путь к самой программе — для команды копирования.
-#[cfg(windows)]
 fn current_exe_display() -> String {
     std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
 }
@@ -618,14 +745,14 @@ fn current_exe_display() -> String {
 /// ровно то, чего быть не должно. Занятый файл перезаписывается уже
 /// под повышением, когда служба остановлена.
 pub fn runner_path(dir: &Path) -> std::path::PathBuf {
-    dir.join(if cfg!(windows) { "runner.exe" } else { "runner" })
+    secure_dir(dir).join(if cfg!(windows) { "runner.exe" } else { "runner" })
 }
 
 /// ⛔ Номер повадок службы. Подпись НЕ включает версию программы: иначе
 /// каждое обновление требовало бы прав администратора. Права нужны лишь
 /// когда меняется сама служба — тогда номер поднимается в коде, и
 /// переустановка проходит один раз.
-const SERVICE_REVISION: u32 = 5;
+const SERVICE_REVISION: u32 = 6;
 
 pub fn install(dir: &Path) -> Result<(), String> {
     if !crate::tunnel::binary_path(dir).is_file() {
@@ -643,10 +770,15 @@ pub fn install(dir: &Path) -> Result<(), String> {
         &format!("перехват: ставлю службу заново\n  {cmd}"));
     // Старую убираем сразу: иначе на Windows останется задача с прежним
     // способом запуска, и человек увидит поведение старой версии.
-    // ⛔ cmd не считает перевод строки разделителем команд: склеенные
-    // через \n они превращаются в бессмыслицу, и он отвечает «не удалось
-    // найти указанный файл». Разделять только амперсандом.
-    let full = format!("{} & {cmd}", uninstall_command());
+    // ⛔ Разделитель у каждой оболочки свой. В cmd перевод строки не
+    // считается разделителем — нужен амперсанд. А в оболочке macOS
+    // амперсанд означает «в фоне»: снятие прежнего демона уходило в фон
+    // и могло снести только что записанное описание нового.
+    let full = if cfg!(windows) {
+        format!("{} & {cmd}", uninstall_command())
+    } else {
+        format!("{} ; {cmd}", uninstall_command())
+    };
     run_elevated(&full)?;
 
     // ⛔ Спрашиваем систему, появилась ли задача на самом деле. Раньше
@@ -686,8 +818,11 @@ fn run_elevated(cmd: &str) -> Result<(), String> {
     // ответила об отказе, раньше уходило в никуда: в журнале оставалось
     // бодрое «служба установлена», а причина — почему задача не
     // создалась — терялась безвозвратно.
-    let log = std::env::temp_dir().join("nexusproxy-elevated.log");
-    let _ = std::fs::remove_file(&log);
+    // ⛔ Имя непредсказуемое. С постоянным именем во временной папке
+    // другой процесс успевает подставить по этому пути ссылку на чужой
+    // файл, и перенаправление вывода от имени администратора затирает
+    // его содержимое.
+    let log = std::env::temp_dir().join(format!("nexusproxy-{}.log", crate::tunnel::random_tag()));
     let verb = wide("runas");
     let file = wide("cmd.exe");
     // ⛔ Скобки обязательны. Перенаправление в cmd относится только к
