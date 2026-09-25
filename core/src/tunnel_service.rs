@@ -126,7 +126,7 @@ mod imp {
             // движка нет» — первое, что нужно знать при разборе.
             if flag && !engine {
                 crate::logfile::line(&crate::logfile::now_stamp(),
-                    "перехват: flag включения стоит, но engine не отвечает");
+                    "перехват: признак включения стоит, но движок не отвечает");
             }
             State::Stopped
         }
@@ -138,7 +138,7 @@ mod imp {
     /// этот файл; создать его человек может своими правами.
     pub fn start_in(dir: &Path) -> Result<(), String> {
         crate::logfile::line(&crate::logfile::now_stamp(),
-            &format!("перехват: включаю — ставлю flag {}", super::flag_path(dir).display()));
+            &format!("перехват: включаю — ставлю признак {}", super::flag_path(dir).display()));
         std::fs::write(super::flag_path(dir), b"1")
             .map_err(|e| format!("не включить перехват: {e}"))?;
         // ⛔ Запускать задачу НЕ пытаемся: она принадлежит системе, и
@@ -169,7 +169,7 @@ mod imp {
         match std::fs::remove_file(super::flag_path(dir)) {
             Ok(()) => {
                 crate::logfile::line(&crate::logfile::now_stamp(),
-                    "перехват: выключаю — flag снят");
+                    "перехват: выключаю — признак снят");
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -177,7 +177,7 @@ mod imp {
                     "перехват: выключать нечего — признака и так нет");
                 Ok(())
             }
-            Err(e) => Err(format!("не выключить перехват: не убрать flag {}: {e}",
+            Err(e) => Err(format!("не выключить перехват: не убрать признак {}: {e}",
                                   super::flag_path(dir).display())),
         }
     }
@@ -255,7 +255,7 @@ while true; do
     # как свежие, а список опознанных программ — как будто из этого
     # сеанса. Разбирать по такому журналу нельзя.
     : > "{enginelog}"
-    echo "$(date '+%F %T') поднимаю engine" >> "$LOG"
+    echo "$(date '+%F %T') поднимаю движок" >> "$LOG"
     "$BIN" run -c "$CFG" >> "$LOG" 2>&1 &
     PID=$!
     # держим, пока flag на месте и настройки не изменились
@@ -276,7 +276,7 @@ while true; do
     done
     kill "$PID" 2>/dev/null
     wait "$PID" 2>/dev/null
-    echo "$(date '+%F %T') engine остановлен" >> "$LOG"
+    echo "$(date '+%F %T') движок остановлен" >> "$LOG"
     # ⛔ Если engine падает сразу, без этой паузы он поднимался бы
     # каждую секунду, и свой журнал наблюдателя распухал бы за сутки до
     # сотен мегабайт — а читает его программа целиком, ровно тогда,
@@ -378,10 +378,10 @@ done
             std::fs::write(&flag, b"on")
                 .map_err(|e| format!("перехват не перезапустился: {e}"))?;
             crate::logfile::line(&crate::logfile::now_stamp(),
-                "перехват: engine перезапущен с новыми настройками");
+                "перехват: движок перезапущен с новыми настройками");
         } else {
             crate::logfile::line(&crate::logfile::now_stamp(),
-                &format!("перехват: flag включения создан ({})", flag.display()));
+                &format!("перехват: признак включения создан ({})", flag.display()));
         }
         Ok(())
     }
@@ -442,7 +442,7 @@ mod tests {
         assert!(runner_path(dir).starts_with(secure_dir(dir)),
                 "копия программы вне закрытой папки: {:?}", runner_path(dir));
         assert!(crate::tunnel::binary_path(dir).starts_with(secure_dir(dir)),
-                "engine вне закрытой папки");
+                "движок вне закрытой папки");
         // а скачивается engine правами обычного пользователя — рядом с настройками
         assert!(!crate::tunnel::downloaded_engine(dir).starts_with(secure_dir(dir)));
     }
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn наблюдатель_смотрит_на_признак() {
         let w = imp::watcher(Path::new("/папка"));
-        assert!(w.contains("[ -f \"$FLAG\" ]"), "наблюдатель не смотрит на flag: {w}");
+        assert!(w.contains("[ -f \"$FLAG\" ]"), "наблюдатель не смотрит на признак: {w}");
     }
 
     /// Угловые скобки и амперсанд в пути не должны ломать описание задачи.
@@ -828,7 +828,7 @@ const SERVICE_REVISION: u32 = 6;
 
 pub fn install(dir: &Path) -> Result<(), String> {
     if !crate::tunnel::binary_path(dir).is_file() {
-        return Err("engine перехвата ещё не скачан".into());
+        return Err("движок перехвата ещё не скачан".into());
     }
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;

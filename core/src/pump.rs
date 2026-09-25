@@ -201,7 +201,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let (sent, received) = counters.get();
-        assert_eq!(sent, 5, "отдано — то, что passed от клиента");
+        assert_eq!(sent, 5, "отдано — то, что ушло от клиента");
         assert_eq!(received, 10, "получено — то, что пришло обратно");
     }
 
