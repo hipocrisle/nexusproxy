@@ -4,6 +4,7 @@
 pub mod config;
 pub mod conns;
 pub mod domain;
+pub mod engine_stats;
 pub mod http_in;
 pub mod failures;
 pub mod health;

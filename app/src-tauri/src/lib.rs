@@ -22,7 +22,6 @@ pub struct Status {
     http_port: u16,
     socks_port: u16,
     system_on: bool,
-    discovering: bool,
     auto_reconnect: bool,
     minimize_to_tray: bool,
     enable_on_start: bool,
@@ -66,7 +65,6 @@ fn status(app: State<App>) -> Status {
                 } else {
                     e.system_proxy_is_ours()
                 },
-                discovering: core::report::session_active(),
                 auto_reconnect: c.auto_reconnect,
                 minimize_to_tray: c.minimize_to_tray,
                 enable_on_start: c.enable_on_start,
@@ -83,7 +81,7 @@ fn status(app: State<App>) -> Status {
         }
         None => Status {
             running: false, upstream: String::new(), http_port: 0, socks_port: 0,
-            system_on: false, discovering: false,
+            system_on: false,
             auto_reconnect: true, minimize_to_tray: true, enable_on_start: true,
             tunnel_mode: false,
             os: std::env::consts::OS.to_string(),
@@ -288,19 +286,30 @@ fn check(app: State<App>, hosts: Vec<String>) -> Result<Vec<Verdict>, String> {
 
 /// Что открыто прямо сейчас — колонки как в Proxifier.
 #[tauri::command]
-fn conns_active() -> Vec<core::conns::Conn> {
+fn conns_active(app: State<App>) -> Vec<core::conns::Conn> {
+    // ⛔ В режиме перехвата программы обращаются не к нам, и свои записи
+    // пусты: человек видел пустую вкладку при работающем туннеле.
+    // Спрашиваем движок — он ведёт учёт сам.
+    if tunnel_on(&app) {
+        return core::engine_stats::active();
+    }
     core::conns::active()
 }
 
 /// Сколько куда ушло, по доменам.
 #[tauri::command]
-fn conns_totals() -> Vec<core::conns::DomainStat> {
+fn conns_totals(app: State<App>) -> Vec<core::conns::DomainStat> {
+    if tunnel_on(&app) {
+        return core::engine_stats::totals();
+    }
     core::conns::totals()
 }
 
 #[tauri::command]
-fn conns_reset() {
-    core::conns::reset_totals()
+fn conns_reset(app: State<App>) {
+    core::engine_stats::reset();
+    let _ = app;
+    core::conns::reset_totals();
 }
 
 /// Сделать прокси основным — одним нажатием, без правки правил.
@@ -690,20 +699,8 @@ fn journal_clear() {
     core::journal::clear()
 }
 
-#[tauri::command]
-fn discovery_start() {
-    core::report::start_session()
-}
 
-#[tauri::command]
-fn discovery_live() -> Vec<core::report::Candidate> {
-    core::report::live_candidates()
-}
 
-#[tauri::command]
-fn discovery_stop() -> Option<core::report::SessionResult> {
-    core::report::finish_session()
-}
 
 #[tauri::command]
 fn system_proxy(app: State<App>, on: bool) -> Result<(), String> {
@@ -915,6 +912,14 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
 /// старым списком — человек добавляет приложение, видит его в окне, а
 /// трафик идёт мимо. Так и было: добавленный браузер в туннель не
 /// попадал вовсе.
+/// Работает ли сейчас перехват — от этого зависит, чьи счётчики верны.
+fn tunnel_on(app: &State<App>) -> bool {
+    match engine(app) {
+        Ok(e) => { let m = e.cfg.lock().unwrap().tunnel_mode; m }
+        Err(_) => false,
+    }
+}
+
 fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
     let path = app.path.lock().unwrap().clone();
     let dir = core::tunnel_dir(&path);
@@ -1148,32 +1153,6 @@ async fn settings_import(app: AppHandle, path: String) -> Result<Vec<String>, St
     Ok(missing)
 }
 
-/// Что прошло через туннель — для «Соединений» и «Подбора доменов».
-///
-/// ⛔ В TUN режиме программы не обращаются к нашему входу, поэтому наши
-/// собственные записи пусты. Берём из журнала движка.
-/// ⛔ Обязательно async + отдельный поток: чтение и разбор журнала —
-/// работа с диском, и в потоке окна она подвешивала программу.
-#[tauri::command]
-async fn tunnel_seen(app: AppHandle) -> Vec<core::tunnel::Seen> {
-    let (path, tunnel) = {
-        let state = app.state::<App>();
-        let path = state.path.lock().unwrap().clone();
-        let tunnel = match engine(&state) {
-            Ok(e) => { let m = e.cfg.lock().unwrap().tunnel_mode; m }
-            Err(_) => false,
-        };
-        (path, tunnel)
-    };
-    if !tunnel {
-        return Vec::new();
-    }
-    tokio::task::spawn_blocking(move || {
-        core::tunnel::seen_connections(&core::tunnel_dir(&path), 200)
-    })
-    .await
-    .unwrap_or_default()
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1278,6 +1257,20 @@ pub fn run() {
 
             let state = app.state::<App>();
             *state.path.lock().unwrap() = path_s.clone();
+
+            // ⛔ Статистику перехвата забираем в СВОЁМ потоке, раз в две
+            // секунды. Спрашивать движок из окна нельзя: это обращение по
+            // сети, и окно на нём замирает.
+            {
+                let dir = core::tunnel_dir(&path_s);
+                std::thread::spawn(move || loop {
+                    if core::tunnel::is_alive(&dir) {
+                        let _ = core::engine_stats::refresh(&dir);
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                });
+            }
+
             let rt = tokio::runtime::Runtime::new()?;
             match rt.block_on(core::Engine::start(cfg, &path_s)) {
                 Ok(e) => {
@@ -1349,11 +1342,10 @@ pub fn run() {
             proxies_health, upstream_set_default, failures_recent, failures_clear,
             override_set, override_clear, overrides_list, proxies_in_use,
             sub_state, sub_install, sub_load, sub_apply, sub_disable,
-            discovery_start, discovery_live, discovery_stop,
             system_proxy, settings_save, set_flag, quit,
             apps_list, app_save, app_remove, app_launch,
             tunnel_state, tunnel_install, tunnel_set, tunnel_log,
-            settings_export, settings_import, tunnel_seen
+            settings_export, settings_import
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

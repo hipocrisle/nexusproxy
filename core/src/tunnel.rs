@@ -317,6 +317,7 @@ pub fn build_config_with(
         }
     }
 
+    let api = api_access(dir_hint);
     serde_json::json!({
         // ⛔ DNS оставляем системе. Туннель по умолчанию отвечает на
         // запросы сам, и внутренние имена — контроллеры домена, файловые
@@ -364,6 +365,13 @@ pub fn build_config_with(
             // Программа при этом не сообщает об ошибке, а виснет.
             "mtu": 1400
         }],
+        // ⛔ Живая статистика. Слушает только свою машину и под паролем.
+        "experimental": {
+            "clash_api": {
+                "external_controller": format!("127.0.0.1:{}", api.port),
+                "secret": api.secret
+            }
+        },
         "outbounds": outbounds,
         "route": {
             // ⛔ Движок обязан знать, каким сервером имён пользоваться
@@ -860,6 +868,55 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+/// Где у движка спрашивать живую статистику.
+///
+/// ⛔ В режиме перехвата программы обращаются не к нам, а прямо в сеть:
+/// свои счётчики остаются пустыми, и человек видит нули при работающем
+/// туннеле. Движок ведёт учёт сам — домен, программу, трафик в обе
+/// стороны, сработавшее правило, — и это единственный источник правды.
+pub fn api_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("api.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Api {
+    pub port: u16,
+    pub secret: String,
+}
+
+/// ⛔ Пароль обязателен. Через это же API движком можно управлять, а
+/// слушает он на своей машине: без пароля любая программа на компьютере
+/// получила бы над перехватом полную власть.
+pub fn api_access(dir: &Path) -> Api {
+    if let Ok(t) = std::fs::read_to_string(api_path(dir)) {
+        if let Ok(a) = serde_json::from_str::<Api>(&t) {
+            if a.port != 0 && !a.secret.is_empty() {
+                return a;
+            }
+        }
+    }
+    let a = Api { port: free_port(), secret: fresh_secret() };
+    let _ = std::fs::write(api_path(dir), serde_json::to_vec_pretty(&a).unwrap_or_default());
+    a
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(9191)
+}
+
+fn fresh_secret() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(std::process::id().to_le_bytes());
+    h.update(format!("{:?}", std::time::SystemTime::now()).as_bytes());
+    h.update((&h as *const _ as usize).to_le_bytes());
+    format!("{:x}", h.finalize())[..32].to_string()
 }
 
 /// Отпечаток настроек — по нему видно, что их изменили.
@@ -1639,139 +1696,6 @@ fn tail_of(path: &Path, bytes: u64) -> Option<String> {
     } else {
         text
     })
-}
-
-/// Одно соединение, как его видел движок.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Seen {
-    /// Имя узла, если движок его распознал, иначе адрес.
-    pub host: String,
-    /// Куда ушло: имя прокси или «напрямую».
-    pub via: String,
-    /// Через прокси или нет — для окраски в окне.
-    pub proxied: bool,
-}
-
-/// Что прошло через туннель — из журнала движка.
-///
-/// ⛔ В TUN режиме программы не обращаются к нашему входу, поэтому
-/// «Соединения», «Журнал» и «Подбор доменов» оставались пустыми: им
-/// неоткуда было брать данные. Человек видел пустые вкладки и решал,
-/// что всё сломалось. Читаем журнал движка — там есть и имя узла, и
-/// решение по нему.
-pub fn seen_connections(dir: &Path, limit: usize) -> Vec<Seen> {
-    // ⛔ Читаем только хвост. Журнал движка растёт до мегабайтов за
-    // минуты, и чтение целиком подвешивало окно — а вызывается это
-    // каждые несколько секунд.
-    let text = match tail_of(&engine_log_path(dir), 512 * 1024) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
-    // Движок пишет решение и имя узла разными строками, связывая их
-    // номером соединения — собираем по нему.
-    let mut host_of: std::collections::HashMap<String, String> = Default::default();
-    let mut via_of: std::collections::HashMap<String, (String, bool)> = Default::default();
-    let mut order: Vec<String> = Vec::new();
-
-    for line in text.lines() {
-        let Some(id) = line.split('[').nth(1).and_then(|r| r.split(']').next()) else { continue };
-        let id = id.split_whitespace().next().unwrap_or(id).to_string();
-
-        if let Some(rest) = line.split("domain: ").nth(1) {
-            let host = rest.split(&[',', ' '][..]).next().unwrap_or("").to_string();
-            if !host.is_empty() {
-                host_of.insert(id.clone(), host);
-            }
-        } else if let Some(rest) = line.split("connection to ").nth(1) {
-            let addr = rest.trim().trim_end_matches('.').to_string();
-            host_of.entry(id.clone()).or_insert(addr);
-        }
-
-        if let Some(rest) = line.split("=> route(").nth(1) {
-            let via = rest.split(')').next().unwrap_or("").to_string();
-            let proxied = via != "direct";
-            via_of.insert(id.clone(), (
-                if proxied { via } else { "напрямую".into() }, proxied));
-        }
-
-        if !order.contains(&id) {
-            order.push(id);
-        }
-    }
-
-    let mut out: Vec<Seen> = order.iter().rev()
-        .filter_map(|id| {
-            let host = host_of.get(id)?.clone();
-            // ⛔ Своё же обращение к прокси в списке только мешает:
-            // человек ищет там свои программы, а не нашу кухню.
-            if host.contains(":1081") || host.starts_with("172.19.0.") {
-                return None;
-            }
-            let (via, proxied) = via_of.get(id)
-                .cloned()
-                .unwrap_or_else(|| ("напрямую".to_string(), false));
-            Some(Seen { host, via, proxied })
-        })
-        .collect();
-    out.dedup_by(|a, b| a.host == b.host && a.via == b.via);
-    out.truncate(limit);
-    out
-}
-
-#[cfg(test)]
-mod seen_tests {
-    use super::*;
-
-    fn write(dir: &Path, text: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(engine_log_path(dir), text).unwrap();
-    }
-
-    fn tmp(who: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("np-seen-{}-{who}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    /// ⛔ В TUN режиме программы не обращаются к нашему входу, и все
-    /// списки оставались пустыми — человек решал, что всё сломалось.
-    #[test]
-    fn собираем_имя_и_решение_по_соединению() {
-        let d = tmp("basic");
-        write(&d, "\
-+0300 DEBUG [111 0ms] router: sniffed protocol: tls, domain: myip.com
-+0300 DEBUG [111 0ms] router: match[4] process_path_regex=[x] => route(основной)
-+0300 INFO [111 0ms] inbound/tun[tun-in]: inbound connection to 1.2.3.4:443
-");
-        let seen = seen_connections(&d, 10);
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].host, "myip.com");
-        assert_eq!(seen[0].via, "основной");
-        assert!(seen[0].proxied);
-    }
-
-    #[test]
-    fn ушедшее_напрямую_видно_как_напрямую() {
-        let d = tmp("direct");
-        write(&d, "\
-+0300 DEBUG [222 0ms] router: sniffed protocol: tls, domain: discord.com
-+0300 DEBUG [222 0ms] router: match[1] ip_is_private=true => route(direct)
-");
-        let seen = seen_connections(&d, 10);
-        assert_eq!(seen[0].host, "discord.com");
-        assert_eq!(seen[0].via, "напрямую");
-        assert!(!seen[0].proxied);
-    }
-
-    /// ⛔ Наши собственные обращения к прокси в списке только мешают:
-    /// человек ищет там свои программы, а не нашу кухню.
-    #[test]
-    fn своё_обращение_к_прокси_не_показываем() {
-        let d = tmp("self");
-        write(&d, "+0300 INFO [333 0ms] inbound/tun[tun-in]: inbound connection to 172.31.211.1:1081\n");
-        assert!(seen_connections(&d, 10).is_empty());
-    }
 }
 
 #[cfg(test)]
