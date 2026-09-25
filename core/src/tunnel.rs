@@ -493,8 +493,8 @@ mod tests {
         assert!(names_at < procs_at,
                 "запрос имени по TCP уйдёт в прокси, и программа повиснет: {names_at} !< {procs_at}");
         assert!(subnet_at < private_at,
-                "внутренний ресурс через прокси невозможен — решает правило «private_at адреса»");
-        assert!(private_at < rules.len(), "правило «private_at адреса» потерялось");
+                "внутренний ресурс через прокси невозможен — решает правило «свои адреса»");
+        assert!(private_at < rules.len(), "правило «свои адреса» потерялось");
     }
 
     /// ⛔ Когда present страны подписки, помощник программы обязан идти
@@ -518,7 +518,7 @@ mod tests {
             .unwrap_or(false)).expect("нет правила для своего хозяйства");
         let domain_at = rules.iter().position(|r| r.get("domain_suffix").is_some())
             .unwrap_or(usize::MAX);
-        assert!(ours < domain_at, "ours хозяйство разбирается позже правил — возможен круг");
+        assert!(ours < domain_at, "своё хозяйство разбирается позже правил — возможен круг");
         assert_eq!(rules[ours]["outbound"], "direct");
     }
 
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn программа_в_корне_диска_не_забирает_весь_диск() {
         assert_eq!(path_prefix("D:\\game.exe"), None, "под правило попал весь диск D");
-        assert_eq!(path_prefix("/app"), None, "под правило попал весь is_root");
+        assert_eq!(path_prefix("/app"), None, "под правило попал весь корень");
         assert_eq!(path_prefix("C:\\Program Files\\App\\app.exe").as_deref(),
                    Some("C:\\Program Files\\App"));
     }
@@ -1398,7 +1398,7 @@ mod path_tests {
     fn особые_знаки_пути_экранируются() {
         let re = path_regex(r"C:\Program Files\Cursor.app");
         assert!(re.contains(r"Cursor\.app"), "точка должна быть экранирована: {re}");
-        assert!(!re.contains(r"\P"), "обратная косая не должна попасть как present: {re}");
+        assert!(!re.contains(r"\P"), "обратная косая не должна попасть как есть: {re}");
     }
 }
 
@@ -1455,7 +1455,7 @@ mod domain_tests {
             r["domain_suffix"].as_array().map_or(false, |a| a.iter().any(|x| x == "grid.gg"))
                 && r["outbound"] == "основной"
         });
-        assert!(hit, "domain_at из правил обязан идти через прокси и в туннеле");
+        assert!(hit, "домен из правил обязан идти через прокси и в туннеле");
     }
 
     #[test]
@@ -1470,7 +1470,7 @@ mod domain_tests {
             r["ip_cidr"].as_array().map_or(false, |a| a.iter().any(|x| x == "10.0.0.0/8"))
                 && r["outbound"] == "основной"
         });
-        assert!(hit, "subnet_at из правил обязана сохраниться");
+        assert!(hit, "подсеть из правил обязана сохраниться");
     }
 
     /// Служебные записи списка (группы) адресами не являются.
@@ -1483,7 +1483,7 @@ mod domain_tests {
             &[corp()],
         );
         let has = rules_of(&c).iter().any(|r| r.get("domain_suffix").is_some());
-        assert!(!has, "служебной записи в настройках движка не at");
+        assert!(!has, "служебной записи в настройках движка нет");
     }
 }
 
@@ -1497,8 +1497,8 @@ pub fn diagnosis(dir: &Path) -> String {
     let say = |o: &mut String, name: &str, p: std::path::PathBuf| {
         let mark = if p.exists() {
             match std::fs::metadata(&p) {
-                Ok(m) => format!("present, {} Б", m.len()),
-                Err(_) => "present".into(),
+                Ok(m) => format!("есть, {} Б", m.len()),
+                Err(_) => "есть".into(),
             }
         } else {
             "НЕТ".into()
@@ -1507,7 +1507,7 @@ pub fn diagnosis(dir: &Path) -> String {
     };
 
     out.push_str("── файлы ──\n");
-    say(&mut out, "закрытая folder", crate::tunnel_service::secure_dir(dir));
+    say(&mut out, "закрытая папка", crate::tunnel_service::secure_dir(dir));
     say(&mut out, "копия для службы", crate::tunnel_service::runner_path(dir));
     say(&mut out, "движок", engine_at_hand(dir));
     say(&mut out, "настройки", config_path(dir));
@@ -2005,7 +2005,7 @@ mod api_tests {
             serde_json::to_vec(&Api { port: busy, secret: "x".repeat(32) }).unwrap()).unwrap();
 
         let a = api_access(&dir);
-        assert_ne!(a.port, busy, "остался занятый port — движок не поднимется");
+        assert_ne!(a.port, busy, "остался занятый порт — движок не поднимется");
         drop(held);
         let _ = std::fs::remove_file(api_path(&dir));
     }
@@ -2019,7 +2019,7 @@ mod api_tests {
         let _ = std::fs::remove_file(api_path(&dir));
         let first = api_access(&dir);
         let again = api_access(&dir);
-        assert_eq!(first.port, again.port, "port меняется на ровном месте");
+        assert_eq!(first.port, again.port, "порт меняется на ровном месте");
         assert_eq!(first.secret, again.secret);
         let _ = std::fs::remove_file(api_path(&dir));
     }
