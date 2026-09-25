@@ -431,6 +431,24 @@ pub fn stop_in(dir: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// ⛔ Установка не должна требовать того, что сама же и создаёт.
+    /// Проверка «движок на месте» смотрела в закрытую папку, куда он
+    /// попадает ИМЕННО при установке, — и переустановка обрывалась на
+    /// первой строке, молча и навсегда.
+    #[test]
+    fn установка_не_требует_того_что_сама_создаёт() {
+        let dir = std::env::temp_dir().join(format!("np-inst-{}", crate::tunnel::random_tag()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // движок скачан, но в закрытую папку ещё не перенесён
+        std::fs::write(crate::tunnel::downloaded_engine(&dir), b"engine").unwrap();
+        assert!(!crate::tunnel::binary_path(&dir).is_file(), "в закрытой папке его быть не должно");
+
+        let ошибка = install(&dir).unwrap_err();
+        assert!(!ошибка.contains("ещё не скачан"),
+                "установка отказалась, хотя движок скачан: {ошибка}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ⛔ Всё, что исполняется от имени системы, обязано лежать в папке,
     /// закрытой от записи. Иначе подмена файла даёт выполнение с её
     /// правами после перезагрузки.
@@ -825,8 +843,17 @@ pub fn runner_path(dir: &Path) -> std::path::PathBuf {
 const SERVICE_REVISION: u32 = 6;
 
 pub fn install(dir: &Path) -> Result<(), String> {
-    if !crate::tunnel::binary_path(dir).is_file() {
-        return Err("движок перехвата ещё не скачан".into());
+    // ⛔ Проверяем СКАЧАННЫЙ движок, а не тот, что в закрытой папке:
+    // в закрытую его переносит сама эта установка. Спрашивая про него
+    // здесь, мы обрывались на первой же строке — «движок ещё не
+    // скачан», — и служба не переустанавливалась НИКОГДА. Именно из-за
+    // этого защита прав не доезжала до людей: программа видела, что
+    // служба устарела, бралась её ставить и молча выходила.
+    if !crate::tunnel::downloaded_engine(dir).is_file()
+        && !crate::tunnel::binary_path(dir).is_file()
+    {
+        return Err(format!("движок перехвата ещё не скачан: нет {}",
+                           crate::tunnel::downloaded_engine(dir).display()));
     }
     let me = std::env::current_exe()
         .map_err(|e| format!("не найти себя: {e}"))?;

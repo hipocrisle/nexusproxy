@@ -804,7 +804,6 @@ fn unpack_tar_gz(body: &[u8], dest: &Path) -> Result<bool, String> {
 
 use std::sync::Mutex;
 static CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
-static STARTING: Mutex<()> = Mutex::new(());
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn log_path(dir: &Path) -> PathBuf {
@@ -864,68 +863,6 @@ pub fn stop() {
     }
 }
 
-/// Поднять перехват.
-///
-/// ⛔ Нужны права администратора: движок создаёт сетевой интерфейс.
-/// Без них он просто не запустится, и в журнале будет отказ доступа —
-/// человеку надо показать это прямо, а не молчать.
-pub fn start(dir: &Path, routes: &[Route], upstreams: &[Upstream]) -> Result<(), String> {
-    let _one_at_a_time = STARTING.lock().unwrap_or_else(|e| e.into_inner());
-    stop();
-    *LAST_ERROR.lock().unwrap() = None;
-
-    if routes.is_empty() {
-        return Err("нет ни одного приложения — перехватывать нечего".into());
-    }
-    let bin = binary_path(dir);
-    if !bin.is_file() {
-        return Err("движок перехвата ещё не скачан".into());
-    }
-
-    let cfg_path = dir.join("tunnel-config.json");
-    let cfg = build_config(routes, upstreams);
-    std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap())
-        .map_err(|e| format!("не записать настройки: {e}"))?;
-
-    // ⛔ Вывод движка обязан куда-то писаться: иначе его отказ выглядит
-    // как «перехват не включился» без единой подсказки почему.
-    let log = std::fs::File::create(log_path(dir))
-        .map_err(|e| format!("не создать журнал: {e}"))?;
-    let log_err = log.try_clone().map_err(|e| format!("не создать журнал: {e}"))?;
-
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.arg("run").arg("-c").arg(&cfg_path)
-       .current_dir(dir)
-       .stdout(log).stderr(log_err);
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // без чёрного окна
-    }
-
-    let child = cmd.spawn().map_err(|e| format!("не запустить движок: {e}"))?;
-    *CHILD.lock().unwrap() = Some(child);
-
-    // Даём подняться и проверяем, что не упал сразу: чаще всего это
-    // нехватка прав, и человеку надо сказать именно это.
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    if !is_running() {
-        let tail = std::fs::read_to_string(log_path(dir)).unwrap_or_default();
-        let why = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-        *LAST_ERROR.lock().unwrap() = Some(why.clone());
-        return Err(if why.to_lowercase().contains("permission")
-                      || why.to_lowercase().contains("denied")
-                      || why.contains("отказ") {
-            "не хватает прав: перехват создаёт сетевой интерфейс, нужен запуск от администратора".into()
-        } else if why.is_empty() {
-            "движок перехвата не запустился".into()
-        } else {
-            format!("движок перехвата не запустился: {why}")
-        });
-    }
-    Ok(())
-}
 
 /// Запустить движок с правами администратора.
 ///
