@@ -67,14 +67,10 @@ jobs:
         # результаты печатаются пачкой в конце, и зависший тест не
         # назвать — работа просто стоит, пока её не снимут. Так в
         # журнале видно, на каком имени всё остановилось.
-        # ⛔ И со сроком: иначе зависший тест держит сборку до
-        # ограничения работы.
-        run: |
-          timeout 600 cargo test --release --manifest-path core/Cargo.toml \
-            -- --test-threads=1 --nocapture || {
-              echo "::error::тесты на macOS не уложились в срок или упали"
-              exit 1
-            }
+        # ⛔ Срок задаём средствами самой сборки: команды `timeout` на
+        # макбуке нет, и шаг падал сразу же.
+        timeout-minutes: 12
+        run: cargo test --release --manifest-path core/Cargo.toml -- --test-threads=1 --nocapture
 
       - name: Зависимости интерфейса
         working-directory: app
