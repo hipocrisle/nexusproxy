@@ -65,13 +65,10 @@ fn route_of(chains: &[String]) -> (String, String) {
 }
 
 fn snapshot(api: &crate::tunnel::Api) -> Result<Vec<Raw>, String> {
-    let url = format!("http://127.0.0.1:{}/connections", api.port);
-    let body: Snapshot = ureq::get(&url)
-        .header("Authorization", &format!("Bearer {}", api.secret))
-        .call()
-        .map_err(|e| format!("движок не отвечает: {e}"))?
-        .body_mut()
-        .read_json()
+    // ⛔ Со сроком ожидания: иначе поток опроса замирает навсегда, если
+    // на том конце соединение принимают, но не отвечают.
+    let text = crate::tunnel::api_get(api, "connections")?;
+    let body: Snapshot = serde_json::from_str(&text)
         .map_err(|e| format!("движок ответил непонятным: {e}"))?;
     Ok(body.connections.unwrap_or_default())
 }
