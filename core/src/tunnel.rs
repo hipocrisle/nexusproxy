@@ -247,6 +247,29 @@ pub fn build_config_with(
         }));
     }
 
+    // ⛔ Своё хозяйство — всегда напрямую, и раньше всех правил.
+    //
+    // Через туннель ходит и сама программа, и её вспомогательные части.
+    // Стоит какому-нибудь правилу совпасть с адресом их сервера — и
+    // получается петля: программа идёт в туннель, туннель отдаёт её в
+    // прокси, а тот возвращает обратно. Обход был сделан только для
+    // адреса самого прокси, да и то лишь когда он задан числом.
+    let своё: Vec<String> = [
+        dir_hint.to_string_lossy().to_string(),
+        std::env::current_exe().map(|p| p.parent().map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default()).unwrap_or_default(),
+    ].iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| path_regex(p))
+        .collect();
+    if !своё.is_empty() {
+        rules.push(serde_json::json!({
+            "process_path_regex": своё,
+            "action": "route",
+            "outbound": "direct"
+        }));
+    }
+
     // приложения — каждое в свой прокси
     let mut by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
     for r in routes {
@@ -468,6 +491,28 @@ mod tests {
         assert!(подсеть < свои,
                 "внутренний ресурс через прокси невозможен — решает правило «свои адреса»");
         assert!(свои < rules.len(), "правило «свои адреса» потерялось");
+    }
+
+    /// ⛔ Трафик самой программы обязан идти мимо прокси, иначе при
+    /// совпадении правила получается петля: программа → туннель →
+    /// прокси → туннель.
+    #[test]
+    fn своё_хозяйство_идёт_напрямую() {
+        let c = build_config_with(
+            Path::new("/данные/tunnel"),
+            &[],
+            &[DomainRule { pattern: "hipogas.org".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let rules = rules_of(&c);
+        let своё = rules.iter().position(|r| r["process_path_regex"].as_array()
+            .map(|a| a.iter().any(|v| v.as_str().unwrap_or("").contains("tunnel")))
+            .unwrap_or(false));
+        let домен = rules.iter().position(|r| r.get("domain_suffix").is_some());
+        let своё = своё.expect("нет правила для своего хозяйства");
+        assert!(своё < домен.unwrap_or(usize::MAX),
+                "своё хозяйство разбирается позже правил человека — возможна петля");
+        assert_eq!(rules[своё]["outbound"], "direct");
     }
 
     /// ⛔ Программа в корне диска не должна заворачивать весь диск.
@@ -1296,7 +1341,7 @@ mod path_tests {
             &[corp()],
         );
         let by_path = c["route"]["rules"].as_array().unwrap().iter()
-            .find(|r| r.get("process_path_regex").is_some())
+            .find(|r| r.get("process_path_regex").is_some() && r["outbound"] != "direct")
             .expect("правило по пути должно быть");
         let re = by_path["process_path_regex"][0].as_str().unwrap();
         assert!(re.contains("Cursor"), "{re}");
@@ -1473,8 +1518,11 @@ pub fn diagnosis(dir: &Path) -> String {
 
     out.push_str("\n── состояние ──\n");
     out.push_str(&format!("служба: {:?}\n", crate::tunnel_service::state_in(dir)));
-    out.push_str(&format!("движок в списке процессов: {}\n",
-        if engine_running(dir) { "да" } else { "нет" }));
+    // ⛔ Не по списку процессов: движок принадлежит системе и человеку
+    // в нём не виден — при работающем перехвате тут неизменно значилось
+    // «нет», и разбор уходил в сторону.
+    out.push_str(&format!("движок работает: {}\n",
+        if is_alive(dir) { "да" } else { "нет" }));
 
     // ⛔ Какие процессы движок РЕАЛЬНО увидел. Если приложения тут нет,
     // значит система не отдала ему путь — и никакое правило по процессу
@@ -1658,7 +1706,8 @@ mod and_tests {
 
         assert!(rules.iter().any(|r| r.get("process_name").is_some()),
                 "правило по имени должно быть");
-        assert!(rules.iter().any(|r| r.get("process_path_regex").is_some()),
+        assert!(rules.iter().any(|r| r.get("process_path_regex").is_some()
+                                     && r["outbound"] != "direct"),
                 "правило по пути должно быть");
     }
 }
@@ -1844,7 +1893,7 @@ mod helper_tests {
                          user: None, password: None }],
         );
         let by_path = c["route"]["rules"].as_array().unwrap().iter()
-            .find(|r| r.get("process_path_regex").is_some())
+            .find(|r| r.get("process_path_regex").is_some() && r["outbound"] != "direct")
             .expect("правило по пути должно быть");
         let all: Vec<&str> = by_path["process_path_regex"].as_array().unwrap()
             .iter().filter_map(|x| x.as_str()).collect();
