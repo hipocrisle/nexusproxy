@@ -22,6 +22,7 @@ static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 /// программы среди них не найти: причину поломки приходилось искать
 /// построчным поиском по мегабайтам.
 static TRAFFIC: Mutex<Option<Sink>> = Mutex::new(None);
+static TRAFFIC_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Журнал и файл журнала — общие на всю программу, поэтому тесты,
 /// которые их трогают, выполняются по одному.
@@ -37,22 +38,44 @@ pub fn open(path: PathBuf) -> std::io::Result<()> {
     // соседний файл под записи о соединениях
     // ⛔ Имя латиницей: путь попадает в команды разбора, а кириллица в
     // них ведёт себя по-разному в разных оболочках и кодировках.
-    let beside = path.with_file_name("nexusproxy-connections.log");
-    if let Ok(f) = OpenOptions::new().create(true).append(true).open(&beside) {
-        let w = f.metadata().map(|m| m.len()).unwrap_or(0);
-        *TRAFFIC.lock().unwrap() = Some(Sink { path: beside, file: f, written: w });
-    }
-    *SINK.lock().unwrap() = Some(Sink { path, file, written });
+    // ⛔ Файл соединений открываем при первой записи, а не сейчас:
+    // журнал открывает и служба перехвата, которая соединений не
+    // пишет, — рядом оставался пустой файл, сбивающий с толку.
+    *TRAFFIC_PATH.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(path.with_file_name("nexusproxy-connections.log"));
+
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { path, file, written });
     Ok(())
 }
 
 /// Запись о соединении — в отдельный файл.
 pub fn traffic(stamp: &str, text: &str) {
+    {
+        let mut g = TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            let Some(path) = TRAFFIC_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            else { return };
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => {
+                    let w = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    *g = Some(Sink { path, file: f, written: w });
+                }
+                // ⛔ Молчать нельзя: человек будет искать соединения в
+                // пустом файле и не поймёт, почему их там нет.
+                Err(e) => {
+                    drop(g);
+                    line(&now_stamp(),
+                         &format!("не открыть журнал соединений {}: {e}", path.display()));
+                    return;
+                }
+            }
+        }
+    }
     write_to(&TRAFFIC, stamp, text);
 }
 
 pub fn path() -> Option<PathBuf> {
-    SINK.lock().unwrap().as_ref().map(|s| s.path.clone())
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|s| s.path.clone())
 }
 
 /// Отметка времени по местным часам — чтобы в логе было то же время,

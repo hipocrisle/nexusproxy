@@ -20,6 +20,7 @@ pub mod proc;
 pub mod pump;
 pub mod report;
 pub mod rules;
+pub mod selfcheck;
 pub mod socks_in;
 pub mod subscription;
 pub mod sysproxy;
@@ -74,7 +75,7 @@ fn build_pool(cfg: &config::Config) -> upstream::Pool {
     for u in &cfg.upstreams {
         m.insert(u.name.clone(), u.clone());
     }
-    // пустое name — «через тот, что по умолчанию»
+    // пустое имя — «через тот, что по умолчанию»
     if let Some(d) = cfg.default_proxy() {
         m.insert(String::new(), d.clone());
     }
@@ -233,7 +234,7 @@ impl Engine {
         });
 
         // Сторож проверяет КАЖДЫЙ прокси из настроек, а не только основной:
-        // иначе о том, что fallback лёг, узнаёшь только когда он понадобился.
+        // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
         let watch_routing = routing.clone();
         let watch_recheck = recheck.clone();
         let watch_cfg = e.cfg.clone();
@@ -293,7 +294,7 @@ impl Engine {
 
                 let list: Vec<upstream::Upstream> = {
                     let r = watch_routing.read().unwrap();
-                    // пустое name — дубль основного, его пропускаем
+                    // пустое имя — дубль основного, его пропускаем
                     r.pool.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
                 };
                 // ⛔ Имя основного прокси берём заново на каждом круге.
@@ -445,7 +446,7 @@ impl Engine {
             }
             c.upstreams.retain(|u| !u.from_subscription);
             for (i, p) in profiles.iter().enumerate() {
-                // name может совпасть с уже заведённым вручную — не затираем чужое
+                // имя может совпасть с уже заведённым вручную — не затираем чужое
                 let name = if c.upstreams.iter().any(|u| u.name == p.name) {
                     format!("{} (подписка)", p.name)
                 } else {
@@ -579,6 +580,7 @@ impl Engine {
                 },
                 address: u.address.clone(), port: u.port,
                 user: u.user.clone(), password: u.password.clone(),
+                from_subscription: u.from_subscription,
             })
             .collect();
         drop(c);

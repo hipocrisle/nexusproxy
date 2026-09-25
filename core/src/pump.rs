@@ -132,7 +132,7 @@ mod tests {
         let ours_addr = ours.local_addr().unwrap();
         let client_task = tokio::spawn(async move {
             let mut c = tokio::net::TcpStream::connect(ours_addr).await.unwrap();
-            // шлём много, чтобы pumping встала в записи
+            // шлём много, чтобы перекачка встала в записи
             let chunk = vec![7u8; 1024 * 1024];
             for _ in 0..40 {
                 if c.write_all(&chunk).await.is_err() {

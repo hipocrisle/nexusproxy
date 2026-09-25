@@ -169,7 +169,7 @@ fn from_base64(s: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "после раскодирования получился не текст".into())
 }
 
-/// vless://uuid@host:port?параметры#имя
+/// vless://uuid@host:порт?параметры#имя
 fn from_vless(link: &str) -> Result<Profile, String> {
     let rest = &link["vless://".len()..];
     let (main, name) = match rest.split_once('#') {
