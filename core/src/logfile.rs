@@ -18,6 +18,11 @@ struct Sink {
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
 
+/// ⛔ Соединения — в СВОЙ файл. Их тысячи в час, и записи о работе
+/// программы среди них не найти: причину поломки приходилось искать
+/// построчным поиском по мегабайтам.
+static TRAFFIC: Mutex<Option<Sink>> = Mutex::new(None);
+
 /// Журнал и файл журнала — общие на всю программу, поэтому тесты,
 /// которые их трогают, выполняются по одному.
 #[cfg(test)]
@@ -29,8 +34,19 @@ pub fn open(path: PathBuf) -> std::io::Result<()> {
     }
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // соседний файл под записи о соединениях
+    let рядом = path.with_file_name("соединения.log");
+    if let Ok(f) = OpenOptions::new().create(true).append(true).open(&рядом) {
+        let w = f.metadata().map(|m| m.len()).unwrap_or(0);
+        *TRAFFIC.lock().unwrap() = Some(Sink { path: рядом, file: f, written: w });
+    }
     *SINK.lock().unwrap() = Some(Sink { path, file, written });
     Ok(())
+}
+
+/// Запись о соединении — в отдельный файл.
+pub fn traffic(stamp: &str, text: &str) {
+    write_to(&TRAFFIC, stamp, text);
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -65,7 +81,11 @@ pub fn now_stamp() -> String {
 /// Строка журнала. Время подставляет вызывающий: ядро не тянет
 /// зависимостей ради форматирования даты.
 pub fn line(stamp: &str, text: &str) {
-    let mut g = SINK.lock().unwrap();
+    write_to(&SINK, stamp, text);
+}
+
+fn write_to(sink: &Mutex<Option<Sink>>, stamp: &str, text: &str) {
+    let mut g = sink.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = g.as_mut() else { return };
     let msg = format!("{stamp} {text}\n");
     if s.file.write_all(msg.as_bytes()).is_ok() {

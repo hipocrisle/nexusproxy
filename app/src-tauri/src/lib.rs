@@ -743,6 +743,8 @@ fn journal_clear() {
 
 #[tauri::command]
 fn system_proxy(app: State<App>, on: bool) -> Result<(), String> {
+    core::logfile::line(&core::logfile::now_stamp(),
+        &format!("человек {} работу программы", if on { "включил" } else { "выключил" }));
     let e = engine(&app)?;
     // ⛔ Одна кнопка на всё. Способ выбран в настройках, здесь только
     // «работает / не работает»: два независимых выключателя человеку не
@@ -914,6 +916,9 @@ fn apps_list(app: State<App>) -> Vec<core::launch::App> {
 
 #[tauri::command]
 fn app_save(state: State<App>, item: core::launch::App) -> Result<String, String> {
+    core::logfile::line(&core::logfile::now_stamp(),
+        &format!("добавляю программу «{}» через «{}»: {}",
+                 item.name, if item.via.is_empty() { "основной" } else { &item.via }, item.path));
     if item.path.trim().is_empty() {
         return Err("не указан путь к программе".into());
     }
@@ -947,6 +952,7 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<String, String
 
 #[tauri::command]
 fn app_remove(state: State<App>, path: String) -> Result<String, String> {
+    core::logfile::line(&core::logfile::now_stamp(), &format!("убираю программу: {path}"));
     let e = engine(&state)?;
     e.cfg.lock().unwrap().apps.retain(|a| a.path != path);
     e.apply_and_save()?;
@@ -1064,6 +1070,9 @@ async fn tunnel_install(app: AppHandle) -> Result<String, String> {
 /// Включить или выключить перехват.
 #[tauri::command]
 async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
+    core::logfile::line(&core::logfile::now_stamp(),
+        &format!("человек выбрал способ работы: {}",
+                 if on { "перехват" } else { "режим прокси" }));
     let (dir, routes, domains, ups) = {
         let state = app.state::<App>();
         let path = state.path.lock().unwrap().clone();

@@ -117,7 +117,19 @@ mod imp {
         if !task_exists() {
             return State::Absent;
         }
-        if super::flag_path(dir).exists() && task_running(dir) { State::Running } else { State::Stopped }
+        let признак = super::flag_path(dir).exists();
+        let движок = task_running(dir);
+        if признак && движок {
+            State::Running
+        } else {
+            // Разница между «выключено человеком» и «должно работать, а
+            // движка нет» — первое, что нужно знать при разборе.
+            if признак && !движок {
+                crate::logfile::line(&crate::logfile::now_stamp(),
+                    "перехват: признак включения стоит, но движок не отвечает");
+            }
+            State::Stopped
+        }
     }
 
     /// ⛔ Ставим признак, а не запускаем задачу. Задача принадлежит
@@ -125,6 +137,8 @@ mod imp {
     /// планировщик отвечает отказом. Задача крутится сама и смотрит на
     /// этот файл; создать его человек может своими правами.
     pub fn start_in(dir: &Path) -> Result<(), String> {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: включаю — ставлю признак {}", super::flag_path(dir).display()));
         std::fs::write(super::flag_path(dir), b"1")
             .map_err(|e| format!("не включить перехват: {e}"))?;
         // ⛔ Запускать задачу НЕ пытаемся: она принадлежит системе, и
@@ -150,8 +164,22 @@ mod imp {
     }
 
     pub fn stop_in(dir: &Path) -> Result<(), String> {
-        let _ = std::fs::remove_file(super::flag_path(dir));
-        Ok(())
+        // ⛔ Отказ не проглатываем: человек нажал «выключить», получил
+        // подтверждение, а трафик машины продолжал заворачиваться.
+        match std::fs::remove_file(super::flag_path(dir)) {
+            Ok(()) => {
+                crate::logfile::line(&crate::logfile::now_stamp(),
+                    "перехват: выключаю — признак снят");
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                crate::logfile::line(&crate::logfile::now_stamp(),
+                    "перехват: выключать нечего — признака и так нет");
+                Ok(())
+            }
+            Err(e) => Err(format!("не выключить перехват: не убрать признак {}: {e}",
+                                  super::flag_path(dir).display())),
+        }
     }
 
 }
@@ -742,11 +770,25 @@ fn signature_text(exe: &Path, dir: &Path) -> String {
 pub fn needs_reinstall(dir: &Path) -> bool {
     let want = match std::env::current_exe() {
         Ok(me) => signature_text(&me, dir),
-        Err(_) => return false,
+        Err(e) => {
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                &format!("перехват: не понять, чем поставлена служба: {e}"));
+            return false;
+        }
     };
     match std::fs::read_to_string(signature_path(dir)) {
-        Ok(have) => have.trim() != want.trim(),
-        Err(_) => true,
+        Ok(have) if have.trim() == want.trim() => false,
+        Ok(_) => {
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                "перехват: служба поставлена прежней версией — нужна переустановка");
+            true
+        }
+        Err(e) => {
+            crate::logfile::line(&crate::logfile::now_stamp(),
+                &format!("перехват: отметки об установке нет ({}): {e}",
+                         signature_path(dir).display()));
+            true
+        }
     }
 }
 
@@ -787,8 +829,18 @@ pub fn install(dir: &Path) -> Result<(), String> {
     write_xml(&me, dir)?;
 
     let cmd = install_command(&me, dir);
-    crate::logfile::line(&crate::logfile::now_stamp(),
-        &format!("перехват: ставлю службу заново\n  {cmd}"));
+    crate::logfile::line(&crate::logfile::now_stamp(), &format!(
+        "перехват: ставлю службу\n  \
+         программа: {}\n  \
+         закрытая папка: {}\n  \
+         копия для службы: {}\n  \
+         движок скачан: {}\n  \
+         команда: {cmd}",
+        me.display(),
+        secure_dir(dir).display(),
+        runner_path(dir).display(),
+        if crate::tunnel::downloaded_engine(dir).is_file() { "да" } else { "НЕТ" },
+    ));
     // Старую убираем сразу: иначе на Windows останется задача с прежним
     // способом запуска, и человек увидит поведение старой версии.
     // ⛔ Разделитель у каждой оболочки свой. В cmd перевод строки не
@@ -829,8 +881,22 @@ pub fn install(dir: &Path) -> Result<(), String> {
                            runner_path(dir).display()));
     }
 
-    let _ = std::fs::write(signature_path(dir), signature_text(&me, dir));
-    crate::logfile::line(&crate::logfile::now_stamp(), "перехват: служба установлена");
+    if let Err(e) = std::fs::write(signature_path(dir), signature_text(&me, dir)) {
+        // ⛔ Без отметки программа будет ставить службу заново при каждом
+        // запуске — и каждый раз спрашивать права.
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: не записать отметку об установке ({}): {e}",
+                     signature_path(dir).display()));
+    }
+    crate::logfile::line(&crate::logfile::now_stamp(), &format!(
+        "перехват: служба установлена\n  \
+         копия на месте: {}\n  \
+         движок в закрытой папке: {}\n  \
+         состояние задачи: {:?}",
+        runner_path(dir).display(),
+        if crate::tunnel::binary_path(dir).is_file() { "да" } else { "НЕТ" },
+        state_in(dir),
+    ));
     Ok(())
 }
 
