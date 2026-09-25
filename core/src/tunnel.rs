@@ -892,7 +892,7 @@ pub struct Api {
 pub fn api_access(dir: &Path) -> Api {
     if let Ok(t) = std::fs::read_to_string(api_path(dir)) {
         if let Ok(a) = serde_json::from_str::<Api>(&t) {
-            if a.port != 0 && !a.secret.is_empty() {
+            if a.port != 0 && !a.secret.is_empty() && port_usable(&a) {
                 return a;
             }
         }
@@ -900,6 +900,45 @@ pub fn api_access(dir: &Path) -> Api {
     let a = Api { port: free_port(), secret: fresh_secret() };
     let _ = std::fs::write(api_path(dir), serde_json::to_vec_pretty(&a).unwrap_or_default());
     a
+}
+
+/// Можно ли по-прежнему пользоваться этим портом.
+///
+/// ⛔ Занятый посторонней программой порт роняет движок ЦЕЛИКОМ:
+/// «external controller listen error: address already in use» — и
+/// перехват не поднимается вовсе. Порт выбирается однажды и живёт в
+/// файле, а за время до следующей загрузки его может занять кто угодно.
+///
+/// ⛔ Но просто «занят — берём новый» нельзя: чаще всего его держит наш
+/// же движок. Меняя порт при каждой проверке, мы переписывали бы
+/// настройки и перезапускали движок по кругу. Поэтому спрашиваем: если
+/// на нашем пароле отвечают — это он и есть.
+fn port_usable(a: &Api) -> bool {
+    if std::net::TcpListener::bind(("127.0.0.1", a.port)).is_ok() {
+        return true;
+    }
+    api_get(a, "version").is_ok()
+}
+
+/// Спросить движок — со сроком ожидания.
+///
+/// ⛔ Срок обязателен. Порт может держать программа, которая соединение
+/// принимает, но не отвечает: без срока ожидание длится вечно, и вместе
+/// с ним замирает всё, что спрашивало, — и проверка порта, и опрос
+/// статистики.
+pub fn api_get(a: &Api, what: &str) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(3)))
+        .build()
+        .into();
+    agent
+        .get(&format!("http://127.0.0.1:{}/{what}", a.port))
+        .header("Authorization", &format!("Bearer {}", a.secret))
+        .call()
+        .map_err(|e| format!("движок не отвечает: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("движок ответил непонятным: {e}"))
 }
 
 fn free_port() -> u16 {
@@ -1696,6 +1735,44 @@ fn tail_of(path: &Path, bytes: u64) -> Option<String> {
     } else {
         text
     })
+}
+
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+
+    /// ⛔ Занятый посторонним порт роняет движок целиком, и перехват не
+    /// поднимается. Значит при занятом порте берём другой.
+    #[test]
+    fn занятый_чужим_порт_меняется() {
+        let dir = std::env::temp_dir().join("np-api-busy");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(api_path(&dir));
+
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        std::fs::write(api_path(&dir),
+            serde_json::to_vec(&Api { port: busy, secret: "x".repeat(32) }).unwrap()).unwrap();
+
+        let a = api_access(&dir);
+        assert_ne!(a.port, busy, "остался занятый порт — движок не поднимется");
+        drop(held);
+        let _ = std::fs::remove_file(api_path(&dir));
+    }
+
+    /// А свой порт не трогаем: иначе настройки переписывались бы и
+    /// движок перезапускался по кругу.
+    #[test]
+    fn свободный_порт_остаётся_прежним() {
+        let dir = std::env::temp_dir().join("np-api-keep");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(api_path(&dir));
+        let first = api_access(&dir);
+        let again = api_access(&dir);
+        assert_eq!(first.port, again.port, "порт меняется на ровном месте");
+        assert_eq!(first.secret, again.secret);
+        let _ = std::fs::remove_file(api_path(&dir));
+    }
 }
 
 #[cfg(test)]
