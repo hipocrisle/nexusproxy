@@ -76,7 +76,7 @@ fn status(app: State<App>) -> Status {
                 upstream_error: h.last_error,
                 config_path: path,
                 log_path: core::logfile::path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                error: None,
+                error: app.start_error.lock().unwrap().clone(),
             }
         }
         None => Status {
@@ -88,7 +88,12 @@ fn status(app: State<App>) -> Status {
             default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
             config_path: path, log_path: String::new(),
-            error: Some("движок не запущен".into()),
+            // ⛔ Показываем НАСТОЯЩУЮ причину. Она сохранялась при
+            // запуске и не читалась никем: человек видел «движок не
+            // запущен» и не мог узнать, что дело, скажем, в занятом
+            // порте.
+            error: Some(app.start_error.lock().unwrap().clone()
+                .unwrap_or_else(|| "движок не запущен".into())),
         },
     }
 }
@@ -242,8 +247,25 @@ fn rule_add_from_file(app: State<App>, path: String) -> Result<core::config::Bul
 fn rules_export(app: State<App>, path: String) -> Result<usize, String> {
     let e = engine(&app)?;
     let c = e.cfg.lock().unwrap();
-    let text = c.through_proxy.join("\n") + "\n";
-    let n = c.through_proxy.iter().filter(|s| !s.starts_with('_')).count();
+    // ⛔ Выгружаем ВСЁ, что задаёт маршрутизацию: общие правила,
+    // правила групп и исключения. Раньше уходили только общие, и у
+    // того, кому отдали файл, пропадали и переведённые на отдельные
+    // прокси домены, и исключения — а число в окне говорило другое.
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(c.through_proxy.iter().cloned());
+    for g in &c.groups {
+        if g.patterns.is_empty() {
+            continue;
+        }
+        lines.push(format!("_через «{}»", g.via));
+        lines.extend(g.patterns.iter().cloned());
+    }
+    if !c.direct.is_empty() {
+        lines.push("_напрямую".into());
+        lines.extend(c.direct.iter().map(|d| format!("!{d}")));
+    }
+    let text = lines.join("\n") + "\n";
+    let n = lines.iter().filter(|s| !s.starts_with('_')).count();
     std::fs::write(&path, text).map_err(|e| format!("не записать {path}: {e}"))?;
     Ok(n)
 }
@@ -552,18 +574,12 @@ fn upstream_save(
         match c.upstreams.iter_mut().find(|x| x.name == old) {
             Some(x) => {
                 *x = up.clone();
-                // переименование обязано тянуть за собой ссылки, иначе
-                // группы и «по умолчанию» укажут на исчезнувшее имя
-                if old != up.name {
-                    for g in c.groups.iter_mut() {
-                        if g.via == old {
-                            g.via = up.name.clone();
-                        }
-                    }
-                    if c.default_upstream == old {
-                        c.default_upstream = up.name.clone();
-                    }
-                }
+                // ⛔ Переименование тянет за собой ВСЕ ссылки: группы,
+                // список программ и «основной». Раньше список программ
+                // забывали, и весь их трафик уходил на несуществующее
+                // имя — со стороны это «программа перестала ходить через
+                // прокси», без единого объяснения.
+                c.rename_upstream(&old, &up.name.clone());
             }
             None => {
                 c.upstreams.push(up.clone());
@@ -777,6 +793,17 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
         Some(e) => e.cfg.lock().unwrap().clone(),
         None => core::config::Config::load(&path)?,
     };
+    // ⛔ Порты проверяем ДО того, как что-то трогать. Ноль или два
+    // одинаковых означают, что движок не поднимется, — и раньше это
+    // выяснялось уже после остановки прежнего.
+    if s.http_port == 0 || s.socks_port == 0 {
+        return Err("порт не может быть нулевым".into());
+    }
+    if s.http_port == s.socks_port {
+        return Err("у входов должны быть разные порты".into());
+    }
+
+    let было = cfg.clone();
     cfg.listen.http = s.http_port;
     cfg.listen.socks = s.socks_port;
     cfg.save(&path)?;
@@ -787,7 +814,29 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
         e.shutdown();
     }
     *state.engine.lock().unwrap() = None;
-    let fresh = core::Engine::start(cfg, &path).await?;
+    let fresh = match core::Engine::start(cfg, &path).await {
+        Ok(e) => e,
+        Err(err) => {
+            // ⛔ Возвращаем как было. Иначе программа остаётся без
+            // движка НАВСЕГДА: негодные порты уже записаны в файл, и
+            // перезапуск не помогает — человеку остаётся править
+            // настройки руками в блокноте.
+            let _ = было.save(&path);
+            match core::Engine::start(было, &path).await {
+                Ok(back) => {
+                    if was_on {
+                        let _ = back.system_proxy_on();
+                    }
+                    *state.engine.lock().unwrap() = Some(back);
+                    return Err(format!("{err}. Прежние настройки возвращены"));
+                }
+                Err(worse) => {
+                    *state.start_error.lock().unwrap() = Some(worse.clone());
+                    return Err(format!("{err}. Вернуть прежние тоже не вышло: {worse}"));
+                }
+            }
+        }
+    };
     if was_on {
         fresh.system_proxy_on()?;
     }
@@ -1228,8 +1277,31 @@ pub fn run() {
             if !path.exists() {
                 default_config().save(&path_s).ok();
             }
-            let mut cfg = core::config::Config::load(&path_s)
-                .unwrap_or_else(|_| default_config());
+            // ⛔ Испорченные настройки НЕ заменяем умолчаниями. Любая
+            // неудача чтения — оборванная запись, файл занят проверяющей
+            // программой, отказ доступа — раньше означала, что человек
+            // молча теряет все прокси, правила и список программ, а
+            // поверх тут же записываются пустые настройки.
+            let mut cfg = match core::config::Config::load_or_backup(&path_s) {
+                Ok((c, note)) => {
+                    if let Some(note) = note {
+                        core::logfile::line(&core::logfile::now_stamp(), &note);
+                        *app.state::<App>().start_error.lock().unwrap() = Some(note);
+                    }
+                    c
+                }
+                Err(e) => {
+                    // Ничего не портим: откладываем нечитаемый файл в
+                    // сторону, чтобы человек мог его посмотреть, и
+                    // говорим об этом прямо.
+                    let kept = format!("{path_s}.испорчен");
+                    let _ = std::fs::rename(&path_s, &kept);
+                    let note = format!("{e}. Прежний файл отложен: {kept}");
+                    core::logfile::line(&core::logfile::now_stamp(), &note);
+                    *app.state::<App>().start_error.lock().unwrap() = Some(note);
+                    default_config()
+                }
+            };
 
             // ── Базовые галки поведения: все четыре включены ──
             // Ставим один раз и запоминаем это в настройках: иначе снятая

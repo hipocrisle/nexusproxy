@@ -391,6 +391,36 @@ impl Engine {
         let names: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
         {
             let mut c = self.cfg.lock().unwrap();
+            // ⛔ Уходящие страны нельзя просто выбросить: на них
+            // ссылаются группы правил, список программ и «основной».
+            // Раньше после обновления подписки, где страна пропала или
+            // переименовалась, программа переставала сохранять ЧТО
+            // УГОДНО — каждое сохранение падало на проверке ссылок, а
+            // человек видел лишь, что настройки не применяются.
+            let уходят: Vec<String> = c.upstreams.iter()
+                .filter(|u| u.from_subscription)
+                .map(|u| u.name.clone())
+                .collect();
+            let остаются: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+            let запасной = c.upstreams.iter()
+                .find(|u| !u.from_subscription)
+                .map(|u| u.name.clone())
+                .unwrap_or_default();
+            for имя in уходят.iter().filter(|n| !остаются.contains(n)) {
+                for g in c.groups.iter_mut() {
+                    if g.via == *имя {
+                        g.via = запасной.clone();
+                    }
+                }
+                for a in c.apps.iter_mut() {
+                    if a.via == *имя {
+                        a.via = запасной.clone();
+                    }
+                }
+                if c.default_upstream == *имя {
+                    c.default_upstream = запасной.clone();
+                }
+            }
             c.upstreams.retain(|u| !u.from_subscription);
             for (i, p) in profiles.iter().enumerate() {
                 // имя может совпасть с уже заведённым вручную — не затираем чужое
