@@ -27,7 +27,14 @@ struct Journal {
 static J: Mutex<Option<Journal>> = Mutex::new(None);
 
 pub fn enable() {
-    *J.lock().unwrap() = Some(Journal { items: VecDeque::new(), next_id: 1 });
+    // ⛔ Нумерацию продолжаем, а не начинаем заново. Окно помнит номер
+    // последней показанной записи, и после перезапуска движка (смена
+    // портов в настройках) вкладка молча переставала обновляться: новые
+    // записи получали номера меньше запомненного. Ни ошибки, ни пустого
+    // списка — просто ничего нового.
+    let mut g = J.lock().unwrap_or_else(|e| e.into_inner());
+    let next_id = g.as_ref().map(|j| j.next_id).unwrap_or(1);
+    *g = Some(Journal { items: VecDeque::new(), next_id });
 }
 
 pub fn push(host: &str, port: u16, route: &Route, via: &str) {

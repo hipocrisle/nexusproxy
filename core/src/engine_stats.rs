@@ -6,7 +6,7 @@
 //! ведёт учёт сам, и здесь мы его забираем — это единственный источник
 //! правды о том, что куда пошло.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -16,6 +16,13 @@ use crate::conns::{Conn, DomainStat};
 #[derive(serde::Deserialize)]
 struct Snapshot {
     connections: Option<Vec<Raw>>,
+    /// ⛔ Итог за всё время ведёт сам движок. Складывать его из снимков
+    /// нельзя: соединения, открывшиеся и закрывшиеся между двумя
+    /// опросами, в снимок не попадают вовсе, и сумма выходит заниженной.
+    #[serde(rename = "downloadTotal", default)]
+    download_total: u64,
+    #[serde(rename = "uploadTotal", default)]
+    upload_total: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -42,6 +49,11 @@ struct Meta {
     process_path: String,
 }
 
+/// Сколько доменов держим в итогах. ⛔ Без предела карта росла вечно:
+/// браузер с рекламой и телеметрией даёт десятки тысяч имён за сутки, а
+/// окно копирует и сортирует её каждую секунду.
+const ПРЕДЕЛ_ДОМЕНОВ: usize = 2000;
+
 #[derive(Default)]
 struct State {
     /// Сколько уже засчитано по каждому соединению — считаем прирост.
@@ -51,9 +63,19 @@ struct State {
     since: HashMap<String, Instant>,
     totals: HashMap<String, DomainStat>,
     active: Vec<Conn>,
+    /// Сколько всего прошло через движок — по его собственному счёту.
+    sent_all: u64,
+    received_all: u64,
 }
 
 static S: Mutex<Option<State>> = Mutex::new(None);
+
+/// ⛔ Паника под замком отравляет мьютекс, и дальше КАЖДОЕ обращение к
+/// учёту паникует: окно перестаёт отвечать целиком. Берём содержимое и
+/// в таком случае — оно от этого не портится.
+fn lock() -> std::sync::MutexGuard<'static, Option<State>> {
+    S.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Куда ушло соединение: цепочка исходящих оканчивается тем, через что
 /// оно в итоге пошло.
@@ -68,13 +90,11 @@ fn port_of(m: &Meta) -> u16 {
     m.destination_port.parse().unwrap_or(0)
 }
 
-fn snapshot(api: &crate::tunnel::Api) -> Result<Vec<Raw>, String> {
+fn snapshot(api: &crate::tunnel::Api) -> Result<Snapshot, String> {
     // ⛔ Со сроком ожидания: иначе поток опроса замирает навсегда, если
     // на том конце соединение принимают, но не отвечают.
     let text = crate::tunnel::api_get(api, "connections")?;
-    let body: Snapshot = serde_json::from_str(&text)
-        .map_err(|e| format!("движок ответил непонятным: {e}"))?;
-    Ok(body.connections.unwrap_or_default())
+    serde_json::from_str(&text).map_err(|e| format!("движок ответил непонятным: {e}"))
 }
 
 /// Забрать у движка свежий снимок и обновить учёт.
@@ -84,10 +104,14 @@ pub fn refresh(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn apply(raw: Vec<Raw>) {
+fn apply(snap: Snapshot) {
+    let raw = snap.connections.unwrap_or_default();
     let fresh = {
-        let mut g = S.lock().unwrap();
-        apply_to(g.get_or_insert_with(State::default), &raw)
+        let mut g = lock();
+        let st = g.get_or_insert_with(State::default);
+        st.sent_all = snap.upload_total;
+        st.received_all = snap.download_total;
+        apply_to(st, &raw)
     };
     // ⛔ Журнал наполняем ЗДЕСЬ, а не в учёте: учёт должен оставаться
     // без побочных действий, иначе его проверки пишут в общий журнал и
@@ -107,11 +131,14 @@ fn apply(raw: Vec<Raw>) {
 fn apply_to(st: &mut State, raw: &[Raw]) -> Vec<(String, u16, String, String)> {
 
     let mut alive: Vec<Conn> = Vec::with_capacity(raw.len());
-    let mut seen: Vec<String> = Vec::with_capacity(raw.len());
+    // ⛔ Множество, а не список: поиск в списке делал уборку
+    // квадратичной, и на тысяче соединений это миллионы сравнений строк
+    // каждые пару секунд — всё это время окно ждёт на замке.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(raw.len());
     let mut fresh: Vec<(String, u16, String, String)> = Vec::new();
 
     for c in raw {
-        seen.push(c.id.clone());
+        seen.insert(c.id.as_str());
         let started = *st.since.entry(c.id.clone()).or_insert_with(Instant::now);
 
         // ⛔ Считаем ПРИРОСТ, а не сумму: движок отдаёт счётчики
@@ -127,10 +154,13 @@ fn apply_to(st: &mut State, raw: &[Raw]) -> Vec<(String, u16, String, String)> {
         let down = c.download.saturating_sub(was.1);
         st.counted.insert(c.id.clone(), (c.upload, c.download));
 
-        let host = if c.metadata.host.is_empty() {
-            c.metadata.destination_ip.clone()
-        } else {
-            c.metadata.host.clone()
+        // ⛔ Пустое имя не схлопываем в безымянную строку: движок может
+        // не дать ни имени, ни адреса, и весь такой трафик сваливался в
+        // одну строку без названия.
+        let host = match (c.metadata.host.trim(), c.metadata.destination_ip.trim()) {
+            ("", "") => "без имени".to_string(),
+            ("", ip) => ip.to_string(),
+            (h, _) => h.to_string(),
         };
         let (route, via) = route_of(&c.chains);
 
@@ -174,20 +204,35 @@ fn apply_to(st: &mut State, raw: &[Raw]) -> Vec<(String, u16, String, String)> {
     }
 
     // Закрытые соединения больше не занимают память.
-    st.counted.retain(|id, _| seen.contains(id));
-    st.since.retain(|id, _| seen.contains(id));
+    st.counted.retain(|id, _| seen.contains(id.as_str()));
+    st.since.retain(|id, _| seen.contains(id.as_str()));
 
     alive.sort_by(|a, b| (b.sent + b.received).cmp(&(a.sent + a.received)));
     st.active = alive;
+
+    // ⛔ Держим только самые объёмные. Без предела карта росла вечно —
+    // за сутки работы это десятки тысяч имён, которые окно копирует и
+    // сортирует каждую секунду.
+    if st.totals.len() > ПРЕДЕЛ_ДОМЕНОВ {
+        let mut весом: Vec<(String, u64)> = st.totals.iter()
+            .map(|(k, v)| (k.clone(), v.sent + v.received))
+            .collect();
+        весом.sort_by(|a, b| b.1.cmp(&a.1));
+        let оставить: HashSet<String> = весом.into_iter()
+            .take(ПРЕДЕЛ_ДОМЕНОВ)
+            .map(|(k, _)| k)
+            .collect();
+        st.totals.retain(|k, _| оставить.contains(k));
+    }
     fresh
 }
 
 pub fn active() -> Vec<Conn> {
-    S.lock().unwrap().as_ref().map(|s| s.active.clone()).unwrap_or_default()
+    lock().as_ref().map(|s| s.active.clone()).unwrap_or_default()
 }
 
 pub fn totals() -> Vec<DomainStat> {
-    let g = S.lock().unwrap();
+    let g = lock();
     let Some(s) = g.as_ref() else { return Vec::new() };
     let mut v: Vec<DomainStat> = s.totals.values().cloned().collect();
     v.sort_by(|a, b| (b.sent + b.received).cmp(&(a.sent + a.received)));
@@ -195,9 +240,21 @@ pub fn totals() -> Vec<DomainStat> {
 }
 
 pub fn reset() {
-    if let Some(s) = S.lock().unwrap().as_mut() {
+    if let Some(s) = lock().as_mut() {
         s.totals.clear();
+        // ⛔ И память о том, какие соединения уже видели. Иначе живые
+        // соединения не считаются заново: домены с долгой связью
+        // показывают растущие байты при нуле соединений, а простаивающие
+        // вовсе исчезают из таблицы.
+        s.counted.clear();
+        s.sent_all = 0;
+        s.received_all = 0;
     }
+}
+
+/// Сколько всего прошло через перехват — по счёту самого движка.
+pub fn totals_all() -> (u64, u64) {
+    lock().as_ref().map(|s| (s.sent_all, s.received_all)).unwrap_or((0, 0))
 }
 
 #[cfg(test)]

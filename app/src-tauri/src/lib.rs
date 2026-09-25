@@ -1305,7 +1305,12 @@ pub fn run() {
                     if core::tunnel::is_alive(&dir) {
                         let _ = core::engine_stats::refresh(&dir);
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // ⛔ Раз в секунду, а не раз в две: движок отдаёт
+                    // только открытые сейчас соединения, и всё, что
+                    // успело открыться и закрыться между опросами, в
+                    // учёт по доменам не попадает вовсе. Общий итог при
+                    // этом точный — его ведёт сам движок.
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 });
             }
 

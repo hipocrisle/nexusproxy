@@ -143,6 +143,12 @@ impl Engine {
             logfile::line(&logfile::now_stamp(),
                           "системные настройки прокси возвращены: прошлый запуск завершился неожиданно");
         }
+        // ⛔ Отказы, о которых давно не слышали, забываем: иначе карта
+        // растёт всё время работы программы.
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+            failures::forget_old(std::time::Duration::from_secs(3600));
+        });
         report::enable();
         health::enable();
         conns::enable();
@@ -579,7 +585,7 @@ impl Engine {
         }
         logfile::line(&logfile::now_stamp(),
                       &format!("правила «{from}» временно идут через «{to}»"));
-        conns::drop_changed_all(&self.rules);
+        conns::drop_changed_all(from);
         Ok(())
     }
 
@@ -588,7 +594,7 @@ impl Engine {
         if had {
             logfile::line(&logfile::now_stamp(),
                           &format!("правила «{from}» вернулись на свой прокси"));
-            conns::drop_changed_all(&self.rules);
+            conns::drop_changed_all(from);
         }
     }
 

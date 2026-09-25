@@ -19,6 +19,10 @@ const MULTI: &[&str] = &[
 /// `api.example.co.uk`          → `example.co.uk`
 /// Адрес возвращается как есть — для него правило по домену не применимо.
 pub fn registrable(host: &str) -> String {
+    // ⛔ Приводим целиком, а не только латиницу: «САЙТ.РФ» и «сайт.рф»
+    // иначе считаются разными — две строки в итогах, две записи об
+    // отказах, и снятие отказа по одному написанию не снимает другое.
+    let host = &host.to_lowercase();
     let h = host.trim_end_matches('.').to_ascii_lowercase();
     if h.parse::<std::net::IpAddr>().is_ok() {
         return h;
