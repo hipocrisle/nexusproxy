@@ -973,52 +973,18 @@ fn refresh_tunnel(app: &State<App>) -> Result<(), String> {
     let path = app.path.lock().unwrap().clone();
     let dir = core::tunnel_dir(&path);
     let e = engine(app)?;
-    let c = e.cfg.lock().unwrap();
-    if !c.tunnel_mode {
+    if !e.cfg.lock().unwrap().tunnel_mode {
         return Ok(());
     }
-    let routes: Vec<core::tunnel::Route> = c.apps.iter()
-        .filter(|a| !a.via.trim().is_empty())
-        .map(|a| core::tunnel::Route {
-            process: core::launch::process_name(&a.path),
-            path: a.path.clone(),
-            via: a.via.clone(),
-        })
-        .collect();
-    let domains: Vec<core::tunnel::DomainRule> = c.through_proxy.iter()
-        .map(|p| core::tunnel::DomainRule { pattern: p.clone(), via: String::new() })
-        .chain(c.groups.iter().filter(|g| g.enabled).flat_map(|g| {
-            g.patterns.iter().map(move |p| core::tunnel::DomainRule {
-                pattern: p.clone(), via: g.via.clone(),
-            })
-        }))
-        .map(|mut d| {
-            if d.via.trim().is_empty() {
-                d.via = c.default_upstream.clone();
-            }
-            d
-        })
-        .collect();
-    let ups: Vec<core::tunnel::Upstream> = c.all_upstreams().into_iter()
-        .map(|u| core::tunnel::Upstream {
-            tag: u.name.clone(),
-            kind: match u.kind {
-                core::upstream::Kind::Socks5 => core::tunnel::Kind::Socks5,
-                core::upstream::Kind::Http => core::tunnel::Kind::Http,
-            },
-            address: u.address.clone(), port: u.port,
-            user: u.user.clone(), password: u.password.clone(),
-        })
-        .collect();
-    drop(c);
-    // ⛔ В TUN режиме системные настройки прокси обязаны быть сняты:
-    // иначе браузеры идут по ним на локальный адрес, мимо туннеля.
+    // ⛔ В режиме перехвата системные настройки прокси обязаны быть
+    // сняты: иначе браузеры идут по ним на наш вход, мимо туннеля.
     e.system_proxy_drop();
-    core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
-    // ⛔ Служба тоже могла устареть: наблюдатель и способ запуска
-    // меняются вместе с программой, а ставится он один раз. Без этой
-    // проверки после обновления продолжает работать прежний — со
-    // старыми повадками и без новых починок.
+    // Сами настройки движка перекладывает движок программы — так это
+    // делает КАЖДОЕ сохранение, а не только часть команд.
+    e.sync_tunnel()?;
+    // ⛔ Служба тоже могла устареть: способ запуска меняется вместе с
+    // программой, а ставится он один раз. Без проверки после обновления
+    // продолжает работать прежний — со старыми повадками.
     if core::tunnel_service::needs_reinstall(&dir) {
         core::tunnel_service::install(&dir)?;
     }

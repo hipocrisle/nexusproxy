@@ -99,7 +99,19 @@ fn path_prefix(path: &str) -> Option<String> {
         return Some(p.to_string());
     }
     let cut = p.rfind(['/', '\\'])?;
-    Some(p[..cut].to_string())
+    let папка = &p[..cut];
+    // ⛔ Программа, лежащая прямо в корне диска, давала префикс вида
+    // «D:» — и под правило попадали ВСЕ процессы с этого диска, то есть
+    // трафик всей машины уходил в корпоративный прокси. Со стороны это
+    // выглядит как «отвалились почта и внутренние ресурсы», причём
+    // выборочно и необъяснимо. В таком случае ловим только по имени.
+    let корень = папка.is_empty()
+        || папка.ends_with(':')
+        || папка.chars().all(|c| c == '/' || c == '\\');
+    if корень {
+        return None;
+    }
+    Some(папка.to_string())
 }
 
 /// Приложения, которые ходят в сеть не сами, а через отдельный процесс
@@ -221,14 +233,6 @@ pub fn build_config_with(
         // правила вида «grid.gg через прокси» не срабатывают вовсе, и
         // работает лишь то, что совпало по адресу.
         serde_json::json!({ "action": "sniff" }),
-        // дальше — правила по приложениям, см. ниже: они должны стоять
-        // как можно раньше, пока соединение ещё живо
-        // свои адреса — мимо перехвата
-        serde_json::json!({
-            "ip_is_private": true,
-            "action": "route",
-            "outbound": "direct"
-        }),
     ];
     // адреса прокси — иначе петля
     let proxy_ips: Vec<String> = upstreams.iter()
@@ -276,6 +280,18 @@ pub fn build_config_with(
         "outbound": "direct"
     }));
 
+    // ⛔ Запросы имён — мимо прокси, и ДО правил приложений. Стоя после
+    // них, это правило было мёртвым: запрос имени по TCP от выбранной
+    // программы уходил в корпоративный прокси, который соединения на
+    // порт 53 обычно запрещает, — имя не разрешалось, и программа
+    // просто висела. Внутренние зоны за прокси не видны, а отвечать за
+    // систему мы не беремся.
+    rules.push(serde_json::json!({
+        "port": [53],
+        "action": "route",
+        "outbound": "direct"
+    }));
+
     // ⛔ Имя и путь — РАЗНЫМИ правилами. Внутри одного правила движок
     // требует совпадения всех условий сразу, а у приложения процессы
     // зовутся по-разному: главный «Cursor», рабочий «Cursor Helper
@@ -303,14 +319,6 @@ pub fn build_config_with(
     // Программа при этом не сообщает об ошибке — она молча не работает,
     // хотя на обычном TCP всё в порядке. Закрыв QUIC, мы заставляем её
     // откатиться на TCP, который через прокси проходит.
-    // ⛔ Запросы имён — мимо прокси и без вмешательства: внутренние
-    // зоны за корпоративным прокси не видны, а отвечать за систему мы
-    // не беремся.
-    rules.push(serde_json::json!({
-        "port": [53],
-        "action": "route",
-        "outbound": "direct"
-    }));
     // правила по доменам и подсетям — то же, что в режиме прокси
     let mut dom_by_via: std::collections::BTreeMap<&str, (Vec<String>, Vec<String>)> = Default::default();
     for d in domains {
@@ -338,6 +346,18 @@ pub fn build_config_with(
             rules.push(rule);
         }
     }
+
+    // ⛔ Свои адреса — напрямую, но ПОСЛЕ правил человека. Стоя третьим
+    // сверху, это правило делало невозможным ровно тот случай, ради
+    // которого программу и заводят: внутренний ресурс, доступный ТОЛЬКО
+    // через корпоративный прокси. Такое правило не срабатывало никогда —
+    // решение принималось раньше, чем до него доходила очередь. Теперь
+    // оно ловит лишь то, о чём человек не распорядился сам.
+    rules.push(serde_json::json!({
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+    }));
 
     let api = api_access(dir_hint);
     serde_json::json!({
@@ -417,20 +437,77 @@ pub fn build_config_with(
 #[cfg(test)]
 mod tests {
 
-    /// ⛔ Движок службы не виден в списке процессов обычному
-    /// пользователю: он принадлежит системе. Живость определяется по
-    /// свежести его журнала, иначе окно показывает «выключено» при
-    /// работающем туннеле.
+    /// ⛔ Падающий по кругу движок не должен считаться работающим.
+    /// Журнал он при этом обновляет каждую секунду — по нему судить
+    /// нельзя.
+    /// ⛔ Порядок правил решает всё. Проверяем именно очерёдность, а не
+    /// наличие: правило, до которого не доходит очередь, — мёртвое.
     #[test]
-    fn движок_службы_считается_живым_по_свежему_журналу() {
-        let dir = std::env::temp_dir().join("np-alive-test");
+    fn очерёдность_правил_не_глушит_нужное() {
+        let c = build_config_with(
+            Path::new("."),
+            &[Route { process: "app.exe".into(), path: "C:\\П\\app.exe".into(), via: "основной".into() }],
+            &[DomainRule { pattern: "10.10.0.0/16".into(), via: "основной".into() },
+              DomainRule { pattern: "intranet.corp".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let rules = rules_of(&c);
+        let место = |ищем: &dyn Fn(&serde_json::Value) -> bool| -> usize {
+            rules.iter().position(|r| ищем(r)).unwrap_or(usize::MAX)
+        };
+        let udp = место(&|r| r["network"] == "udp");
+        let имена = место(&|r| r["port"].as_array().map(|a| a.contains(&serde_json::json!(53))).unwrap_or(false));
+        let процессы = место(&|r| r.get("process_name").is_some());
+        let свои = место(&|r| r["ip_is_private"] == true);
+        let подсеть = место(&|r| r["ip_cidr"].as_array()
+            .map(|a| a.iter().any(|v| v == "10.10.0.0/16")).unwrap_or(false));
+
+        assert!(udp < процессы, "UDP выбранной программы уйдёт в прокси, а через него он не ходит");
+        assert!(имена < процессы,
+                "запрос имени по TCP уйдёт в прокси, и программа повиснет: {имена} !< {процессы}");
+        assert!(подсеть < свои,
+                "внутренний ресурс через прокси невозможен — решает правило «свои адреса»");
+        assert!(свои < rules.len(), "правило «свои адреса» потерялось");
+    }
+
+    /// ⛔ Программа в корне диска не должна заворачивать весь диск.
+    #[test]
+    fn программа_в_корне_диска_не_забирает_весь_диск() {
+        assert_eq!(path_prefix("D:\\game.exe"), None, "под правило попал весь диск D");
+        assert_eq!(path_prefix("/app"), None, "под правило попал весь корень");
+        assert_eq!(path_prefix("C:\\Program Files\\App\\app.exe").as_deref(),
+                   Some("C:\\Program Files\\App"));
+    }
+
+    #[test]
+    fn падающий_по_кругу_движок_не_считается_живым() {
+        let dir = std::env::temp_dir().join(format!("np-alive-{}", random_tag()));
         let _ = std::fs::create_dir_all(&dir);
-        let log = engine_log_path(&dir);
-        let _ = std::fs::remove_file(&log);
-        assert!(!is_alive(&dir), "журнала нет — движка нет");
-        std::fs::write(&log, "свежая запись").unwrap();
-        assert!(is_alive(&dir), "журнал только что писали — движок жив");
-        let _ = std::fs::remove_file(&log);
+        std::fs::write(engine_log_path(&dir), "только что писали").unwrap();
+        // доступа к движку нет вовсе
+        assert!(!is_alive(&dir), "свежий журнал принят за живой движок");
+
+        // и с записанным доступом, но никем не занятым портом — тоже
+        let свободный = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let порт = свободный.local_addr().unwrap().port();
+        drop(свободный);
+        std::fs::write(api_path(&dir),
+            serde_json::to_vec(&Api { port: порт, secret: "x".repeat(32) }).unwrap()).unwrap();
+        assert!(!is_alive(&dir), "движка нет, а программа считает его живым");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// А отвечающий движок — живой, даже если его процесс нам не виден.
+    #[test]
+    fn отвечающий_движок_считается_живым() {
+        let dir = std::env::temp_dir().join(format!("np-alive2-{}", random_tag()));
+        let _ = std::fs::create_dir_all(&dir);
+        let слушает = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let порт = слушает.local_addr().unwrap().port();
+        std::fs::write(api_path(&dir),
+            serde_json::to_vec(&Api { port: порт, secret: "x".repeat(32) }).unwrap()).unwrap();
+        assert!(is_alive(&dir), "движок отвечает, а считается мёртвым");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     use super::*;
 
@@ -585,13 +662,19 @@ pub fn download(dir: &Path) -> Result<String, String> {
         .read_to_vec()
         .map_err(|e| format!("обрыв при скачивании: {e}"))?;
 
-    let dest = downloaded_engine(dir);
+    // ⛔ Распаковываем рядом и подставляем в самом конце. Прежде файл
+    // сразу обрезался до нуля, и обрыв связи посреди скачивания оставлял
+    // огрызок, который программа считала установленным движком: запуск
+    // падал с невнятной ошибкой, а перекачать было нечем.
+    let dest_final = downloaded_engine(dir);
+    let dest = dir.join(format!("sing-box.{}.part", random_tag()));
     let found = if want_zip {
         unpack_zip(&body, &dest)?
     } else {
         unpack_tar_gz(&body, &dest)?
     };
     if !found {
+        let _ = std::fs::remove_file(&dest);
         return Err("в архиве не оказалось самого движка".into());
     }
     #[cfg(unix)]
@@ -599,6 +682,10 @@ pub fn download(dir: &Path) -> Result<String, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
     }
+    std::fs::rename(&dest, &dest_final).map_err(|e| {
+        let _ = std::fs::remove_file(&dest);
+        format!("не подставить скачанный движок: {e}")
+    })?;
     Ok(version)
 }
 
@@ -659,17 +746,24 @@ pub fn is_alive(dir: &Path) -> bool {
     if is_running() || crate::xray::is_alive(&binary_path(dir)) {
         return true;
     }
-    // ⛔ Движок работает от имени системы, и узнать путь его процесса
-    // обычными правами нельзя: перечисление процессов возвращает про
-    // него пустоту. Программа при этом показывала «перехват выключен»
-    // при живом туннеле. Зато виден его журнал — если в него только что
-    // писали, движок работает.
-    std::fs::metadata(engine_log_path(dir))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .map(|e| e.as_secs() < 90)
-        .unwrap_or(false)
+    // ⛔ Спрашиваем сам движок, а НЕ смотрим на свежесть его журнала.
+    // Журнал обнуляется перед каждым запуском, поэтому при падении по
+    // кругу он обновлялся каждую секунду — и программа показывала
+    // «перехват работает» при полностью мёртвом туннеле, то есть ровно
+    // тогда, когда человеку нужнее всего правда.
+    //
+    // Процесс движка принадлежит системе и в списке процессов
+    // пользователю не виден, зато его управляющий вход отвечает.
+    let Some(api) = api_stored(dir) else { return false };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], api.port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+}
+
+/// Записанный доступ к движку — без проверок и без обращений к сети.
+fn api_stored(dir: &Path) -> Option<Api> {
+    let text = std::fs::read_to_string(api_path(dir)).ok()?;
+    let a: Api = serde_json::from_str(&text).ok()?;
+    (a.port != 0 && !a.secret.is_empty()).then_some(a)
 }
 
 pub fn is_running() -> bool {
@@ -792,8 +886,25 @@ pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
                     upstreams: &[Upstream]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
     let cfg = build_config_with(dir, routes, domains, upstreams);
-    std::fs::write(config_path(dir), serde_json::to_vec_pretty(&cfg).unwrap())
-        .map_err(|e| format!("не записать настройки: {e}"))?;
+    let text = serde_json::to_vec_pretty(&cfg).unwrap();
+
+    // ⛔ Если настройки не изменились, не трогаем файл вовсе: служба
+    // следит за его отпечатком и на любую запись перезапускает движок.
+    // Лишний перезапуск — это разрыв всех соединений на ровном месте.
+    if std::fs::read(config_path(dir)).map(|было| было == text).unwrap_or(false) {
+        return Ok(());
+    }
+
+    // ⛔ Пишем целиком и только потом подставляем под нужное имя.
+    // Обычная запись сначала обрезает файл до нуля, а служба читает его
+    // раз в секунду — и успевала прочесть огрызок: движок падал, а
+    // человек видел разрыв связи при каждой правке списка.
+    let tmp = dir.join(format!("tunnel-config.{}.tmp", random_tag()));
+    std::fs::write(&tmp, &text).map_err(|e| format!("не записать настройки: {e}"))?;
+    std::fs::rename(&tmp, config_path(dir)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("не записать настройки: {e}")
+    })?;
 
     // ⛔ Проверяем настройки самим движком, прежде чем он на них
     // запустится. Иначе негодные настройки означают бесконечный круг:
@@ -935,7 +1046,15 @@ pub fn api_access(dir: &Path) -> Api {
         }
     }
     let a = Api { port: free_port(), secret: fresh_secret() };
-    let _ = std::fs::write(api_path(dir), serde_json::to_vec_pretty(&a).unwrap_or_default());
+    // ⛔ Если записать не удалось, следующий вызов выдумает новые порт и
+    // пароль — они разойдутся с теми, что уже у работающего движка.
+    // Статистика становится вечно нулевой, а каждая запись настроек
+    // выглядит изменением и заставляет службу перезапускать движок по
+    // кругу. Лучше честно сказать об этом в журнал.
+    if let Err(e) = std::fs::write(api_path(dir), serde_json::to_vec_pretty(&a).unwrap_or_default()) {
+        crate::logfile::line(&crate::logfile::now_stamp(),
+            &format!("перехват: не записать доступ к движку ({}): {e}", api_path(dir).display()));
+    }
     a
 }
 
@@ -1083,17 +1202,6 @@ pub fn log_tail(dir: &Path, lines: usize) -> String {
                 .map(|s| s.to_string()));
         }
     }
-    // ⛔ Главное — что делала сама программа: какие команды выполняла и
-    // что ответила система. Эти записи идут в общий журнал, и без них в
-    // окне была пустота вместо причины.
-    if let Some(parent) = dir.parent() {
-        if let Ok(t) = std::fs::read_to_string(parent.join("nexusproxy.log")) {
-            out.extend(t.lines().rev()
-                .filter(|l| l.contains("перехват"))
-                .take(lines)
-                .map(|s| s.to_string()));
-        }
-    }
     // ⛔ Строки идут из разных файлов, и часть повторяется. Без
     // упорядочивания и отсева человек читает мешанину, в которой
     // последовательность событий не видна.
@@ -1116,9 +1224,14 @@ fn stamp_of(line: &str) -> String {
     } else {
         0
     };
+    // ⛔ Режем по СИМВОЛАМ, а не по байтам: в строке лежит сырой вывод
+    // движка, и не-ASCII в первых девятнадцати байтах (кириллица в
+    // ответе системы, имя на своём языке) роняло разбор прямо в команде
+    // окна.
     let rest = &line[start.min(line.len())..];
-    if rest.len() >= 19 && rest.starts_with(|c: char| c.is_ascii_digit()) {
-        rest[..19].to_string()
+    let head: String = rest.chars().take(19).collect();
+    if head.chars().count() == 19 && head.starts_with(|c: char| c.is_ascii_digit()) {
+        head
     } else {
         "9999".to_string()
     }
