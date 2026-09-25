@@ -504,7 +504,63 @@ impl Engine {
             logfile::line(&logfile::now_stamp(),
                           &format!("правила изменены, разорвано соединений: {dropped}"));
         }
-        c.save(&self.path)
+        c.save(&self.path)?;
+        let tunnel = c.tunnel_mode;
+        drop(c);
+        // ⛔ Донести изменения до движка обязано КАЖДОЕ сохранение.
+        // Раньше это делала половина команд: правка пароля прокси,
+        // перевод группы, смена основного, применение подписки
+        // сохранялись в окне, а движок продолжал работать со старыми
+        // настройками до следующего переключения режима.
+        if tunnel {
+            if let Err(e) = self.sync_tunnel() {
+                logfile::line(&logfile::now_stamp(),
+                              &format!("перехват не принял настройки: {e}"));
+                return Err(format!("настройки сохранены, но перехват их не принял: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Переложить нынешние настройки в настройки движка перехвата.
+    pub fn sync_tunnel(&self) -> Result<(), String> {
+        let dir = tunnel_dir(&self.path);
+        let c = self.cfg.lock().unwrap();
+        let routes: Vec<tunnel::Route> = c.apps.iter()
+            .filter(|a| !a.via.trim().is_empty())
+            .map(|a| tunnel::Route {
+                process: launch::process_name(&a.path),
+                path: a.path.clone(),
+                via: a.via.clone(),
+            })
+            .collect();
+        let domains: Vec<tunnel::DomainRule> = c.through_proxy.iter()
+            .map(|p| tunnel::DomainRule { pattern: p.clone(), via: String::new() })
+            .chain(c.groups.iter().filter(|g| g.enabled).flat_map(|g| {
+                g.patterns.iter().map(move |p| tunnel::DomainRule {
+                    pattern: p.clone(), via: g.via.clone(),
+                })
+            }))
+            .map(|mut d| {
+                if d.via.trim().is_empty() {
+                    d.via = c.default_upstream.clone();
+                }
+                d
+            })
+            .collect();
+        let ups: Vec<tunnel::Upstream> = c.all_upstreams().into_iter()
+            .map(|u| tunnel::Upstream {
+                tag: u.name.clone(),
+                kind: match u.kind {
+                    upstream::Kind::Socks5 => tunnel::Kind::Socks5,
+                    upstream::Kind::Http => tunnel::Kind::Http,
+                },
+                address: u.address.clone(), port: u.port,
+                user: u.user.clone(), password: u.password.clone(),
+            })
+            .collect();
+        drop(c);
+        tunnel::write_config(&dir, &routes, &domains, &ups)
     }
 
     /// Временно увести правила одного прокси на другой.

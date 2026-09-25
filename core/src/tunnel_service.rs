@@ -131,16 +131,19 @@ mod imp {
         // попытка кончается отказом, который человек видит как поломку.
         // Задача крутится с включения компьютера и сама поднимет движок
         // по признаку — на это нужно несколько секунд.
-        // Движок уже работает — больше ничего не нужно.
-        for _ in 0..20 {
+        // ⛔ Ждём недолго. Этот вызов идёт из потока окна, и прежние
+        // десять секунд означали, что программа не показывается при
+        // запуске, а каждое добавление правила подвешивает окно.
+        // Служба поднимет движок сама, признак она уже видит.
+        for _ in 0..6 {
             if crate::tunnel::is_alive(dir) {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
         if task_exists() {
-            Err("служба перехвата установлена, но движок не поднялся. \
-                 Загляните в подробности работы — там ответ движка".into())
+            // Не ошибка: служба есть, признак стоит, движку нужно время.
+            Ok(())
         } else {
             Err("служба перехвата не установлена".into())
         }
@@ -173,7 +176,15 @@ mod imp {
         if !plist_path().exists() {
             return State::Absent;
         }
-        if super::flag_path(dir).exists() { State::Running } else { State::Stopped }
+        // ⛔ Одного признака мало: он лежит на месте и когда движок не
+        // скачан, упал или демон его не поднял. Окно при этом уверенно
+        // показывало «перехват работает», а программа при запуске даже
+        // не пыталась ничего исправить.
+        if super::flag_path(dir).exists() && crate::tunnel::is_alive(dir) {
+            State::Running
+        } else {
+            State::Stopped
+        }
     }
 
     /// Описание демона.
@@ -238,6 +249,16 @@ while true; do
     kill "$PID" 2>/dev/null
     wait "$PID" 2>/dev/null
     echo "$(date '+%F %T') движок остановлен" >> "$LOG"
+    # ⛔ Если движок падает сразу, без этой паузы он поднимался бы
+    # каждую секунду, и свой журнал наблюдателя распухал бы за сутки до
+    # сотен мегабайт — а читает его программа целиком, ровно тогда,
+    # когда человек полез смотреть, почему не работает.
+    if [ -f "$FLAG" ]; then sleep 5; fi
+  fi
+  # ⛔ Свой журнал тоже обрезаем.
+  MYSIZE=$(stat -f %z "$LOG" 2>/dev/null || echo 0)
+  if [ "$MYSIZE" -gt 2097152 ]; then
+    tail -c 1048576 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
   fi
   sleep 1
 done
@@ -801,7 +822,15 @@ pub fn install(dir: &Path) -> Result<(), String> {
 
 /// Убрать службу — тоже с запросом прав.
 pub fn uninstall() -> Result<(), String> {
-    run_elevated(&uninstall_command())
+    match run_elevated(&uninstall_command()) {
+        Ok(()) => Ok(()),
+        // ⛔ Снимать нечего — это не отказ. Человеку показывали ошибку
+        // там, где всё уже в нужном состоянии.
+        Err(e) if e.to_lowercase().contains("не найден")
+            || e.to_lowercase().contains("cannot find")
+            || e.to_lowercase().contains("does not exist") => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(windows)]
@@ -846,11 +875,24 @@ fn run_elevated(cmd: &str) -> Result<(), String> {
         // Человек мог нажать «Нет» — это его решение, а не наша поломка.
         return Err("права администратора не выданы".into());
     }
+    // ⛔ Ждём столько, сколько нужно: установка идёт с проверкой файлов
+    // сторожевой программой и на медленном диске занимает минуты. По
+    // истечении срока код возврата брался у ЕЩЁ РАБОТАЮЩЕГО процесса и
+    // равнялся «выполняется» — установка объявлялась провалившейся, а
+    // человек жал ещё раз и получал вторую поверх идущей.
+    const ЖДЁМ: u32 = 10 * 60 * 1000;
     let mut code: u32 = 0;
+    let итог = unsafe { WaitForSingleObject(info.hProcess, ЖДЁМ) };
     unsafe {
-        WaitForSingleObject(info.hProcess, 60_000);
-        GetExitCodeProcess(info.hProcess, &mut code);
+        if итог == 0 {
+            GetExitCodeProcess(info.hProcess, &mut code);
+        } else {
+            code = u32::MAX; // не дождались — считаем неудачей честно
+        }
         CloseHandle(info.hProcess);
+    }
+    if code == u32::MAX {
+        return Err("установка не завершилась за отведённое время".into());
     }
 
     let said = std::fs::read(&log).map(|b| imp::oem_to_utf8(&b)).unwrap_or_default();
