@@ -228,11 +228,53 @@ impl Config {
     }
 
     /// Пишем через временный файл: если запись оборвётся, старый конфиг цел.
+    /// ⛔ Сохранение обязано быть либо полным, либо никаким. Внезапное
+    /// отключение сразу после записи оставляло на месте настроек файл
+    /// нулевой длины: содержимое ещё не дошло до диска, а имя уже
+    /// переставлено. Дальше программа не могла его прочесть и заменяла
+    /// настройки человека умолчаниями.
     pub fn save(&self, path: &str) -> Result<(), String> {
+        use std::io::Write;
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let tmp = format!("{path}.tmp");
-        std::fs::write(&tmp, text.as_bytes()).map_err(|e| format!("не пишется {tmp}: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("не переименовать в {path}: {e}"))
+        // Имя временного файла своё у каждой записи: две одновременные
+        // записи иначе портят друг другу содержимое.
+        let tmp = format!("{path}.{}.tmp", crate::tunnel::random_tag());
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|e| format!("не пишется {tmp}: {e}"))?;
+            f.write_all(text.as_bytes()).map_err(|e| format!("не пишется {tmp}: {e}"))?;
+            f.sync_all().map_err(|e| format!("не сбросить на диск {tmp}: {e}"))?;
+        }
+        // Прежние настройки держим рядом: если новые окажутся негодными,
+        // человеку будет что вернуть.
+        if std::path::Path::new(path).is_file() {
+            let _ = std::fs::copy(path, format!("{path}.bak"));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("не переименовать в {path}: {e}")
+        })
+    }
+
+    /// Прочитать настройки, а если они испорчены — взять вчерашние.
+    ///
+    /// ⛔ Возвращаем ошибку, а не умолчания. Прежде любая неудача чтения
+    /// — оборванная запись, файл занят проверяющей программой, отказ
+    /// доступа — приводила к тому, что человек молча терял все прокси,
+    /// правила и список программ, и поверх тут же записывались пустые
+    /// настройки.
+    pub fn load_or_backup(path: &str) -> Result<(Self, Option<String>), String> {
+        match Self::load(path) {
+            Ok(c) => Ok((c, None)),
+            Err(first) => {
+                let bak = format!("{path}.bak");
+                match Self::load(&bak) {
+                    Ok(c) => Ok((c, Some(format!(
+                        "настройки не читались ({first}), взяты последние сохранённые")))),
+                    Err(_) => Err(first),
+                }
+            }
+        }
     }
 
     /// Добавить ресурс в список «через прокси». Возвращает false, если он уже был.
@@ -345,7 +387,155 @@ impl Config {
                 return Err(format!("группа ссылается на неизвестный прокси «{}»", g.via));
             }
         }
+        // ⛔ Приложения ссылаются на прокси по имени так же, как группы.
+        // Без проверки переименование прокси уводило весь их трафик на
+        // несуществующий адрес, и человек видел только, что программа
+        // «перестала ходить через прокси».
+        for a in &self.apps {
+            if !a.via.trim().is_empty() && self.upstream_by_name(&a.via).is_none() {
+                return Err(format!("приложение «{}» ссылается на неизвестный прокси «{}»",
+                                   a.name, a.via));
+            }
+        }
+        if !self.default_upstream.is_empty()
+            && self.upstream_by_name(&self.default_upstream).is_none()
+        {
+            return Err(format!("основным назначен неизвестный прокси «{}»",
+                               self.default_upstream));
+        }
         Ok(())
+    }
+
+    /// Переименование прокси — во всех местах, где на него ссылаются.
+    ///
+    /// ⛔ Ссылки живут по имени в трёх местах: группы, приложения и
+    /// «основной». Раньше обновлялись только первые два, и список
+    /// программ оставался указывать в пустоту.
+    pub fn rename_upstream(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        for g in &mut self.groups {
+            if g.via == from {
+                g.via = to.to_string();
+            }
+        }
+        for a in &mut self.apps {
+            if a.via == from {
+                a.via = to.to_string();
+            }
+        }
+        if self.default_upstream == from {
+            self.default_upstream = to.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod links_tests {
+    use super::*;
+
+    fn с_приложением() -> Config {
+        let mut c = tests::cfg(&[], &[]);
+        c.apps.push(crate::launch::App {
+            name: "Cursor".into(),
+            path: "C:\\Cursor.exe".into(),
+            kind: crate::launch::Kind::Auto,
+            via: "основной".into(),
+        });
+        c.groups.push(RouteGroup {
+            via: "основной".into(),
+            patterns: vec!["example.com".into()],
+            enabled: true,
+        });
+        c
+    }
+
+    /// ⛔ Переименование прокси обязано тянуть за собой список программ:
+    /// иначе весь их трафик уходит на несуществующее имя, и со стороны
+    /// это «программа перестала ходить через прокси».
+    #[test]
+    fn переименование_тянет_за_собой_программы() {
+        let mut c = с_приложением();
+        c.upstreams[0].name = "офис".into();
+        c.rename_upstream("основной", "офис");
+        assert_eq!(c.apps[0].via, "офис");
+        assert_eq!(c.groups[0].via, "офис");
+        assert_eq!(c.default_upstream, "офис");
+        assert!(c.check_links().is_ok(), "{:?}", c.check_links());
+    }
+
+    /// Ссылка в пустоту должна обнаруживаться, а не работать молча.
+    #[test]
+    fn ссылка_программы_в_пустоту_видна() {
+        let mut c = с_приложением();
+        c.apps[0].via = "которого-нет".into();
+        assert!(c.check_links().is_err(), "битая ссылка программы не замечена");
+    }
+
+    /// ⛔ Негодный файл не должен уничтожать то, что уже настроено.
+    #[test]
+    fn негодные_принесённые_настройки_не_рушат_свои() {
+        let mut c = с_приложением();
+        let было = c.through_proxy.clone();
+        let mut чужое = c.export();
+        чужое.upstreams.clear();           // прокси в файле нет вовсе
+        чужое.through_proxy = vec!["новое.com".into()];
+        let жалобы = c.import(чужое);
+        assert!(!жалобы.is_empty(), "негодный файл принят молча");
+        assert_eq!(c.through_proxy, было, "свои правила затёрты");
+        assert_eq!(c.apps.len(), 1, "свой список программ затёрт");
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    /// ⛔ Испорченные настройки не должны превращаться в пустые: за ними
+    /// весь труд человека — прокси, правила, список программ.
+    #[test]
+    fn испорченные_настройки_берутся_из_запасной_копии() {
+        let dir = std::env::temp_dir().join(format!("np-cfg-{}", crate::tunnel::random_tag()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json").display().to_string();
+
+        let mut c = tests::cfg(&["example.com"], &[]);
+        c.save(&path).unwrap();
+        // второе сохранение кладёт первое в запасную копию
+        c.through_proxy.push("second.com".into());
+        c.save(&path).unwrap();
+
+        std::fs::write(&path, "{ это не настройки").unwrap();
+        let (back, note) = Config::load_or_backup(&path).unwrap();
+        assert!(note.is_some(), "человеку не сказали, что взяли запасную копию");
+        assert!(back.through_proxy.contains(&"example.com".to_string()),
+                "правила потеряны: {:?}", back.through_proxy);
+
+        // а когда и запасной копии нет — честная ошибка, а не умолчания
+        std::fs::remove_file(format!("{path}.bak")).unwrap();
+        assert!(Config::load_or_backup(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// После записи содержимое обязано быть на диске целиком.
+    #[test]
+    fn сохранение_доходит_до_диска_целиком() {
+        let dir = std::env::temp_dir().join(format!("np-cfg2-{}", crate::tunnel::random_tag()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json").display().to_string();
+        let c = tests::cfg(&["a.com", "b.com"], &["c.com"]);
+        c.save(&path).unwrap();
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back.through_proxy.len(), 2);
+        assert_eq!(back.direct.len(), 1);
+        // временных огрызков после себя не оставляем
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "остались временные файлы: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -656,7 +846,11 @@ impl Config {
                 kept.insert(u.name.clone(), pw);
             }
         }
-        self.upstreams = p.upstreams.into_iter()
+        // ⛔ Сначала собираем, потом проверяем, и только потом меняем
+        // своё. Раньше негодный файл (пустой список прокси, группа на
+        // несуществующий) уничтожал настройки человека ещё до того, как
+        // выяснялось, что принять его нельзя.
+        let upstreams: Vec<_> = p.upstreams.into_iter()
             .map(|mut u| {
                 if u.password.is_none() {
                     u.password = kept.get(&u.name).cloned();
@@ -664,13 +858,24 @@ impl Config {
                 u
             })
             .collect();
-        self.default_upstream = p.default_upstream;
-        self.groups = p.groups;
-        self.through_proxy = p.through_proxy;
-        self.direct = p.direct;
-        self.tunnel_mode = p.tunnel_mode;
-        self.upstream = None;
 
+        let mut пробный = self.clone();
+        пробный.upstreams = upstreams;
+        пробный.default_upstream = p.default_upstream;
+        пробный.groups = p.groups;
+        пробный.through_proxy = p.through_proxy;
+        пробный.direct = p.direct;
+        пробный.tunnel_mode = p.tunnel_mode;
+        пробный.upstream = None;
+        пробный.migrate();
+
+        if let Err(e) = пробный.check_links() {
+            return vec![format!("настройки не приняты: {e}")];
+        }
+        if пробный.all_upstreams().is_empty() {
+            return vec!["в файле нет ни одного прокси — настройки не приняты".into()];
+        }
+        *self = пробный;
         Vec::new()
     }
 }
