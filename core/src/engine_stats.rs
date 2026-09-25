@@ -18,7 +18,7 @@ struct Snapshot {
     connections: Option<Vec<Raw>>,
     /// ⛔ Итог за всё время ведёт сам движок. Складывать его из снимков
     /// нельзя: соединения, открывшиеся и закрывшиеся между двумя
-    /// опросами, в снимок не попадают вовсе, и сумма выходит заниженной.
+    /// опросами, в snapshot_of не попадают вовсе, и сумма выходит заниженной.
     #[serde(rename = "downloadTotal", default)]
     download_total: u64,
     #[serde(rename = "uploadTotal", default)]
@@ -97,7 +97,7 @@ fn snapshot(api: &crate::tunnel::Api) -> Result<Snapshot, String> {
     serde_json::from_str(&text).map_err(|e| format!("движок ответил непонятным: {e}"))
 }
 
-/// Забрать у движка свежий снимок и обновить учёт.
+/// Забрать у движка свежий snapshot_of и обновить учёт.
 pub fn refresh(dir: &Path) -> Result<(), String> {
     let api = crate::tunnel::api_access(dir);
     apply(snapshot(&api)?);
@@ -214,15 +214,15 @@ fn apply_to(st: &mut State, raw: &[Raw]) -> Vec<(String, u16, String, String)> {
     // за сутки работы это десятки тысяч имён, которые окно копирует и
     // сортирует каждую секунду.
     if st.totals.len() > ПРЕДЕЛ_ДОМЕНОВ {
-        let mut весом: Vec<(String, u64)> = st.totals.iter()
+        let mut by_volume: Vec<(String, u64)> = st.totals.iter()
             .map(|(k, v)| (k.clone(), v.sent + v.received))
             .collect();
-        весом.sort_by(|a, b| b.1.cmp(&a.1));
-        let оставить: HashSet<String> = весом.into_iter()
+        by_volume.sort_by(|a, b| b.1.cmp(&a.1));
+        let keep: HashSet<String> = by_volume.into_iter()
             .take(ПРЕДЕЛ_ДОМЕНОВ)
             .map(|(k, _)| k)
             .collect();
-        st.totals.retain(|k, _| оставить.contains(k));
+        st.totals.retain(|k, _| keep.contains(k));
     }
     fresh
 }
@@ -261,11 +261,11 @@ pub fn totals_all() -> (u64, u64) {
 mod tests {
     use super::*;
 
-    fn снимок(текст: &str) -> Vec<Raw> {
-        serde_json::from_str::<Snapshot>(текст).unwrap().connections.unwrap_or_default()
+    fn snapshot_of(text: &str) -> Vec<Raw> {
+        serde_json::from_str::<Snapshot>(text).unwrap().connections.unwrap_or_default()
     }
 
-    fn одно(id: &str, up: u64, down: u64) -> String {
+    fn one_conn(id: &str, up: u64, down: u64) -> String {
         format!(r#"{{"connections":[{{"id":"{id}","chains":["direct"],
             "upload":{up},"download":{down},
             "metadata":{{"host":"example.com","destinationPort":"443",
@@ -274,7 +274,7 @@ mod tests {
 
     /// ⛔ Движок отдаёт счётчики соединения ЦЕЛИКОМ. Складывая их на
     /// каждом снимке, программа умножала бы трафик на число опросов.
-    fn итоги(st: &State) -> Vec<DomainStat> {
+    fn totals_of(st: &State) -> Vec<DomainStat> {
         st.totals.values().cloned().collect()
     }
 
@@ -282,9 +282,9 @@ mod tests {
     fn трафик_не_умножается_на_число_опросов() {
         let mut st = State::default();
         for _ in 0..5 {
-            let _ = apply_to(&mut st, &снимок(&одно("a", 100, 900)));
+            let _ = apply_to(&mut st, &snapshot_of(&one_conn("a", 100, 900)));
         }
-        let t = итоги(&st);
+        let t = totals_of(&st);
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].sent, 100, "отданное посчитано неверно");
         assert_eq!(t[0].received, 900, "полученное посчитано неверно");
@@ -294,9 +294,9 @@ mod tests {
     #[test]
     fn прирост_между_снимками_засчитывается() {
         let mut st = State::default();
-        apply_to(&mut st, &снимок(&одно("b", 10, 20)));
-        apply_to(&mut st, &снимок(&одно("b", 30, 70)));
-        let t = итоги(&st);
+        apply_to(&mut st, &snapshot_of(&one_conn("b", 10, 20)));
+        apply_to(&mut st, &snapshot_of(&one_conn("b", 30, 70)));
+        let t = totals_of(&st);
         assert_eq!(t[0].sent, 30);
         assert_eq!(t[0].received, 70);
     }
@@ -308,9 +308,9 @@ mod tests {
     fn соединение_без_трафика_считается_один_раз() {
         let mut st = State::default();
         for _ in 0..4 {
-            apply_to(&mut st, &снимок(&одно("c", 0, 0)));
+            apply_to(&mut st, &snapshot_of(&one_conn("c", 0, 0)));
         }
-        assert_eq!(итоги(&st)[0].conns, 1, "соединение посчитано несколько раз");
+        assert_eq!(totals_of(&st)[0].conns, 1, "соединение посчитано несколько раз");
     }
 
     #[test]

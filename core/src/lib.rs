@@ -74,7 +74,7 @@ fn build_pool(cfg: &config::Config) -> upstream::Pool {
     for u in &cfg.upstreams {
         m.insert(u.name.clone(), u.clone());
     }
-    // пустое имя — «через тот, что по умолчанию»
+    // пустое name — «через тот, что по умолчанию»
     if let Some(d) = cfg.default_proxy() {
         m.insert(String::new(), d.clone());
     }
@@ -233,7 +233,7 @@ impl Engine {
         });
 
         // Сторож проверяет КАЖДЫЙ прокси из настроек, а не только основной:
-        // иначе о том, что запасной лёг, узнаёшь только когда он понадобился.
+        // иначе о том, что fallback лёг, узнаёшь только когда он понадобился.
         let watch_routing = routing.clone();
         let watch_recheck = recheck.clone();
         let watch_cfg = e.cfg.clone();
@@ -293,7 +293,7 @@ impl Engine {
 
                 let list: Vec<upstream::Upstream> = {
                     let r = watch_routing.read().unwrap();
-                    // пустое имя — дубль основного, его пропускаем
+                    // пустое name — дубль основного, его пропускаем
                     r.pool.iter().filter(|(k, _)| !k.is_empty()).map(|(_, v)| v.clone()).collect()
                 };
                 // ⛔ Имя основного прокси берём заново на каждом круге.
@@ -419,33 +419,33 @@ impl Engine {
             // переименовалась, программа переставала сохранять ЧТО
             // УГОДНО — каждое сохранение падало на проверке ссылок, а
             // человек видел лишь, что настройки не применяются.
-            let уходят: Vec<String> = c.upstreams.iter()
+            let leaving: Vec<String> = c.upstreams.iter()
                 .filter(|u| u.from_subscription)
                 .map(|u| u.name.clone())
                 .collect();
-            let остаются: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
-            let запасной = c.upstreams.iter()
+            let staying: Vec<String> = profiles.iter().map(|p| p.name.clone()).collect();
+            let fallback = c.upstreams.iter()
                 .find(|u| !u.from_subscription)
                 .map(|u| u.name.clone())
                 .unwrap_or_default();
-            for имя in уходят.iter().filter(|n| !остаются.contains(n)) {
+            for name in leaving.iter().filter(|n| !staying.contains(n)) {
                 for g in c.groups.iter_mut() {
-                    if g.via == *имя {
-                        g.via = запасной.clone();
+                    if g.via == *name {
+                        g.via = fallback.clone();
                     }
                 }
                 for a in c.apps.iter_mut() {
-                    if a.via == *имя {
-                        a.via = запасной.clone();
+                    if a.via == *name {
+                        a.via = fallback.clone();
                     }
                 }
-                if c.default_upstream == *имя {
-                    c.default_upstream = запасной.clone();
+                if c.default_upstream == *name {
+                    c.default_upstream = fallback.clone();
                 }
             }
             c.upstreams.retain(|u| !u.from_subscription);
             for (i, p) in profiles.iter().enumerate() {
-                // имя может совпасть с уже заведённым вручную — не затираем чужое
+                // name может совпасть с уже заведённым вручную — не затираем чужое
                 let name = if c.upstreams.iter().any(|u| u.name == p.name) {
                     format!("{} (подписка)", p.name)
                 } else {

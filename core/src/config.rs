@@ -49,7 +49,7 @@ pub fn normalize(pattern: &str) -> String {
     format!("domain:{p}")
 }
 
-/// Подписка: откуда взяли и что в ней было.
+/// Подписка: откуда взяли и что в ней before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     /// адрес, если подписку берут по ссылке — чтобы обновлять
@@ -62,7 +62,7 @@ pub struct Subscription {
     pub enabled: bool,
 }
 
-/// Итог добавления списком — что принято, что уже было, что не разобрано.
+/// Итог добавления списком — что принято, что уже before, что не разобрано.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct BulkResult {
     pub added: Vec<String>,
@@ -156,7 +156,7 @@ impl Config {
     }
 
     /// Переносит старое поле `upstream` в общий список и следит,
-    /// чтобы у каждого прокси было имя, а «по умолчанию» указывал
+    /// чтобы у каждого прокси before имя, а «по умолчанию» указывал
     /// на существующую запись.
     pub fn migrate(&mut self) {
         if let Some(mut u) = self.upstream.take() {
@@ -330,7 +330,7 @@ impl Config {
 
     /// Убрать ресурс отовсюду: и из общего списка, и из групп.
     /// ⛔ Раньше чистился только общий список, и правило, переведённое
-    /// на другой прокси, удалить было нельзя — оно молча оставалось.
+    /// на другой прокси, удалить before нельзя — оно молча оставалось.
     pub fn remove_proxy(&mut self, pattern: &str) -> bool {
         let p = normalize(pattern);
         let before = self.through_proxy.len()
@@ -435,7 +435,7 @@ impl Config {
 mod links_tests {
     use super::*;
 
-    fn с_приложением() -> Config {
+    fn with_app() -> Config {
         let mut c = tests::cfg(&[], &[]);
         c.apps.push(crate::launch::App {
             name: "Cursor".into(),
@@ -456,7 +456,7 @@ mod links_tests {
     /// это «программа перестала ходить через прокси».
     #[test]
     fn переименование_тянет_за_собой_программы() {
-        let mut c = с_приложением();
+        let mut c = with_app();
         c.upstreams[0].name = "офис".into();
         c.rename_upstream("основной", "офис");
         assert_eq!(c.apps[0].via, "офис");
@@ -468,7 +468,7 @@ mod links_tests {
     /// Ссылка в пустоту должна обнаруживаться, а не работать молча.
     #[test]
     fn ссылка_программы_в_пустоту_видна() {
-        let mut c = с_приложением();
+        let mut c = with_app();
         c.apps[0].via = "которого-нет".into();
         assert!(c.check_links().is_err(), "битая ссылка программы не замечена");
     }
@@ -476,14 +476,14 @@ mod links_tests {
     /// ⛔ Негодный файл не должен уничтожать то, что уже настроено.
     #[test]
     fn негодные_принесённые_настройки_не_рушат_свои() {
-        let mut c = с_приложением();
-        let было = c.through_proxy.clone();
-        let mut чужое = c.export();
-        чужое.upstreams.clear();           // прокси в файле нет вовсе
-        чужое.through_proxy = vec!["новое.com".into()];
-        let жалобы = c.import(чужое);
-        assert!(!жалобы.is_empty(), "негодный файл принят молча");
-        assert_eq!(c.through_proxy, было, "свои правила затёрты");
+        let mut c = with_app();
+        let before = c.through_proxy.clone();
+        let mut incoming = c.export();
+        incoming.upstreams.clear();           // прокси в файле нет вовсе
+        incoming.through_proxy = vec!["новое.com".into()];
+        let complaints = c.import(incoming);
+        assert!(!complaints.is_empty(), "негодный файл принят молча");
+        assert_eq!(c.through_proxy, before, "свои правила затёрты");
         assert_eq!(c.apps.len(), 1, "свой список программ затёрт");
     }
 }
@@ -859,23 +859,23 @@ impl Config {
             })
             .collect();
 
-        let mut пробный = self.clone();
-        пробный.upstreams = upstreams;
-        пробный.default_upstream = p.default_upstream;
-        пробный.groups = p.groups;
-        пробный.through_proxy = p.through_proxy;
-        пробный.direct = p.direct;
-        пробный.tunnel_mode = p.tunnel_mode;
-        пробный.upstream = None;
-        пробный.migrate();
+        let mut candidate = self.clone();
+        candidate.upstreams = upstreams;
+        candidate.default_upstream = p.default_upstream;
+        candidate.groups = p.groups;
+        candidate.through_proxy = p.through_proxy;
+        candidate.direct = p.direct;
+        candidate.tunnel_mode = p.tunnel_mode;
+        candidate.upstream = None;
+        candidate.migrate();
 
-        if let Err(e) = пробный.check_links() {
+        if let Err(e) = candidate.check_links() {
             return vec![format!("настройки не приняты: {e}")];
         }
-        if пробный.all_upstreams().is_empty() {
+        if candidate.all_upstreams().is_empty() {
             return vec!["в файле нет ни одного прокси — настройки не приняты".into()];
         }
-        *self = пробный;
+        *self = candidate;
         Vec::new()
     }
 }
@@ -903,14 +903,14 @@ mod portable_tests {
         let mut c = tests::cfg(&[], &[]);
         c.upstreams[0].name = "офис".into();
         c.upstreams[0].password = Some("мой-пароль".into());
-        let принесённое = c.export();
-        c.import(принесённое);
+        let brought = c.export();
+        c.import(brought);
         assert_eq!(c.upstreams[0].password.as_deref(), Some("мой-пароль"));
     }
 
     /// ⛔ В перенос не должно попадать ничего, привязанного к машине:
     /// пути к журналу, состояние, порты. Иначе настройки одного человека
-    /// утащат за собой чужое, и у второго не заработает.
+    /// утащат за собой incoming, и у второго не заработает.
     #[test]
     fn переносим_только_настроенное_руками() {
         let c = tests::cfg(&["domain:grid.gg"], &[]);
