@@ -99,8 +99,24 @@ impl Engine {
         let tdir = tunnel_dir(path);
         if cfg.tunnel_mode {
             match tunnel_service::state_in(&tdir) {
+                // ⛔ Работает — ещё не значит «свежая». Служба ставится
+                // один раз, а её повадки меняются вместе с программой:
+                // без этой проверки обновление молча не доезжало, и
+                // человек продолжал работать на прежней службе, считая,
+                // что получил новую.
                 tunnel_service::State::Running => {
-                    logfile::line(&logfile::now_stamp(), "перехват: уже работает");
+                    if tunnel_service::needs_reinstall(&tdir) {
+                        logfile::line(&logfile::now_stamp(),
+                            "перехват: служба устарела — ставлю заново");
+                        match tunnel_service::install(&tdir) {
+                            Ok(_) => logfile::line(&logfile::now_stamp(),
+                                "перехват: служба обновлена"),
+                            Err(e) => logfile::line(&logfile::now_stamp(),
+                                &format!("перехват: служба не обновилась: {e}")),
+                        }
+                    } else {
+                        logfile::line(&logfile::now_stamp(), "перехват: уже работает");
+                    }
                 }
                 tunnel_service::State::Stopped => {
                     match tunnel_service::start_in(&tdir) {
