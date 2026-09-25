@@ -18,7 +18,7 @@ struct Snapshot {
     connections: Option<Vec<Raw>>,
     /// ⛔ Итог за всё время ведёт сам движок. Складывать его из снимков
     /// нельзя: соединения, открывшиеся и закрывшиеся между двумя
-    /// опросами, в snapshot_of не попадают вовсе, и сумма выходит заниженной.
+    /// опросами, в снимок не попадают вовсе, и сумма выходит заниженной.
     #[serde(rename = "downloadTotal", default)]
     download_total: u64,
     #[serde(rename = "uploadTotal", default)]
@@ -97,7 +97,7 @@ fn snapshot(api: &crate::tunnel::Api) -> Result<Snapshot, String> {
     serde_json::from_str(&text).map_err(|e| format!("движок ответил непонятным: {e}"))
 }
 
-/// Забрать у движка свежий snapshot_of и обновить учёт.
+/// Забрать у движка свежий снимок и обновить учёт.
 pub fn refresh(dir: &Path) -> Result<(), String> {
     let api = crate::tunnel::api_access(dir);
     apply(snapshot(&api)?);

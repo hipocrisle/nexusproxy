@@ -468,7 +468,7 @@ fn sub_state(app: State<App>) -> SubState {
 }
 
 /// Скачать xray. Отдельным действием и только по нажатию: в состав
-/// программы он не входит, чтобы на рабочих машинах его не before вовсе.
+/// программы он не входит, чтобы на рабочих машинах его не было вовсе.
 #[tauri::command]
 async fn sub_install(app: tauri::AppHandle) -> Result<String, String> {
     let path = app.state::<App>().path.lock().unwrap().clone();
@@ -842,7 +842,7 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
     let fresh = match core::Engine::start(cfg, &path).await {
         Ok(e) => e,
         Err(err) => {
-            // ⛔ Возвращаем как before. Иначе программа остаётся без
+            // ⛔ Возвращаем как было. Иначе программа остаётся без
             // движка НАВСЕГДА: негодные порты уже записаны в файл, и
             // перезапуск не помогает — человеку остаётся править
             // настройки руками в блокноте.
@@ -925,7 +925,7 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<String, String
     let e = engine(&state)?;
     // Прокси у приложения обязателен: ради него его сюда и добавляют.
     // Пустое значение оставляло бы приложение жить по общим правилам —
-    // ровно то, что before бы и без записи в списке.
+    // ровно то, что было бы и без записи в списке.
     let mut item = item;
     if item.via.trim().is_empty() {
         item.via = e.cfg.lock().unwrap().default_upstream.clone();
@@ -988,7 +988,7 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
 /// ⛔ Вызывать при ЛЮБОМ изменении списка приложений и правил. Движок
 /// читает настройки при запуске: не обновив их, мы оставляем его со
 /// старым списком — человек добавляет приложение, видит его в окне, а
-/// трафик идёт мимо. Так и before: добавленный браузер в туннель не
+/// трафик идёт мимо. Так и было: добавленный браузер в туннель не
 /// попадал вовсе.
 /// Работает ли сейчас перехват — от этого зависит, чьи счётчики верны.
 fn tunnel_on(app: &State<App>) -> bool {
@@ -1097,6 +1097,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
                 },
                 address: u.address.clone(), port: u.port,
                 user: u.user.clone(), password: u.password.clone(),
+                from_subscription: u.from_subscription,
             })
             .collect();
         // ⛔ Правила по доменам обязаны попасть в туннель: системные
@@ -1349,6 +1350,11 @@ pub fn run() {
                 });
             }
 
+            // ⛔ Отчёт о состоянии — сразу, до запуска движка: если
+            // что-то не так, это видно в журнале первой же записью, и
+            // разбор не начинается с переписки «пришли вывод команды».
+            core::selfcheck::run(&cfg, &path_s, env!("CARGO_PKG_VERSION"));
+
             let rt = tokio::runtime::Runtime::new()?;
             match rt.block_on(core::Engine::start(cfg, &path_s)) {
                 Ok(e) => {
@@ -1378,7 +1384,7 @@ pub fn run() {
             }
 
             // ⛔ Только ПОСЛЕ запуска движка: раньше этот блок стоял выше,
-            // движка ещё не before, и галка «включать при запуске» молча
+            // движка ещё не было, и галка «включать при запуске» молча
             // ничего не делала.
             {
                 let e = app.state::<App>().engine.lock().unwrap().clone();
