@@ -64,6 +64,10 @@ fn route_of(chains: &[String]) -> (String, String) {
     }
 }
 
+fn port_of(m: &Meta) -> u16 {
+    m.destination_port.parse().unwrap_or(0)
+}
+
 fn snapshot(api: &crate::tunnel::Api) -> Result<Vec<Raw>, String> {
     // ⛔ Со сроком ожидания: иначе поток опроса замирает навсегда, если
     // на том конце соединение принимают, но не отвечают.
@@ -81,16 +85,30 @@ pub fn refresh(dir: &Path) -> Result<(), String> {
 }
 
 fn apply(raw: Vec<Raw>) {
-    let mut g = S.lock().unwrap();
-    apply_to(g.get_or_insert_with(State::default), &raw);
+    let fresh = {
+        let mut g = S.lock().unwrap();
+        apply_to(g.get_or_insert_with(State::default), &raw)
+    };
+    // ⛔ Журнал наполняем ЗДЕСЬ, а не в учёте: учёт должен оставаться
+    // без побочных действий, иначе его проверки пишут в общий журнал и
+    // сбивают чужие.
+    for (host, port, route, via) in fresh {
+        let r = if route == "proxy" {
+            crate::rules::Route::Proxy(via.clone())
+        } else {
+            crate::rules::Route::Direct
+        };
+        crate::journal::push(&host, port, &r, &via);
+    }
 }
 
-/// Чистый учёт — отдельно от общего состояния, чтобы его можно было
-/// проверять без движка.
-fn apply_to(st: &mut State, raw: &[Raw]) {
+/// Чистый учёт — без побочных действий, чтобы его можно было проверять
+/// без движка. Возвращает соединения, увиденные впервые.
+fn apply_to(st: &mut State, raw: &[Raw]) -> Vec<(String, u16, String, String)> {
 
     let mut alive: Vec<Conn> = Vec::with_capacity(raw.len());
     let mut seen: Vec<String> = Vec::with_capacity(raw.len());
+    let mut fresh: Vec<(String, u16, String, String)> = Vec::new();
 
     for c in raw {
         seen.push(c.id.clone());
@@ -132,10 +150,14 @@ fn apply_to(st: &mut State, raw: &[Raw]) {
             e.received += down;
         }
 
+        if first_time {
+            fresh.push((host.clone(), port_of(&c.metadata), route.clone(), via.clone()));
+        }
+
         alive.push(Conn {
             id: 0,
             host,
-            port: c.metadata.destination_port.parse().unwrap_or(0),
+            port: port_of(&c.metadata),
             route,
             via,
             app: if c.metadata.process_path.is_empty() {
@@ -157,6 +179,7 @@ fn apply_to(st: &mut State, raw: &[Raw]) {
 
     alive.sort_by(|a, b| (b.sent + b.received).cmp(&(a.sent + a.received)));
     st.active = alive;
+    fresh
 }
 
 pub fn active() -> Vec<Conn> {
@@ -202,7 +225,7 @@ mod tests {
     fn трафик_не_умножается_на_число_опросов() {
         let mut st = State::default();
         for _ in 0..5 {
-            apply_to(&mut st, &снимок(&одно("a", 100, 900)));
+            let _ = apply_to(&mut st, &снимок(&одно("a", 100, 900)));
         }
         let t = итоги(&st);
         assert_eq!(t.len(), 1);
