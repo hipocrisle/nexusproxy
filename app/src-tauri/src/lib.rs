@@ -285,18 +285,18 @@ fn presets() -> Vec<core::presets::Preset> {
 #[tauri::command]
 fn rule_remove_many(app: State<App>, patterns: Vec<String>) -> Result<usize, String> {
     let e = engine(&app)?;
-    let mut снято = 0;
+    let mut removed = 0;
     {
         let mut c = e.cfg.lock().unwrap();
         for p in &patterns {
             if c.remove_proxy(p) {
-                снято += 1;
+                removed += 1;
             }
         }
     }
     e.apply_and_save()?;
     let _ = refresh_tunnel(&app);
-    Ok(снято)
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -468,7 +468,7 @@ fn sub_state(app: State<App>) -> SubState {
 }
 
 /// Скачать xray. Отдельным действием и только по нажатию: в состав
-/// программы он не входит, чтобы на рабочих машинах его не было вовсе.
+/// программы он не входит, чтобы на рабочих машинах его не before вовсе.
 #[tauri::command]
 async fn sub_install(app: tauri::AppHandle) -> Result<String, String> {
     let path = app.state::<App>().path.lock().unwrap().clone();
@@ -828,7 +828,7 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
         return Err("у входов должны быть разные порты".into());
     }
 
-    let было = cfg.clone();
+    let before = cfg.clone();
     cfg.listen.http = s.http_port;
     cfg.listen.socks = s.socks_port;
     cfg.save(&path)?;
@@ -842,12 +842,12 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
     let fresh = match core::Engine::start(cfg, &path).await {
         Ok(e) => e,
         Err(err) => {
-            // ⛔ Возвращаем как было. Иначе программа остаётся без
+            // ⛔ Возвращаем как before. Иначе программа остаётся без
             // движка НАВСЕГДА: негодные порты уже записаны в файл, и
             // перезапуск не помогает — человеку остаётся править
             // настройки руками в блокноте.
-            let _ = было.save(&path);
-            match core::Engine::start(было, &path).await {
+            let _ = before.save(&path);
+            match core::Engine::start(before, &path).await {
                 Ok(back) => {
                     if was_on {
                         let _ = back.system_proxy_on();
@@ -925,7 +925,7 @@ fn app_save(state: State<App>, item: core::launch::App) -> Result<String, String
     let e = engine(&state)?;
     // Прокси у приложения обязателен: ради него его сюда и добавляют.
     // Пустое значение оставляло бы приложение жить по общим правилам —
-    // ровно то, что было бы и без записи в списке.
+    // ровно то, что before бы и без записи в списке.
     let mut item = item;
     if item.via.trim().is_empty() {
         item.via = e.cfg.lock().unwrap().default_upstream.clone();
@@ -988,7 +988,7 @@ fn app_launch(state: State<App>, path: String) -> Result<String, String> {
 /// ⛔ Вызывать при ЛЮБОМ изменении списка приложений и правил. Движок
 /// читает настройки при запуске: не обновив их, мы оставляем его со
 /// старым списком — человек добавляет приложение, видит его в окне, а
-/// трафик идёт мимо. Так и было: добавленный браузер в туннель не
+/// трафик идёт мимо. Так и before: добавленный браузер в туннель не
 /// попадал вовсе.
 /// Работает ли сейчас перехват — от этого зависит, чьи счётчики верны.
 fn tunnel_on(app: &State<App>) -> bool {
@@ -1292,7 +1292,10 @@ pub fn run() {
                     // Ничего не портим: откладываем нечитаемый файл в
                     // сторону, чтобы человек мог его посмотреть, и
                     // говорим об этом прямо.
-                    let kept = format!("{path_s}.испорчен");
+                    // ⛔ Имя латиницей: путь попадает в сообщения и
+                    // команды разбора, а кириллица в них ведёт себя
+                    // по-разному в разных оболочках и кодировках.
+                    let kept = format!("{path_s}.broken");
                     let _ = std::fs::rename(&path_s, &kept);
                     let note = format!("{e}. Прежний файл отложен: {kept}");
                     core::logfile::line(&core::logfile::now_stamp(), &note);
@@ -1375,7 +1378,7 @@ pub fn run() {
             }
 
             // ⛔ Только ПОСЛЕ запуска движка: раньше этот блок стоял выше,
-            // движка ещё не было, и галка «включать при запуске» молча
+            // движка ещё не before, и галка «включать при запуске» молча
             // ничего не делала.
             {
                 let e = app.state::<App>().engine.lock().unwrap().clone();

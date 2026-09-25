@@ -59,11 +59,11 @@ pub async fn both_ways_until(
                     r = cr.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n },
                     _ = &mut notified => break,
                 };
-                let ушло = tokio::select! {
+                let passed = tokio::select! {
                     w = sw.write_all(&buf[..n]) => w.is_ok(),
                     _ = &mut notified => false,
                 };
-                if !ушло {
+                if !passed {
                     break;
                 }
                 c.sent.fetch_add(n as u64, Ordering::Relaxed);
@@ -88,11 +88,11 @@ pub async fn both_ways_until(
                     r = sr.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n },
                     _ = &mut notified => break,
                 };
-                let ушло = tokio::select! {
+                let passed = tokio::select! {
                     w = cw.write_all(&buf[..n]) => w.is_ok(),
                     _ = &mut notified => false,
                 };
-                if !ушло {
+                if !passed {
                     break;
                 }
                 c.received.fetch_add(n as u64, Ordering::Relaxed);
@@ -118,47 +118,47 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
-        let слушает = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let адрес = слушает.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         // та сторона принимает соединение и НЕ читает — запись упирается
-        let держит = tokio::spawn(async move {
-            let (s, _) = слушает.accept().await.unwrap();
+        let holder = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             drop(s);
         });
 
-        let к_серверу = tokio::net::TcpStream::connect(адрес).await.unwrap();
-        let наш = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let наш_адрес = наш.local_addr().unwrap();
-        let клиент = tokio::spawn(async move {
-            let mut c = tokio::net::TcpStream::connect(наш_адрес).await.unwrap();
-            // шлём много, чтобы перекачка встала в записи
-            let кусок = vec![7u8; 1024 * 1024];
+        let to_server = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ours = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ours_addr = ours.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(ours_addr).await.unwrap();
+            // шлём много, чтобы pumping встала в записи
+            let chunk = vec![7u8; 1024 * 1024];
             for _ in 0..40 {
-                if c.write_all(&кусок).await.is_err() {
+                if c.write_all(&chunk).await.is_err() {
                     break;
                 }
             }
         });
-        let (со_стороны_клиента, _) = наш.accept().await.unwrap();
+        let (from_client, _) = ours.accept().await.unwrap();
 
         let kill = std::sync::Arc::new(tokio::sync::Notify::new());
         let counters = std::sync::Arc::new(Counters::default());
-        let перекачка = tokio::spawn(both_ways_until(
-            со_стороны_клиента, к_серверу, counters, kill.clone()));
+        let pumping = tokio::spawn(both_ways_until(
+            from_client, to_server, counters, kill.clone()));
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         kill.notify_waiters();
 
-        let начало = std::time::Instant::now();
-        let итог = tokio::time::timeout(std::time::Duration::from_secs(10), перекачка).await;
-        println!("перекачка завершилась за {:?}", начало.elapsed());
-        assert!(итог.is_ok(), "обрыв не сработал — соединение осталось жить");
-        assert!(начало.elapsed() < std::time::Duration::from_secs(5),
-                "обрыв сработал слишком медленно: {:?}", начало.elapsed());
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), pumping).await;
+        println!("pumping завершилась за {:?}", started.elapsed());
+        assert!(outcome.is_ok(), "обрыв не сработал — соединение осталось жить");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5),
+                "обрыв сработал слишком медленно: {:?}", started.elapsed());
 
-        держит.abort();
-        клиент.abort();
+        holder.abort();
+        client_task.abort();
     }
     use tokio::net::TcpListener;
 
@@ -201,7 +201,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let (sent, received) = counters.get();
-        assert_eq!(sent, 5, "отдано — то, что ушло от клиента");
+        assert_eq!(sent, 5, "отдано — то, что passed от клиента");
         assert_eq!(received, 10, "получено — то, что пришло обратно");
     }
 

@@ -35,10 +35,12 @@ pub fn open(path: PathBuf) -> std::io::Result<()> {
     let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let written = file.metadata().map(|m| m.len()).unwrap_or(0);
     // соседний файл под записи о соединениях
-    let рядом = path.with_file_name("соединения.log");
-    if let Ok(f) = OpenOptions::new().create(true).append(true).open(&рядом) {
+    // ⛔ Имя латиницей: путь попадает в команды разбора, а кириллица в
+    // них ведёт себя по-разному в разных оболочках и кодировках.
+    let beside = path.with_file_name("nexusproxy-connections.log");
+    if let Ok(f) = OpenOptions::new().create(true).append(true).open(&beside) {
         let w = f.metadata().map(|m| m.len()).unwrap_or(0);
-        *TRAFFIC.lock().unwrap() = Some(Sink { path: рядом, file: f, written: w });
+        *TRAFFIC.lock().unwrap() = Some(Sink { path: beside, file: f, written: w });
     }
     *SINK.lock().unwrap() = Some(Sink { path, file, written });
     Ok(())
