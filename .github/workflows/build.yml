@@ -24,8 +24,9 @@ jobs:
   core:
     name: Тесты движка
     runs-on: ubuntu-24.04
-    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
-    timeout-minutes: 40
+    # ⛔ Обычная сборка укладывается минут в пятнадцать. Без ограничения
+    # зависшая работа держала бы выпуск до шести часов.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,8 +38,9 @@ jobs:
   macos:
     name: Сборка под macOS
     runs-on: macos-latest
-    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
-    timeout-minutes: 40
+    # ⛔ Обычная сборка укладывается минут в пятнадцать. Без ограничения
+    # зависшая работа держала бы выпуск до шести часов.
+    timeout-minutes: 20
     needs: core
     permissions:
       contents: write
@@ -61,7 +63,18 @@ jobs:
           key: macos
 
       - name: Тесты движка на macOS
-        run: cargo test --release --manifest-path core/Cargo.toml
+        # ⛔ По одному и без задержки вывода: при обычном прогоне
+        # результаты печатаются пачкой в конце, и зависший тест не
+        # назвать — работа просто стоит, пока её не снимут. Так в
+        # журнале видно, на каком имени всё остановилось.
+        # ⛔ И со сроком: иначе зависший тест держит сборку до
+        # ограничения работы.
+        run: |
+          timeout 600 cargo test --release --manifest-path core/Cargo.toml \
+            -- --test-threads=1 --nocapture || {
+              echo "::error::тесты на macOS не уложились в срок или упали"
+              exit 1
+            }
 
       - name: Зависимости интерфейса
         working-directory: app
@@ -107,8 +120,9 @@ jobs:
   windows:
     name: Сборка под Windows
     runs-on: windows-latest
-    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
-    timeout-minutes: 40
+    # ⛔ Обычная сборка укладывается минут в пятнадцать. Без ограничения
+    # зависшая работа держала бы выпуск до шести часов.
+    timeout-minutes: 20
     needs: core
     permissions:
       contents: write
@@ -210,8 +224,9 @@ jobs:
   feed:
     name: Список обновлений
     runs-on: ubuntu-latest
-    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
-    timeout-minutes: 40
+    # ⛔ Обычная сборка укладывается минут в пятнадцать. Без ограничения
+    # зависшая работа держала бы выпуск до шести часов.
+    timeout-minutes: 20
     needs: [windows, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
