@@ -247,27 +247,31 @@ pub fn build_config_with(
         }));
     }
 
-    // ⛔ Своё хозяйство — всегда напрямую, и раньше всех правил.
+    // ⛔ Своё хозяйство мимо СТРАН подписки — иначе петля.
     //
-    // Через туннель ходит и сама программа, и её вспомогательные части.
-    // Стоит какому-нибудь правилу совпасть с адресом их сервера — и
-    // получается петля: программа идёт в туннель, туннель отдаёт её в
-    // прокси, а тот возвращает обратно. Обход был сделан только для
-    // адреса самого прокси, да и то лишь когда он задан числом.
-    let своё: Vec<String> = [
-        dir_hint.to_string_lossy().to_string(),
-        std::env::current_exe().map(|p| p.parent().map(|d| d.to_string_lossy().to_string())
-            .unwrap_or_default()).unwrap_or_default(),
-    ].iter()
-        .filter(|p| !p.is_empty())
-        .map(|p| path_regex(p))
-        .collect();
-    if !своё.is_empty() {
-        rules.push(serde_json::json!({
-            "process_path_regex": своё,
-            "action": "route",
-            "outbound": "direct"
-        }));
+    // Страны подписки подняты как локальные порты нашего же помощника.
+    // Стоит правилу увести в такую страну трафик самого помощника — и
+    // получается круг: программа идёт в туннель, туннель отдаёт её в
+    // локальный порт, помощник идёт к своему серверу, и тот же туннель
+    // отправляет его обратно в тот же порт.
+    //
+    // ⛔ Правило ставится ТОЛЬКО когда страны есть. Без них петле взяться
+    // неоткуда, а лишнее «напрямую» сломало бы работу там, где выход в
+    // сеть есть только через корпоративный прокси.
+    let есть_страны = upstreams.iter().any(|u| u.address == "127.0.0.1");
+    if есть_страны {
+        // Берём всю папку программы, а не только папку перехвата:
+        // помощник лежит в соседней.
+        let своё: Vec<String> = dir_hint.parent()
+            .map(|d| vec![path_regex(&d.to_string_lossy())])
+            .unwrap_or_default();
+        if !своё.is_empty() {
+            rules.push(serde_json::json!({
+                "process_path_regex": своё,
+                "action": "route",
+                "outbound": "direct"
+            }));
+        }
     }
 
     // приложения — каждое в свой прокси
@@ -493,26 +497,45 @@ mod tests {
         assert!(свои < rules.len(), "правило «свои адреса» потерялось");
     }
 
-    /// ⛔ Трафик самой программы обязан идти мимо прокси, иначе при
-    /// совпадении правила получается петля: программа → туннель →
-    /// прокси → туннель.
+    /// ⛔ Когда есть страны подписки, помощник программы обязан идти
+    /// мимо них: иначе его собственный трафик возвращается в тот же
+    /// локальный порт, и получается круг.
     #[test]
-    fn своё_хозяйство_идёт_напрямую() {
+    fn при_странах_своё_хозяйство_идёт_напрямую() {
+        let страна = Upstream {
+            tag: "Германия".into(), kind: Kind::Socks5,
+            address: "127.0.0.1".into(), port: 20800, user: None, password: None,
+        };
         let c = build_config_with(
-            Path::new("/данные/tunnel"),
+            Path::new("/данные/org.hipogas.nexusproxy/tunnel"),
             &[],
-            &[DomainRule { pattern: "hipogas.org".into(), via: "основной".into() }],
-            &[corp()],
+            &[DomainRule { pattern: "hipogas.org".into(), via: "Германия".into() }],
+            &[corp(), страна],
         );
         let rules = rules_of(&c);
         let своё = rules.iter().position(|r| r["process_path_regex"].as_array()
-            .map(|a| a.iter().any(|v| v.as_str().unwrap_or("").contains("tunnel")))
-            .unwrap_or(false));
-        let домен = rules.iter().position(|r| r.get("domain_suffix").is_some());
-        let своё = своё.expect("нет правила для своего хозяйства");
-        assert!(своё < домен.unwrap_or(usize::MAX),
-                "своё хозяйство разбирается позже правил человека — возможна петля");
+            .map(|a| a.iter().any(|v| v.as_str().unwrap_or("").contains("nexusproxy")))
+            .unwrap_or(false)).expect("нет правила для своего хозяйства");
+        let домен = rules.iter().position(|r| r.get("domain_suffix").is_some())
+            .unwrap_or(usize::MAX);
+        assert!(своё < домен, "своё хозяйство разбирается позже правил — возможен круг");
         assert_eq!(rules[своё]["outbound"], "direct");
+    }
+
+    /// ⛔ А без стран такого правила быть не должно: в сети, где выход
+    /// только через корпоративный прокси, «напрямую» означает «никуда».
+    #[test]
+    fn без_стран_лишнего_правила_нет() {
+        let c = build_config_with(
+            Path::new("/данные/org.hipogas.nexusproxy/tunnel"),
+            &[],
+            &[DomainRule { pattern: "example.com".into(), via: "основной".into() }],
+            &[corp()],
+        );
+        let есть = rules_of(&c).iter().any(|r| r["process_path_regex"].as_array()
+            .map(|a| a.iter().any(|v| v.as_str().unwrap_or("").contains("nexusproxy")))
+            .unwrap_or(false));
+        assert!(!есть, "лишнее правило «напрямую» сломает работу через корпоративный прокси");
     }
 
     /// ⛔ Программа в корне диска не должна заворачивать весь диск.
