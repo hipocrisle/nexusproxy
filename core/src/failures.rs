@@ -36,17 +36,24 @@ struct Item {
 static S: Mutex<Option<BTreeMap<String, Item>>> = Mutex::new(None);
 
 pub fn enable() {
-    *S.lock().unwrap() = Some(BTreeMap::new());
+    *S.lock().unwrap_or_else(|e| e.into_inner()) = Some(BTreeMap::new());
 }
 
 pub fn note(host: &str, route: &Route, via: &str, error: &str) {
     let domain = crate::domain::registrable(host);
-    let mut g = S.lock().unwrap();
+    let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = g.as_mut() else { return };
     let e = m.entry(domain).or_insert(Item {
         count: 0, route: route.tag().into(), via: via.into(),
         error: error.into(), at: Instant::now(),
     });
+    // ⛔ Счёт «подряд» обнуляется, если между отказами прошло время.
+    // Иначе сорок утренних отказов и один случайный днём давали «41 раз
+    // подряд», и человеку предлагали чинить по давно неактуальным
+    // данным.
+    if e.at.elapsed() > std::time::Duration::from_secs(10 * 60) {
+        e.count = 0;
+    }
     e.count += 1;
     e.route = route.tag().into();
     e.via = via.into();
@@ -57,14 +64,14 @@ pub fn note(host: &str, route: &Route, via: &str, error: &str) {
 /// Успешное соединение снимает домен с учёта: проблема ушла.
 pub fn forget(host: &str) {
     let domain = crate::domain::registrable(host);
-    if let Some(m) = S.lock().unwrap().as_mut() {
+    if let Some(m) = S.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.remove(&domain);
     }
 }
 
 /// Отказы за последние `within_secs` секунд, свежие сверху.
 pub fn recent(within_secs: u64) -> Vec<Failure> {
-    let g = S.lock().unwrap();
+    let g = S.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = g.as_ref() else { return Vec::new() };
     let mut v: Vec<Failure> = m
         .iter()
@@ -79,8 +86,15 @@ pub fn recent(within_secs: u64) -> Vec<Failure> {
     v
 }
 
+/// Забыть то, о чём давно не слышали: карта иначе растёт вечно.
+pub fn forget_old(older_than: std::time::Duration) {
+    if let Some(m) = S.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.retain(|_, v| v.at.elapsed() < older_than);
+    }
+}
+
 pub fn clear() {
-    if let Some(m) = S.lock().unwrap().as_mut() {
+    if let Some(m) = S.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         m.clear();
     }
 }

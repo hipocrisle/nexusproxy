@@ -61,10 +61,16 @@ struct State {
 }
 
 static S: Mutex<Option<State>> = Mutex::new(None);
+
+/// ⛔ Паника под замком отравляет мьютекс, и дальше учёт паникует на
+/// каждом новом соединении — режим прокси перестаёт принимать их вовсе.
+fn lock() -> std::sync::MutexGuard<'static, Option<State>> {
+    S.lock().unwrap_or_else(|e| e.into_inner())
+}
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 pub fn enable() {
-    *S.lock().unwrap() = Some(State::default());
+    *lock() = Some(State::default());
 }
 
 /// Соединение открылось. Возвращает номер и счётчики, которые
@@ -75,7 +81,7 @@ pub fn open(host: &str, port: u16, route: &str, via: &str, app: &crate::proc::Ap
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let counters = std::sync::Arc::new(crate::pump::Counters::default());
     let kill = std::sync::Arc::new(tokio::sync::Notify::new());
-    if let Some(s) = S.lock().unwrap().as_mut() {
+    if let Some(s) = lock().as_mut() {
         s.live.insert(id, Live {
             host: host.to_string(), port, route: route.to_string(),
             via: via.to_string(), app: app.clone(),
@@ -87,12 +93,16 @@ pub fn open(host: &str, port: u16, route: &str, via: &str, app: &crate::proc::Ap
 
 /// Оборвать все соединения, идущие через прокси. Нужно при подмене:
 /// правило не изменилось, а идти должно в другое место.
-pub fn drop_changed_all(_rules: &std::sync::RwLock<crate::rules::Rules>) -> usize {
-    let g = S.lock().unwrap();
-    let Some(s) = g.as_ref() else { return 0 };
+pub fn drop_changed_all(from: &str) -> usize {
+    // ⛔ Рвём только соединения через ТОТ прокси, который подменили.
+    // Раньше обрывались все до единого, включая соединения других
+    // прокси и назначенные приложениям: длинная связь HTTP/2 рвалась на
+    // ровном месте, и работа человека обрывалась вместе с ней.
+    let mut g = lock();
+    let Some(s) = g.as_mut() else { return 0 };
     let mut n = 0;
     for c in s.live.values() {
-        if c.route == "proxy" {
+        if c.route == "proxy" && (from.is_empty() || c.via == from) {
             c.kill.notify_waiters();
             n += 1;
         }
@@ -107,7 +117,7 @@ pub fn drop_changed_all(_rules: &std::sync::RwLock<crate::rules::Rules>) -> usiz
 /// браузеры держат их подолгу, и человек видит «настройка не работает».
 pub fn drop_changed(rules: &std::sync::RwLock<crate::rules::Rules>,
                     apps: &std::sync::RwLock<crate::approutes::AppRoutes>) -> usize {
-    let g = S.lock().unwrap();
+    let g = lock();
     let Some(s) = g.as_ref() else { return 0 };
     let r = rules.read().unwrap();
     let a = apps.read().unwrap();
@@ -137,22 +147,26 @@ pub fn drop_changed(rules: &std::sync::RwLock<crate::rules::Rules>,
 
 /// Соединение закрылось: переносим объём в итоги по домену.
 pub fn close(id: u64, sent: u64, received: u64) {
-    let mut g = S.lock().unwrap();
+    let mut g = lock();
     let Some(s) = g.as_mut() else { return };
     let Some(c) = s.live.remove(&id) else { return };
+    // ⛔ Ключ включает путь: к одному домену часть соединений может
+    // идти напрямую, часть через прокси. Складывая их в одну строку, мы
+    // показывали объём вместе, а в колонке пути — того, чьё соединение
+    // закрылось последним; человек делал вывод о маршруте, которого не
+    // было.
     let domain = crate::domain::registrable(&c.host);
-    let e = s.totals.entry(domain.clone()).or_insert_with(|| DomainStat {
+    let key = format!("{domain}|{}|{}", c.route, c.via);
+    let e = s.totals.entry(key).or_insert_with(|| DomainStat {
         domain, route: c.route.clone(), via: c.via.clone(), ..Default::default()
     });
-    e.route = c.route.clone();
-    e.via = c.via.clone();
     e.conns += 1;
     e.sent += sent;
     e.received += received;
 }
 
 pub fn active() -> Vec<Conn> {
-    let g = S.lock().unwrap();
+    let g = lock();
     let Some(s) = g.as_ref() else { return Vec::new() };
     let mut v: Vec<Conn> = s.live.iter().map(|(id, c)| {
         let (sent, received) = c.counters.get();
@@ -169,7 +183,7 @@ pub fn active() -> Vec<Conn> {
 
 /// Итоги по доменам, самые объёмные сверху.
 pub fn totals() -> Vec<DomainStat> {
-    let g = S.lock().unwrap();
+    let g = lock();
     let Some(s) = g.as_ref() else { return Vec::new() };
     let mut v: Vec<DomainStat> = s.totals.values().cloned().collect();
     v.sort_by(|a, b| (b.sent + b.received).cmp(&(a.sent + a.received)));
@@ -177,7 +191,7 @@ pub fn totals() -> Vec<DomainStat> {
 }
 
 pub fn reset_totals() {
-    if let Some(s) = S.lock().unwrap().as_mut() {
+    if let Some(s) = lock().as_mut() {
         s.totals.clear();
     }
 }
