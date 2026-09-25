@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 fn main() {
     let dir = PathBuf::from(std::env::args().nth(1).expect("папка"));
+    nexusproxy_core::journal::enable();
     let api = nexusproxy_core::tunnel::api_access(&dir);
     println!("порт {} пароль {}…", api.port, &api.secret[..8]);
 
@@ -96,6 +97,12 @@ fn main() {
         }
         Err(e) => println!("ОШИБКА: {e}"),
     }
+    let j = nexusproxy_core::journal::since(0);
+    println!("записей в журнале: {}", j.len());
+    for e in j.iter().take(5) {
+        println!("  {} {}:{} {} {}", e.at, e.host, e.port, e.route, e.via);
+    }
+
     let _ = holder.join();
     let _ = load.join();
     let _ = child.kill();
