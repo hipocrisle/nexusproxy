@@ -24,6 +24,8 @@ jobs:
   core:
     name: Тесты движка
     runs-on: ubuntu-24.04
+    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -35,6 +37,8 @@ jobs:
   macos:
     name: Сборка под macOS
     runs-on: macos-latest
+    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
+    timeout-minutes: 40
     needs: core
     permissions:
       contents: write
@@ -103,6 +107,8 @@ jobs:
   windows:
     name: Сборка под Windows
     runs-on: windows-latest
+    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
+    timeout-minutes: 40
     needs: core
     permissions:
       contents: write
@@ -204,6 +210,8 @@ jobs:
   feed:
     name: Список обновлений
     runs-on: ubuntu-latest
+    # ⛔ Без ограничения зависшая работа держит выпуск до шести часов.
+    timeout-minutes: 40
     needs: [windows, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
