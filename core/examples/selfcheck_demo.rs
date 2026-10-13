@@ -12,7 +12,7 @@ fn main() {
         name: "основной".into(),
         kind: nexusproxy_core::upstream::Kind::Socks5,
         address: "172.31.211.1".into(), port: 1081,
-        user: Some("i.korobkov".into()), password: Some("тайна".into()),
+        user: Some("имя".into()), password: Some("тайна".into()),
         from_subscription: false,
     });
     cfg.default_upstream = "основной".into();

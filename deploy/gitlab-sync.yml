@@ -11,7 +11,7 @@
 #   GL_TOKEN     токен проекта-зеркала, роль Maintainer,
 #                права api и write_repository. Пометить «Masked»
 #   GL_PROJECT   числовой идентификатор проекта-зеркала
-#   MIRROR_PATH  путь к зеркалу, например i.korobkov/nexusproxy
+#   MIRROR_PATH  путь к зеркалу, например имя-владельца/nexusproxy
 #
 # Расписание: Settings → CI/CD → Schedules, например раз в час.
 # Исполнителю нужен доступ наружу к github.com.

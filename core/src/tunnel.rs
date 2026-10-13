@@ -520,7 +520,7 @@ mod tests {
         let c = build_config_with(
             Path::new("/данные/org.hipogas.nexusproxy/tunnel"),
             &[],
-            &[DomainRule { pattern: "hipogas.org".into(), via: "Германия".into() }],
+            &[DomainRule { pattern: "example.com".into(), via: "Германия".into() }],
             &[corp(), country],
         );
         let rules = rules_of(&c);
