@@ -26,6 +26,8 @@ pub struct Status {
     minimize_to_tray: bool,
     enable_on_start: bool,
     tunnel_mode: bool,
+    /// Сети, которые не заводим в туннель.
+    outside_tunnel: Vec<String>,
     default_upstream: String,
     rules_count: usize,
     upstream_up: bool,
@@ -69,6 +71,7 @@ fn status(app: State<App>) -> Status {
                 minimize_to_tray: c.minimize_to_tray,
                 enable_on_start: c.enable_on_start,
                 tunnel_mode: c.tunnel_mode,
+                outside_tunnel: c.outside_tunnel.clone(),
                 os: std::env::consts::OS.to_string(),
                 default_upstream: c.default_upstream.clone(),
                 rules_count: c.through_proxy.iter().filter(|s| !s.starts_with('_')).count(),
@@ -84,6 +87,7 @@ fn status(app: State<App>) -> Status {
             system_on: false,
             auto_reconnect: true, minimize_to_tray: true, enable_on_start: true,
             tunnel_mode: false,
+            outside_tunnel: core::config::сети_мимо_туннеля(),
             os: std::env::consts::OS.to_string(),
             default_upstream: String::new(), rules_count: 0,
             upstream_up: false, upstream_error: None,
@@ -790,6 +794,21 @@ fn set_flag(app: State<App>, name: String, value: bool) -> Result<(), String> {
     e.apply_and_save()
 }
 
+/// Задать сети, которые не заводим в туннель.
+///
+/// ⛔ Негодные записи отсеиваем здесь же: движок кривую сеть не
+/// простит — туннель не поднимется вовсе, и человек останется без
+/// связи из-за одной опечатки в поле.
+#[tauri::command]
+fn set_outside_tunnel(app: State<App>, list: Vec<String>) -> Result<(), String> {
+    let e = engine(&app)?;
+    {
+        let mut c = e.cfg.lock().unwrap();
+        c.outside_tunnel = core::config::годные_сети(&list);
+    }
+    e.apply_and_save()
+}
+
 /// Полный выход: вернуть системные настройки и закрыться.
 /// ⛔ Обязательно через это, а не через закрытие окна: иначе у пользователя
 /// останется системный прокси, указывающий в никуда, и «пропадёт интернет».
@@ -872,6 +891,7 @@ async fn settings_save(app: tauri::AppHandle, s: Settings) -> Result<(), String>
 fn default_config() -> core::config::Config {
     core::config::Config {
         upstream: None,
+        outside_tunnel: core::config::сети_мимо_туннеля(),
         upstreams: vec![core::upstream::Upstream {
             name: "основной".into(),
             kind: core::upstream::Kind::Socks5,
@@ -1073,7 +1093,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
     core::logfile::line(&core::logfile::now_stamp(),
         &format!("человек выбрал способ работы: {}",
                  if on { "перехват" } else { "режим прокси" }));
-    let (dir, routes, domains, ups) = {
+    let (dir, routes, domains, ups, вне_туннеля) = {
         let state = app.state::<App>();
         let path = state.path.lock().unwrap().clone();
         let dir = core::tunnel_dir(&path);
@@ -1088,6 +1108,8 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
                 via: a.via.clone(),
             })
             .collect();
+        // Сети, выведенные из туннеля, — рядом с остальными настройками.
+        let вне_туннеля = c.outside_tunnel.clone();
         let ups: Vec<core::tunnel::Upstream> = c.all_upstreams().into_iter()
             .map(|u| core::tunnel::Upstream {
                 tag: u.name.clone(),
@@ -1117,7 +1139,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
                 d
             })
             .collect();
-        (dir, routes, domains, ups)
+        (dir, routes, domains, ups, вне_туннеля)
     };
     { let s = app.state::<App>(); engine(&s)?.apply_and_save()?; }
 
@@ -1134,7 +1156,7 @@ async fn tunnel_set(app: AppHandle, on: bool) -> Result<(), String> {
             return Ok(());
         }
         // Настройки пишем всегда: служба читает их при запуске.
-        core::tunnel::write_config(&dir, &routes, &domains, &ups)?;
+        core::tunnel::write_config(&dir, &routes, &domains, &ups, &вне_туннеля)?;
         // ⛔ Проверяем не только наличие, но и чем служба поставлена:
         // после обновления программы старая запись продолжает работать
         // по-старому, и человек не видит никаких изменений.
@@ -1424,6 +1446,7 @@ pub fn run() {
             conns_active, conns_totals, conns_reset,
             upstreams_list, upstream_save, upstream_remove, group_save, group_remove,
             proxies_health, upstream_set_default, failures_recent, failures_clear,
+            set_outside_tunnel,
             override_set, override_clear, overrides_list, proxies_in_use,
             sub_state, sub_install, sub_load, sub_apply, sub_disable,
             system_proxy, settings_save, set_flag, quit,

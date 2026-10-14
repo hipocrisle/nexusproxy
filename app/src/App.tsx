@@ -12,6 +12,7 @@ type Status = {
   system_on: boolean; rules_count: number;
   auto_reconnect: boolean; minimize_to_tray: boolean;
   enable_on_start: boolean; tunnel_mode: boolean; default_upstream: string;
+  outside_tunnel: string[];
   upstream_up: boolean; upstream_error: string | null;
   config_path: string; log_path: string; error: string | null;
 };
@@ -1471,6 +1472,27 @@ function Settings({ st, onSaved }: { st: Status | null; onSaved: () => void }) {
         <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
 Проверка доступности каждые 15 секунд.
         </p>
+        <div style={{ marginTop: 16 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Сети мимо перехвата</div>
+          <textarea
+            rows={4}
+            spellCheck={false}
+            defaultValue={(st?.outside_tunnel ?? []).join("\n")}
+            onBlur={(e) =>
+              invoke("set_outside_tunnel", {
+                list: e.target.value.split("\n").map((x) => x.trim()).filter(Boolean),
+              }).then(onSaved).catch((err) => alert(String(err)))
+            }
+            style={{ width: "100%", fontFamily: "monospace", fontSize: 12 }}
+          />
+          <p className="hint" style={{ marginTop: 4, marginBottom: 0 }}>
+По одной сети в строке, например 10.180.0.0/16. Перечисленное сюда не попадает
+в перехват вовсе: иначе проверка связи показывает открытыми порты, которые закрыты,
+и диагностика сети врёт. Сеть корпоративного прокси добавлять нельзя — через него
+надо уметь ходить и самому прокси.
+          </p>
+        </div>
+
         <p className="hint" style={{ marginTop: 8 }}>
 Журнал обрезается при 4 МБ, предыдущий — nexusproxy.log.1.
         </p>

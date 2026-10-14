@@ -22,27 +22,6 @@ const RELEASES: &str = "https://api.github.com/repos/SagerNet/sing-box/releases/
 /// из диапазона для частных сетей, чтобы не столкнуться с настоящими.
 const TUN_ADDR: &str = "172.19.0.1/30";
 
-/// Сети, которые НЕ заводим в туннель вовсе — пакеты к ним идут мимо
-/// нашего интерфейса, через обычный шлюз.
-///
-/// ⛔ Зачем, если движок и так гонит частные адреса напрямую: решение о
-/// маршруте принимается ПОСЛЕ того, как пакет вошёл в туннель, а наш
-/// сетевой слой завершает TCP-рукопожатие сам, не дожидаясь настоящего
-/// хоста. Из-за этого проверка связи показывала открытыми порты,
-/// которые закрыты, «маршрут до адреса» указывал на наш интерфейс
-/// вместо сетевой карты, а подключение к недоступной папке падало не с
-/// той ошибкой. Диагностика врала, и человек целый день шёл по ложному
-/// следу. К выведенным отсюда сетям это больше не относится.
-///
-/// ⛔ 172.16.0.0/12 здесь НЕТ намеренно: в этом диапазоне живут и
-/// корпоративный прокси, и наши туннели, а их иногда нужно гнать через
-/// прокси. От петли — чтобы дойти до прокси, надо пройти через прокси —
-/// защищает отдельное правило: адреса прокси всегда идут напрямую.
-const ВНЕ_ТУННЕЛЯ: [&str; 3] = [
-    "10.0.0.0/8",
-    "192.168.0.0/16",
-    "169.254.0.0/16", // адреса, которые машина назначает себе сама
-];
 
 fn exe_name() -> &'static str {
     if cfg!(windows) { "sing-box.exe" } else { "sing-box" }
@@ -214,7 +193,8 @@ pub fn engine_log_path(dir: &Path) -> PathBuf {
 }
 
 pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Value {
-    build_config_with(Path::new("."), routes, &[], upstreams)
+    build_config_with(Path::new("."), routes, &[], upstreams,
+                      &crate::config::сети_мимо_туннеля())
 }
 
 /// ⛔ TUN режим заменяет режим прокси целиком, а не дополняет его.
@@ -227,6 +207,7 @@ pub fn build_config_with(
     routes: &[Route],
     domains: &[DomainRule],
     upstreams: &[Upstream],
+    outside: &[String],
 ) -> serde_json::Value {
     let mut resolvers = system_resolvers();
     if resolvers.is_empty() {
@@ -419,7 +400,7 @@ pub fn build_config_with(
     }));
 
     let api = api_access(dir_hint);
-    serde_json::json!({
+    let mut cfg = serde_json::json!({
         // ⛔ DNS оставляем системе. Туннель по умолчанию отвечает на
         // запросы сам, и внутренние names_at — контроллеры домена, файловые
         // ресурсы — перестают разрешаться: у человека виснет оснастка
@@ -454,8 +435,6 @@ pub fn build_config_with(
             "tag": "tun-in",
             "address": [TUN_ADDR],
             "auto_route": true,
-            // Частные сети мимо туннеля — зачем, см. ВНЕ_ТУННЕЛЯ.
-            "route_exclude_address": ВНЕ_ТУННЕЛЯ,
             // ⛔ Строгий режим выключен: он мешает работе части программ
             // Windows, обращающихся к службам своей сети — у пользователя
             // из-за него повисала оснастка управления доменом, при живом
@@ -492,7 +471,14 @@ pub fn build_config_with(
             "final": "direct",
             "auto_detect_interface": true
         }
-    })
+    });
+
+    // ⛔ Сети, выведенные из туннеля. Поле добавляем только если список
+    // непуст: пустой массив движок трактует иначе, чем его отсутствие.
+    if !outside.is_empty() {
+        cfg["inbounds"][0]["route_exclude_address"] = serde_json::json!(outside);
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -511,6 +497,7 @@ mod tests {
             &[DomainRule { pattern: "10.10.0.0/16".into(), via: "основной".into() },
               DomainRule { pattern: "intranet.corp".into(), via: "основной".into() }],
             &[corp()],
+            &[],
         );
         let rules = rules_of(&c);
         let at = |ищем: &dyn Fn(&serde_json::Value) -> bool| -> usize {
@@ -546,6 +533,7 @@ mod tests {
             &[],
             &[DomainRule { pattern: "example.com".into(), via: "Германия".into() }],
             &[corp(), country],
+            &[],
         );
         let rules = rules_of(&c);
         let ours = rules.iter().position(|r| r["process_path_regex"].as_array()
@@ -566,6 +554,7 @@ mod tests {
             &[],
             &[DomainRule { pattern: "example.com".into(), via: "основной".into() }],
             &[corp()],
+            &[],
         );
         let present = rules_of(&c).iter().any(|r| r["process_path_regex"].as_array()
             .map(|a| a.iter().any(|v| v.as_str().unwrap_or("").contains("nexusproxy")))
@@ -656,6 +645,24 @@ mod tests {
 
     /// Своя сеть мимо перехвата: прокси до неё не достанет, а обращения
     /// к самому себе он и вовсе завернёт в петлю.
+    /// Список сетей мимо туннеля задаёт человек — проверяем, что до
+    /// движка доезжает именно он, а не наше умолчание.
+    #[test]
+    fn список_сетей_берётся_из_настроек() {
+        let свой = vec!["10.180.0.0/16".to_string(), "192.168.88.0/24".to_string()];
+        let c = build_config_with(Path::new("."), &[], &[], &[corp()], &свой);
+        let вне: Vec<String> = c["inbounds"][0]["route_exclude_address"]
+            .as_array().expect("списка нет")
+            .iter().map(|v| v.as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(вне, свой, "до движка доехал не тот список");
+
+        // Пустой список — поля быть не должно: движок понимает пустой
+        // массив иначе, чем его отсутствие.
+        let c = build_config_with(Path::new("."), &[], &[], &[corp()], &[]);
+        assert!(c["inbounds"][0].get("route_exclude_address").is_none(),
+                "при пустом списке поле всё равно записано");
+    }
+
     /// ⛔ Частные сети обязаны быть ВЫВЕДЕНЫ из туннеля, а не просто
     /// направлены напрямую правилом: правило срабатывает уже после того,
     /// как пакет вошёл в наш интерфейс, и проверка связи к тому моменту
@@ -951,9 +958,9 @@ pub fn kill_orphans(dir: &Path) -> usize {
 
 /// Записать настройки для движка. Служба читает их при запуске.
 pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
-                    upstreams: &[Upstream]) -> Result<(), String> {
+                    upstreams: &[Upstream], outside: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
-    let cfg = build_config_with(dir, routes, domains, upstreams);
+    let cfg = build_config_with(dir, routes, domains, upstreams, outside);
     let text = serde_json::to_vec_pretty(&cfg).unwrap();
 
     // ⛔ Если настройки не изменились, не трогаем файл вовсе: служба
@@ -1452,6 +1459,7 @@ mod domain_tests {
             &[],
             &[DomainRule { pattern: "domain:grid.gg".into(), via: "основной".into() }],
             &[corp()],
+            &[],
         );
         let hit = rules_of(&c).iter().any(|r| {
             r["domain_suffix"].as_array().map_or(false, |a| a.iter().any(|x| x == "grid.gg"))
@@ -1467,6 +1475,7 @@ mod domain_tests {
             &[],
             &[DomainRule { pattern: "10.0.0.0/8".into(), via: "основной".into() }],
             &[corp()],
+            &[],
         );
         let hit = rules_of(&c).iter().any(|r| {
             r["ip_cidr"].as_array().map_or(false, |a| a.iter().any(|x| x == "10.0.0.0/8"))
@@ -1483,6 +1492,7 @@ mod domain_tests {
             &[],
             &[DomainRule { pattern: "_Группа".into(), via: "основной".into() }],
             &[corp()],
+            &[],
         );
         let has = rules_of(&c).iter().any(|r| r.get("domain_suffix").is_some());
         assert!(!has, "служебной записи в настройках движка нет");
@@ -1905,6 +1915,7 @@ mod order_of_rules_tests {
             &[Upstream { tag: "основной".into(), kind: Kind::Socks5,
                          address: "172.31.211.1".into(), port: 1081,
                          user: None, password: None , from_subscription: false }],
+            &[],
         );
         let rules = c["route"]["rules"].as_array().unwrap();
         let app = rules.iter().position(|r| r.get("process_name").is_some()).unwrap();

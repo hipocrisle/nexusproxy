@@ -583,8 +583,10 @@ impl Engine {
                 from_subscription: u.from_subscription,
             })
             .collect();
+        // Список сетей мимо туннеля берём ДО освобождения настроек.
+        let вне = c.outside_tunnel.clone();
         drop(c);
-        tunnel::write_config(&dir, &routes, &domains, &ups)
+        tunnel::write_config(&dir, &routes, &domains, &ups, &вне)
     }
 
     /// Временно увести правила одного прокси на другой.
