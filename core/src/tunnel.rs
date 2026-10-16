@@ -671,6 +671,54 @@ mod tests {
     /// И столь же обязательно, чтобы 172.16.0.0/12 остался В туннеле: там
     /// живут корпоративный прокси и наши туннели, их иногда нужно гнать
     /// через прокси.
+    /// ⛔ Проверять на доступность имеет смысл только то, что живёт в
+    /// чужой сети. Страны из подписки подняты на этой же машине: они
+    /// отвечают всегда, и из-за них страховка никогда бы не сработала.
+    #[test]
+    fn на_доступность_проверяем_только_чужие_прокси() {
+        let страна = Upstream {
+            tag: "Германия".into(), kind: Kind::Socks5,
+            address: "127.0.0.1".into(), port: 10801,
+            user: None, password: None, from_subscription: true,
+        };
+        let список = upstreams_to_watch(&[corp(), страна]);
+        let ждём = format!("{} {}", corp().address, corp().port);
+        assert!(список.contains(&ждём), "корпоративного нет: {список:?}");
+        assert!(!список.contains("127.0.0.1"), "попала страна с этой же машины: {список:?}");
+    }
+
+    /// ⛔ Главная проверка страховки: пока прокси не отвечает, движок
+    /// поднимать нельзя — иначе весь трафик уходит в никуда и человек
+    /// остаётся без интернета. И наоборот: нечего проверять — не мешаем.
+    #[test]
+    fn недоступный_прокси_виден_а_пустой_список_не_мешает() {
+        let каталог = std::env::temp_dir().join(format!("nxp-reach-{}", std::process::id()));
+        std::fs::create_dir_all(&каталог).unwrap();
+
+        // файла нет вовсе — считаем доступным
+        assert!(upstreams_reachable(&каталог), "без списка страховка не должна мешать");
+
+        // пустой список — тоже не мешаем
+        std::fs::write(upstreams_path(&каталог), "").unwrap();
+        assert!(upstreams_reachable(&каталог), "пустой список не должен мешать");
+
+        // заведомо закрытый порт — недоступен
+        std::fs::write(upstreams_path(&каталог), "127.0.0.1 9\n").unwrap();
+        assert!(!upstreams_reachable(&каталог), "закрытый порт показан доступным");
+
+        // живой слушающий порт — доступен
+        let слушатель = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let порт = слушатель.local_addr().unwrap().port();
+        std::fs::write(upstreams_path(&каталог), format!("127.0.0.1 {порт}\n")).unwrap();
+        assert!(upstreams_reachable(&каталог), "живой порт показан недоступным");
+
+        // хотя бы один из списка — достаточно
+        std::fs::write(upstreams_path(&каталог), format!("127.0.0.1 9\n127.0.0.1 {порт}\n")).unwrap();
+        assert!(upstreams_reachable(&каталог), "второй живой адрес не учтён");
+
+        let _ = std::fs::remove_dir_all(&каталог);
+    }
+
     #[test]
     fn частные_сети_выведены_из_туннеля_кроме_прокси() {
         let c = build_config(&[], &[corp()]);
@@ -961,6 +1009,9 @@ pub fn write_config(dir: &Path, routes: &[Route], domains: &[DomainRule],
                     upstreams: &[Upstream], outside: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("не создать папку: {e}"))?;
     let cfg = build_config_with(dir, routes, domains, upstreams, outside);
+    // Список для наблюдателя пишем всегда: пустой файл означает «проверять
+    // нечего», и наблюдатель тогда не мешает работе.
+    let _ = std::fs::write(upstreams_path(dir), upstreams_to_watch(upstreams));
     let text = serde_json::to_vec_pretty(&cfg).unwrap();
 
     // ⛔ Если настройки не изменились, не трогаем файл вовсе: служба
@@ -1016,6 +1067,36 @@ pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("tunnel-config.json")
 }
 
+/// Список вышестоящих прокси для наблюдателя: строки вида «адрес порт».
+///
+/// ⛔ Зачем отдельный файл, если всё есть в настройках движка: наблюдатель
+/// — сценарий оболочки, и разбирать там JSON значит городить хрупкий разбор
+/// текста, который сломается от первой же смены порядка полей. Пишем рядом
+/// простой список, он всегда свежий — обновляется вместе с настройками.
+pub fn upstreams_path(dir: &Path) -> PathBuf {
+    dir.join("upstreams.txt")
+}
+
+/// Какие прокси проверять на доступность.
+///
+/// ⛔ Страны из подписки сюда НЕ попадают: они подняты на этой же машине
+/// локальным портом и доступны всегда, их проверка ничего не значит.
+/// Проверяем только то, что живёт в чужой сети, — корпоративный прокси.
+pub fn upstreams_to_watch(upstreams: &[Upstream]) -> String {
+    let mut строки = Vec::new();
+    for u in upstreams {
+        if u.from_subscription {
+            continue;
+        }
+        let адрес = u.address.trim();
+        if адрес.is_empty() || адрес.starts_with("127.") || адрес == "localhost" {
+            continue;
+        }
+        строки.push(format!("{adr} {port}", adr = адрес, port = u.port));
+    }
+    строки.join("\n")
+}
+
 /// Поднять движок и ждать его — этим занимается наш же файл, запущенный
 /// задачей планировщика.
 ///
@@ -1030,6 +1111,41 @@ pub fn config_path(dir: &Path) -> PathBuf {
 /// часовой давности, а в журнале не было ни одной записи о запуске.
 /// Поэтому следим сами: есть признак — движок работает и перечитывает
 /// настройки при каждом изменении, нет — стоит.
+/// Отвечает ли хоть один вышестоящий прокси.
+///
+/// ⛔ Без этой проверки перехват доламывает сеть за пределами офиса:
+/// признак включения переживает перезагрузку, служба поднимает движок
+/// при входе в систему, весь трафик уходит в недостижимый прокси — и
+/// человек остаётся без интернета, даже не открывая программу. Понять
+/// причину по виду невозможно: программа закрыта, «ничего не включено».
+///
+/// ⛔ Список пуст или не прочитан — отвечаем «доступен» и НЕ мешаем:
+/// лучше оставить как было, чем выключить перехват там, где он нужен.
+pub fn upstreams_reachable(dir: &Path) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(текст) = std::fs::read_to_string(upstreams_path(dir)) else {
+        return true;
+    };
+    let строки: Vec<&str> = текст.lines().filter(|l| !l.trim().is_empty()).collect();
+    if строки.is_empty() {
+        return true;
+    }
+    for строка in строки {
+        let mut части = строка.split_whitespace();
+        let (Some(хост), Some(порт)) = (части.next(), части.next()) else {
+            continue;
+        };
+        let Ok(порт) = порт.parse::<u16>() else { continue };
+        let Ok(адреса) = (хост, порт).to_socket_addrs() else { continue };
+        for адрес in адреса {
+            if TcpStream::connect_timeout(&адрес, std::time::Duration::from_secs(2)).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
     crate::logfile::open(dir.join("runner.log")).ok();
     crate::logfile::line(&crate::logfile::now_stamp(),
@@ -1038,6 +1154,8 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
     let mut running: Option<std::process::Child> = None;
     let mut cfg_stamp = config_stamp(dir);
     let mut tick: u64 = 0;
+    let mut ждём_прокси = false;
+    let mut промахов = 0u8;
     loop {
         let want = flag.exists();
         let fresh = config_stamp(dir);
@@ -1046,6 +1164,20 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
         match (&mut running, want) {
             // просят работать, а движка нет — поднимаем
             (None, true) => {
+                if !upstreams_reachable(dir) {
+                    // Перехват остаётся включённым — ждём, пока прокси
+                    // появится. В офисе поднимется само, руками ничего
+                    // делать не нужно.
+                    if !ждём_прокси {
+                        crate::logfile::line(&crate::logfile::now_stamp(),
+                            "перехват: прокси недоступен, движок не поднимаю — сеть идёт напрямую");
+                        ждём_прокси = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+                ждём_прокси = false;
+                промахов = 0;
                 cfg_stamp = fresh;
                 // ⛔ Движок от прошлого запуска держит сетевой интерфейс,
                 // и новый падает с «The object already exists». Снимаем
@@ -1093,6 +1225,26 @@ pub fn watch_flag(dir: &Path, flag: &Path) -> Result<(), String> {
                 }
             }
             (None, false) => {}
+        }
+        // ⛔ Прокси могли отобрать на ходу: закрыл ноутбук в офисе,
+        // открыл дома. Проверяем раз в пятнадцать секунд и гасим движок
+        // после двух неудач подряд — одиночная бывает от моргнувшей сети.
+        if running.is_some() && tick % 15 == 14 {
+            if upstreams_reachable(dir) {
+                промахов = 0;
+            } else {
+                промахов += 1;
+                if промахов >= 2 {
+                    if let Some(c) = running.as_mut() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    running = None;
+                    промахов = 0;
+                    crate::logfile::line(&crate::logfile::now_stamp(),
+                        "перехват: прокси пропал, снимаю перехват — сеть идёт напрямую");
+                }
+            }
         }
         // ⛔ Журнал движка на подробном уровне растёт мегабайтами в час.
         // Без обрезки он съедает at, а программа виснет, читая его.
