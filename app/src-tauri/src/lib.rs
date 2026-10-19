@@ -1375,7 +1375,13 @@ pub fn run() {
             // ⛔ Отчёт о состоянии — сразу, до запуска движка: если
             // что-то не так, это видно в журнале первой же записью, и
             // разбор не начинается с переписки «пришли вывод команды».
-            core::selfcheck::run(&cfg, &path_s, env!("CARGO_PKG_VERSION"));
+            // ⛔ Версию берём из сведений о пакете, а НЕ из
+            // CARGO_PKG_VERSION. Выпуск нумеруется в tauri.conf.json, и
+            // номер в Cargo.toml за ним не ходит: отчёт месяцами писал
+            // 1.1.5 при установленной 1.1.7. Разбор чужой машины с этого
+            // и начинается — врать тут нельзя.
+            core::selfcheck::run(&cfg, &path_s,
+                                 &app.package_info().version.to_string());
 
             let rt = tokio::runtime::Runtime::new()?;
             match rt.block_on(core::Engine::start(cfg, &path_s)) {

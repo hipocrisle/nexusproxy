@@ -153,9 +153,18 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           CONF=$(node -p "require('./app/src-tauri/tauri.conf.json').version")
-          echo "тег=$TAG конфиг=$CONF"
+          CRATE=$(sed -n '0,/^version = /s/^version = "\(.*\)"/\1/p' app/src-tauri/Cargo.toml)
+          echo "тег=$TAG конфиг=$CONF пакет=$CRATE"
           if [ "$CONF" != "$TAG" ]; then
             echo "::error::Тег $GITHUB_REF_NAME не совпадает с версией $CONF"
+            exit 1
+          fi
+          # ⛔ Номер в Cargo.toml обязан идти следом. Он месяцами отставал
+          # (1.1.5 при выпущенной 1.1.7), и отчёт о состоянии на чужой
+          # машине называл не ту версию — разбор начинался с неверной
+          # посылки.
+          if [ "$CRATE" != "$TAG" ]; then
+            echo "::error::В app/src-tauri/Cargo.toml версия $CRATE, а тег $GITHUB_REF_NAME"
             exit 1
           fi
 
