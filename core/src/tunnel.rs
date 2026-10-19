@@ -192,6 +192,18 @@ pub fn engine_log_path(dir: &Path) -> PathBuf {
     dir.join("sing-box.log")
 }
 
+/// Журнал ПРЕДЫДУЩЕГО запуска движка.
+///
+/// ⛔ Без него разобрать аварию невозможно. Журнал начинается заново при
+/// каждом подъёме движка, а человек замечает беду не сразу: пока он
+/// закроет программу, перезапустит её и пришлёт журнал, движок успевает
+/// подняться снова — и в файле лежит здоровый сеанс, а не тот, в котором
+/// сеть легла. Ровно так пропал разбор обращения от 2026-10-19: в архиве
+/// оказался журнал, начатый уже после аварии.
+pub fn engine_log_prev_path(dir: &Path) -> PathBuf {
+    dir.join("sing-box.log.1")
+}
+
 pub fn build_config(routes: &[Route], upstreams: &[Upstream]) -> serde_json::Value {
     build_config_with(Path::new("."), routes, &[], upstreams,
                       &crate::config::сети_мимо_туннеля())
@@ -1394,7 +1406,10 @@ fn spawn_engine(dir: &Path) -> Result<std::process::Child, String> {
         return Err(format!("движок не найден: {}", bin.display()));
     }
     // ⛔ Журнал движка начинаем заново: иначе вчерашние отказы
-    // выглядят как сегодняшние и уводят разбор в сторону.
+    // выглядят как сегодняшние и уводят разбор в сторону. Но прежний
+    // НЕ выбрасываем, а сдвигаем на шаг назад: именно в нём остаётся
+    // след аварии, из-за которой движок и перезапустили.
+    let _ = std::fs::rename(engine_log_path(dir), engine_log_prev_path(dir));
     let _ = std::fs::write(engine_log_path(dir), b"");
     let log = std::fs::File::create(log_path(dir))
         .map_err(|e| format!("не создать журнал: {e}"))?;
@@ -1692,6 +1707,7 @@ pub fn diagnosis(dir: &Path) -> String {
     say(&mut out, "настройки", config_path(dir));
     say(&mut out, "признак включения", dir.join("enabled"));
     say(&mut out, "журнал движка", engine_log_path(dir));
+    say(&mut out, "журнал движка (прошлый запуск)", engine_log_prev_path(dir));
     #[cfg(target_os = "macos")]
     {
         say(&mut out, "наблюдатель", dir.join("watch.sh"));
