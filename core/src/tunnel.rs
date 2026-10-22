@@ -1975,7 +1975,11 @@ mod mtu_tests {
 /// Поэтому спрашиваем ДО включения и передаём явными адресами.
 pub fn system_resolvers() -> Vec<String> {
     let out = if cfg!(windows) {
-        std::process::Command::new("powershell")
+        // ⛔ Только через помощника. Обычный запуск показывает окно
+        // консоли, а сюда мы заходим при каждой записи настроек движка —
+        // при старте программы это мигало дважды подряд, и выглядело
+        // так, будто программа втихую что-то выполняет.
+        crate::cmd::тихая("powershell")
             .args(["-NoProfile", "-Command",
                    "Get-DnsClientServerAddress -AddressFamily IPv4 | \
                     Select-Object -ExpandProperty ServerAddresses"])

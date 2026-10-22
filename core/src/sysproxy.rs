@@ -209,16 +209,15 @@ pub fn spawn_guard(config_path: &str) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let mut cmd = std::process::Command::new(exe);
+    // Отдельной группой процессов, чтобы пережить нас; окна консоли
+    // помощник не даёт в любом случае.
+    #[cfg(windows)]
+    let mut cmd = crate::cmd::тихая_с_флагами(exe, 0x0000_0200);
+    #[cfg(not(windows))]
+    let mut cmd = crate::cmd::тихая(exe);
     cmd.arg("--restore-guard")
        .arg(std::process::id().to_string())
        .arg(config_path);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // без чёрного окна и отдельной группой, чтобы пережить нас
-        cmd.creation_flags(0x0800_0000 | 0x0000_0200);
-    }
     let _ = cmd.spawn();
 }
 

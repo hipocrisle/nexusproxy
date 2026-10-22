@@ -1,6 +1,7 @@
 //! Ядро NexusProxy: локальный прокси с правилами.
 //! Отдельно от интерфейса, чтобы им пользовались и окно программы, и консоль.
 
+pub mod cmd;
 pub mod config;
 pub mod conns;
 pub mod domain;
